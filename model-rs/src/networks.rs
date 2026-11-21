@@ -21,8 +21,8 @@ fn blend(value: &Array, missing: &Array, has: &Array) -> R<Array> {
 }
 
 pub struct RootNetwork {
-    shared: TransformerEncoder,
-    root_token: TransformerEncoder,
+    pub shared: TransformerEncoder,
+    pub root_token: TransformerEncoder,
     conv_output: DoubleCondDecoder,
     proj_local_pose: Linear,
     proj_local_root_value: Linear,
@@ -148,7 +148,7 @@ pub struct PoseNetwork {
     heads: i32,
     pub mask_id: i32,
     num_with_mask: i32,
-    transformer: TransformerEncoder,
+    pub transformer: TransformerEncoder,
     pose_token_emb: Embedding,
     proj_pose_token_emb: FcBlock,
     proj_local_root_values: Linear,
@@ -203,32 +203,40 @@ impl PoseNetwork {
     }
 }
 
+/// Product codebook lookup: `(B, T, H)` per-head indices into `codebook (H, E, W)` ->
+/// `(B, T, H * W)` (`MultiHeadQuantizer.dequantize`).
+pub fn dequantize(codebook: &Array, indices: &Array) -> R<Array> {
+    let (heads, entries, width) = (codebook.dim(0), codebook.dim(1), codebook.dim(2));
+    let flat = indices + &(&arange(heads)? * entries);
+    let codes = codebook.reshape(&[heads * entries, width])?.take_axis(&flat, 0)?;
+    codes.reshape(&[indices.dim(0), indices.dim(1), heads * width])
+}
+
+/// Overall code indices (`entries^heads` space) -> per-head digits `(..., heads)`
+/// (`MultiHeadQuantizer.overall_to_heads`).
+pub fn overall_to_heads(overall: &Array, heads: i32, entries: i32) -> R<Array> {
+    let powers: Vec<i64> = (0..heads).map(|h| (entries as i64).pow(h as u32)).collect();
+    let powers = Array::from_slice(&powers, &[heads]);
+    let o = unsq(&overall.as_dtype(Dtype::Int64)?, -1)?;
+    ops::remainder(ops::floor_divide(&o, &powers)?, i(entries))
+}
+
 /// Product-codebook VQ-VAE decoder (`quantizer.dequantize` + `DoubleCondDecoder`).
 pub struct VqDecoder {
-    codebook: Array, // (H * E, W), flattened once at load time
-    heads: i32,
-    entries: i32,
-    width: i32,
+    pub codebook: Array, // (H, E, W)
     decoder: DoubleCondDecoder,
 }
 
 impl VqDecoder {
     pub fn load(w: &mut Weights, vq: &VqSpec) -> R<Self> {
-        let embed = w.get("vqvae.quantizer.vq.codebook.embed")?;
-        let (heads, entries, width) = (embed.dim(0), embed.dim(1), embed.dim(2));
         Ok(VqDecoder {
-            codebook: embed,
-            heads,
-            entries,
-            width,
+            codebook: w.get("vqvae.quantizer.vq.codebook.embed")?,
             decoder: DoubleCondDecoder::load(w, "vqvae.decoder", DOWN_T, vq.width, vq.depth, vq.dilation_growth_rate)?,
         })
     }
 
     pub fn dequantize(&self, indices: &Array) -> R<Array> {
-        let flat = indices + &(&arange(self.heads)? * self.entries);
-        let codes = self.codebook.reshape(&[self.heads * self.entries, self.width])?.take_axis(&flat, 0)?;
-        codes.reshape(&[indices.dim(0), indices.dim(1), self.heads * self.width])
+        dequantize(&self.codebook, indices)
     }
 
     pub fn decode(&self, tokens: &Array, target: &Array, has_target: &Array, external: &Array, token_mask: &Array) -> R<Array> {

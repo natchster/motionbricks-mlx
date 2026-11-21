@@ -4,8 +4,9 @@
 * Git-LFS assets (rig .npz, sample clips, ONNX graphs): downloaded from GitHub's media
   endpoint and checked against the SHA-256 ``oid`` stored in each LFS pointer, so
   git-lfs itself is not required.
-* Checkpoints: the SafeTensors + stats files from huggingface.co/nvidia/MotionBricks,
-  checked against the size/SHA-256 table in upstream ``tools/onnx/checksums.py``.
+* Checkpoints: the SafeTensors + stats files from huggingface.co/nvidia/MotionBricks, fetched
+  by the model package's own downloader (``motionbricks_mlx.hub``, also usable without the
+  sandbox). Its size/SHA-256 manifest is first checked against upstream ``tools/onnx/checksums.py``.
 
 Usage (from the repo root):  uv run python sandbox/scripts/fetch_assets.py [--onnx] [--motions]
 """
@@ -25,8 +26,6 @@ from pathlib import Path
 UPSTREAM_REPO = "https://github.com/NVlabs/motionbricks.git"
 UPSTREAM_COMMIT = "54fc563aeaaf819a753d72cc9fdc6713989cdd43"  # v0.2.0
 MEDIA_URL = "https://media.githubusercontent.com/media/NVlabs/motionbricks/{commit}/{path}"
-HF_REPO = "nvidia/MotionBricks"
-HF_REVISION = "3cb362d9b95aa40462abcb4d8cfae9ffb6d97410"  # the weights this port was tested with
 
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = ROOT / "sandbox" / "upstream"
@@ -91,24 +90,26 @@ def fetch_lfs(relpath: str) -> None:
     staged.replace(target)
 
 
-def fetch_checkpoints() -> None:
-    from huggingface_hub import hf_hub_download
-
+def upstream_checksums() -> set[tuple[str, int, str]]:
+    """(sha256, bytes, repository path) of every checkpoint file in upstream's checksums.py."""
     spec = importlib.util.spec_from_file_location("checksums", UPSTREAM / "tools/onnx/checksums.py")
     checksums = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(checksums)
-    hf_dirs = {"soma": "soma", "g1": "g1"}
-    for kind, release in checksums.CHECKPOINTS.items():
-        for entry in release["files"]:
-            rel = f"{hf_dirs[kind]}/{release['root_directory']}/{entry['path']}"
-            local = CHECKPOINTS / rel
-            if local.is_file() and local.stat().st_size == entry["bytes"] and sha256(local) == entry["sha256"]:
-                print(f"hf: {rel} (verified)")
-                continue
-            print(f"hf: {rel} ({entry['bytes'] / 1e6:.1f} MB)")
-            hf_hub_download(HF_REPO, rel, revision=HF_REVISION, local_dir=CHECKPOINTS)
-            if local.stat().st_size != entry["bytes"] or sha256(local) != entry["sha256"]:
-                raise SystemExit(f"checksum mismatch for {rel}")
+    folders = {"soma": "soma", "g1": "g1"}
+    return {
+        (e["sha256"], e["bytes"], f"{folders[kind]}/{release['root_directory']}/{e['path']}")
+        for kind, release in checksums.CHECKPOINTS.items()
+        for e in release["files"]
+    }
+
+
+def fetch_checkpoints() -> None:
+    from motionbricks_mlx import hub
+
+    ours = {(e.sha256, e.size, e.path) for e in hub.manifest()}
+    if ours != upstream_checksums():
+        raise SystemExit("motionbricks_mlx/assets/checkpoints.sha256 differs from upstream checksums.py")
+    hub.download(dest=CHECKPOINTS)
 
 
 def main() -> None:

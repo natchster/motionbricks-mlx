@@ -272,10 +272,20 @@ impl MetalModel {
     /// `precision`: "float32", "float16", "bfloat16", or "int8" (FP32 activations with INT8
     /// transformer projections, as `motionbricks_mlx.MotionBricks.quantize(8)`).
     pub fn from_checkpoints_with(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: &str) -> Result<Self> {
-        let prec = Precision::parse(precision)?;
-        let int8 = precision == "int8";
         let spec = get_spec(name)?;
         let loaded = read_checkpoints(dir, &spec)?;
+        Self::from_loaded(spec, loaded, max_batch, precision)
+    }
+
+    /// From one converted file (`motionbricks_rs::convert` or `motionbricks_mlx.convert`).
+    pub fn from_converted(path: impl AsRef<Path>, max_batch: usize, precision: &str) -> Result<Self> {
+        let (name, loaded) = crate::weights::read_converted(path)?;
+        Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision)
+    }
+
+    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: &str) -> Result<Self> {
+        let prec = Precision::parse(precision)?;
+        let int8 = precision == "int8";
         let rep = MotionRepresentation::new(spec.num_joints, &loaded.mean, &loaded.std)?;
         let gpu = Gpu::with_precision(prec)?;
         let k = Kernels::new(&gpu)?;
@@ -810,8 +820,21 @@ impl MetalModel {
 
     /// ONNX-Runtime-style call: upload, record (committing in chunks), wait, read back.
     pub fn run(&self, inputs: &HashMap<String, Npy>) -> Result<(Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
+        self.run_with_durations(inputs, None)
+    }
+
+    /// Like [`Self::run`]; `durations` (6..=16 tokens per request) replaces the durations the root
+    /// network would choose (Python: `core.predict(..., num_tokens=...)`).
+    pub fn run_with_durations(&self, inputs: &HashMap<String, Npy>, durations: Option<&[i32]>) -> Result<(Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
         let n = self.upload_inputs(inputs)?;
-        let d = self.dims(n, false);
+        if let Some(t) = durations {
+            if t.len() != n || t.iter().any(|&v| !(6..=16).contains(&v)) {
+                bail!("durations must be {n} values in 6..=16, got {t:?}");
+            }
+            let bits: Vec<f32> = t.iter().map(|&v| f32::from_bits(v as u32)).collect();
+            self.b.nt_in.as_mut_slice()[..n].copy_from_slice(&bits);
+        }
+        let d = self.dims(n, durations.is_some());
         let mut rec = self.recorder();
         self.encode(&mut rec, &d);
         wait(&rec.commit());

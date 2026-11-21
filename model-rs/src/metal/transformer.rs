@@ -243,6 +243,8 @@ pub struct Kernels {
     pub attention: Pipeline,
     /// Simdgroup-matrix attention, keyed by (padded length, head dim).
     attention_mma: HashMap<(usize, usize), Pipeline>,
+    /// Use the scalar attention kernel (one lane per key) even where the MMA kernel applies.
+    pub scalar_attention: bool,
     pub add_ln: Pipeline,
     pub dummy: Buf,
     pub dummy_t: Buf,
@@ -266,6 +268,7 @@ impl Kernels {
                 .into_iter()
                 .map(|(l, d)| Ok(((l, d), gpu.pipeline(&format!("attention_mma_{l}_{d}"))?)))
                 .collect::<Result<_>>()?,
+            scalar_attention: false,
             add_ln: gpu.pipeline("add_layernorm")?,
             dummy: gpu.buffer(4),
             dummy_t: gpu.buffer_t(4),
@@ -430,7 +433,7 @@ impl Kernels {
         };
         let args = [Arg::Buf(qkv, 0), Arg::Buf(pad.unwrap_or(&self.dummy), 0), Arg::Buf(out, 0), Arg::Bytes(as_bytes(&p))];
         let lp = if l <= 16 { 16 } else { 32 };
-        if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= 32 && std::env::var_os("MB_SCALAR_ATTENTION").is_none()) {
+        if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= 32 && !self.scalar_attention) {
             rec.dispatch(pso, &args, (b * h, 1, 1), (lp * 4, 1, 1));
             return;
         }

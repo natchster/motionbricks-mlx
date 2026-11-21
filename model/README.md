@@ -44,6 +44,13 @@ g1 = mb.load("weights/g1.safetensors", dtype="float16")         # float32 | floa
 g1.quantize(bits=8)                                             # experimental: ~4x smaller transformer weights, fastest at N=1
 ```
 
+Install and get the weights (MLX + NumPy only, no sandbox):
+
+```sh
+uv sync --package motionbricks-mlx                                      # from the repository root; or: pip install ./model
+uv run --package motionbricks-mlx motionbricks-mlx download             # checkpoints/MotionBricks/{soma,g1}, SHA-256 verified
+```
+
 From the command line:
 
 ```sh
@@ -52,11 +59,11 @@ uv run --package motionbricks-mlx motionbricks-mlx bench    --model unitree_g1 -
 uv run --package motionbricks-mlx motionbricks-mlx convert  --model soma --checkpoints checkpoints/MotionBricks/soma --output weights/soma.safetensors
 ```
 
-`--package motionbricks-mlx` installs only this package (MLX + NumPy), not the sandbox. Get the
-weights with `sandbox/setup.sh`, or with `uv run --package motionbricks-mlx --extra hub hf download
-nvidia/MotionBricks --local-dir checkpoints/MotionBricks --revision
-3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`. They are licensed under the NVIDIA Open Model Agreement
-and are not part of this repository.
+`--package motionbricks-mlx` installs only this package, not the sandbox. `download`
+(`motionbricks_mlx.hub`) fetches `nvidia/MotionBricks` at revision `3cb362d` over plain HTTPS. It
+checks every file against upstream's size and SHA-256 table (`assets/checkpoints.sha256`) and skips
+files that are already verified. `--model soma|unitree_g1` and `--dir PATH` narrow or move it. The
+weights are licensed under the NVIDIA Open Model Agreement and are not part of this repository.
 
 ## Design notes
 
@@ -84,10 +91,19 @@ and are not part of this repository.
 
 ## Verification
 
-The tests run against NVIDIA's own PyTorch implementation (golden fixtures recorded by
-`sandbox/scripts/make_golden.py`): `uv run --all-packages pytest model/tests`. Every sub-network is
-**teacher-forced** with the exact tensors the PyTorch run produced, so an error localizes to one
-module.
+`uv run --package motionbricks-mlx --extra test pytest model/tests` (or `pip install
+"./model[test]" && pytest model/tests`) runs the suite without the sandbox:
+
+| Tests | Need | Without them |
+|---|---|---|
+| 10 weight-free unit tests (`test_layers.py`) | nothing | always run |
+| 20 behavioural tests (`test_model.py`) | the checkpoints (`motionbricks-mlx download`) | skipped |
+| 40 parity tests (`test_parity.py`) | the golden fixtures from NVIDIA's PyTorch model (`sandbox/setup.sh`) | skipped |
+
+`MOTIONBRICKS_CHECKPOINTS` and `MOTIONBRICKS_GOLDEN` point the tests at other locations. The parity
+tests compare against NVIDIA's own PyTorch implementation, using golden fixtures recorded by
+`sandbox/scripts/make_golden.py`. Every sub-network is **teacher-forced** with the exact tensors the
+PyTorch run produced, so an error localizes to one module.
 
 | Stage (5 request families × 2 models) | Max relative error vs PyTorch FP32 |
 |---|---|

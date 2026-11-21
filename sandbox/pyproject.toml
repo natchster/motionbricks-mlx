@@ -12,7 +12,6 @@ dependencies = [
     "onnxruntime>=1.20",
     "safetensors>=0.4",
     "warp-lang>=1.8",
-    "huggingface_hub>=0.30",
     "motionbricks-mlx",
 ]
 

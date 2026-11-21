@@ -7,7 +7,8 @@
 //! Two sources are supported:
 //! * the Hugging Face SafeTensors folder (`checkpoints/MotionBricks/{soma,g1}`), with the same
 //!   mechanical PyTorch -> MLX renaming and Conv1d transposes as the Python port;
-//! * a single converted file written by the Python port's `motionbricks_mlx.convert`.
+//! * a single converted file written by `motionbricks_mlx.convert` (Python) or [`save_converted`]
+//!   (Rust, `motionbricks_rs::convert`): the same format, readable by both ports.
 //!
 //! Loading is strict: every tensor must be consumed by the model, except the VQ-VAE encoder,
 //! which inference never runs (the Python port keeps it for completeness only).
@@ -106,7 +107,7 @@ pub fn read_checkpoints_with(dir: impl AsRef<Path>, spec: &ModelSpec, contiguous
     for (module, rel, prefix) in spec.checkpoint_files {
         let path = dir.join(rel);
         if !path.is_file() {
-            bail!("missing checkpoint {} (run sandbox/setup.sh)", path.display());
+            bail!("missing checkpoint {} (run model-rs/scripts/download_weights.sh or `motionbricks-mlx download`)", path.display());
         }
         let state = Array::load_safetensors(&path).with_context(|| format!("loading {}", path.display()))?;
         for (name, value) in state {
@@ -129,6 +130,22 @@ pub fn read_checkpoints_with(dir: impl AsRef<Path>, spec: &ModelSpec, contiguous
     let mean = Npy::load(dir.join(spec.stats_files.0))?.to_f32();
     let std = Npy::load(dir.join(spec.stats_files.1))?.to_f32();
     Ok(Loaded { tensors, mean, std })
+}
+
+/// Write a converted single-file model: MLX-layout tensors in `dtype`, the normalization stats,
+/// and `{"model": name, "format": "1"}` metadata (`motionbricks_mlx.weights.save_converted`).
+pub fn save_converted(path: impl AsRef<Path>, name: &str, loaded: &Loaded, dtype: Dtype) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut arrays: Vec<(String, Array)> =
+        loaded.tensors.iter().map(|(k, v)| Ok((k.clone(), v.as_dtype(dtype)?))).collect::<Result<_>>()?;
+    arrays.push(("stats.mean".into(), Array::from_slice(&loaded.mean, &[loaded.mean.len() as i32])));
+    arrays.push(("stats.std".into(), Array::from_slice(&loaded.std, &[loaded.std.len() as i32])));
+    let metadata = HashMap::from([("model".to_string(), name.to_string()), ("format".to_string(), FORMAT_VERSION.to_string())]);
+    Array::save_safetensors(arrays, &metadata, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Read a converted single-file model (`motionbricks_mlx.convert`). Returns the model name too.

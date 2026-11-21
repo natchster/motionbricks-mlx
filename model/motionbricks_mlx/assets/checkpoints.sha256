@@ -1,0 +1,16 @@
+# Released MotionBricks checkpoint files on huggingface.co/nvidia/MotionBricks at revision
+# 3cb362d9b95aa40462abcb4d8cfae9ffb6d97410: sha256, size in bytes, path in the repository.
+# Copied from upstream NVlabs/motionbricks tools/onnx/checksums.py (commit 54fc563),
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0. Read by
+# motionbricks_mlx.hub (Python), model-rs/scripts/download_weights.sh (Rust users) and
+# sandbox/scripts/fetch_assets.py; sandbox/tests checks it against upstream's table.
+8537d9d33a880ff1df6c16c28ed061d60c461a5918d70b1cf99251ff91a10a10   546109841  soma/soma-v6-nova-4n8g-ea43dd8-fp32-v1/mmm-v6-soma-pose-nova-4n8g-ea43dd8-fp32-v1/version_0/checkpoints/model-step=1500000.safetensors
+802f79631ea88a1a920cf44725f5d0e9973a0c8d7adb5359b01bd7a5af57492d        3088  soma/soma-v6-nova-4n8g-ea43dd8-fp32-v1/mmm-v6-soma-pose-nova-4n8g-ea43dd8-fp32-v1/version_0/stats/motion/mean.npy
+1a97818fea2a10e562de059013b081ecf7943d6815a36396f0d94f54ad26acb6        3088  soma/soma-v6-nova-4n8g-ea43dd8-fp32-v1/mmm-v6-soma-pose-nova-4n8g-ea43dd8-fp32-v1/version_0/stats/motion/std.npy
+a48d48c3d8ff98c825ca315797644789ae37f2db9069779a3118f42e84f4f29e   161695084  soma/soma-v6-nova-4n8g-ea43dd8-fp32-v1/mmm-v6-soma-root-nova-4n8g-ea43dd8-fp32-v1/version_0/checkpoints/model-step=1500000.safetensors
+ba0d1db48ba7182ef5d1a72268bfaa1a196f1f1fbf00144c046d947b90684a1a    93442464  soma/soma-v6-nova-4n8g-ea43dd8-fp32-v1/vqvae-v6-soma-nova-4n8g-ea43dd8-fp32-v1/version_0/checkpoints/model-step=1500000.safetensors
+2154d80cac2beb4bb4074b4db92ae59d9fdfbc58651550c32941fe8527d28313   546380073  g1/out/motionbricks_pose/version_1/checkpoints/model-step=2000000.safetensors
+ca390f0081e2373ab71e860a3546cb70cc11fdfac6ce525155403e047b66fdea        3472  g1/out/motionbricks_pose/version_1/stats/motion/mean.npy
+fca7dd6135cbe96504b1307a7db97e9004556937a2fc72d139077b962cee6bd7        3472  g1/out/motionbricks_pose/version_1/stats/motion/std.npy
+da6ff2c05e45dfe4ac5e8e8362a6404f5c927fcddb18410e6804b61e55d4f2dc   136510540  g1/out/motionbricks_root/version_1/checkpoints/model-step=2000000.safetensors
+bf9c31173b334303bf392d184c24701ad1a095b3e94a5fe6b11db4d01343a454    95194080  g1/out/motionbricks_vqvae/version_1/checkpoints/model-step=2000000.safetensors

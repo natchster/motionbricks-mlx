@@ -11,6 +11,7 @@
 //! Port: Apache-2.0 (see the repository's LICENSE and NOTICE).
 
 pub mod config;
+pub mod examples;
 pub mod inference;
 pub mod kernels;
 pub mod layers;
@@ -23,4 +24,4 @@ pub mod representation;
 pub mod rig;
 pub mod weights;
 
-pub use model::{MotionBricks, compiled, parse_dtype};
+pub use model::{MotionBricks, compiled, convert, parse_dtype};

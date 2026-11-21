@@ -20,7 +20,7 @@ use crate::npy::{Npy, load_npz_bytes};
 use crate::ops::*;
 use crate::representation::MotionRepresentation;
 use crate::rig::{G1Rig, SomaRetarget};
-use crate::weights::{Loaded, Weights, read_checkpoints_with, read_converted};
+use crate::weights::{Loaded, Weights, read_checkpoints, read_checkpoints_with, read_converted};
 
 pub const G1_INPUTS: [&str; 6] = [
     "context_qpos", "target_qpos", "has_global_root_values", "has_local_root_values", "has_local_poses",
@@ -48,6 +48,8 @@ pub struct MotionBricks {
     pub core: Core,
     rig: Rig,
     pub num_inference_steps: usize,
+    /// `(bits, group_size)` once [`MotionBricks::quantize`] ran.
+    pub quantization: Option<(i32, i32)>,
 }
 
 pub fn parse_dtype(name: &str) -> Result<Dtype> {
@@ -104,7 +106,21 @@ impl MotionBricks {
         // Materialize the dtype casts once, so they are not part of every generation.
         let params = weights.into_used();
         mlx_rs::transforms::eval(params.iter())?;
-        Ok(MotionBricks { spec, core, rig, num_inference_steps: 1 })
+        Ok(MotionBricks { spec, core, rig, num_inference_steps: 1, quantization: None })
+    }
+
+    /// Affine-quantize the transformer projections of the pose and root networks, like the Python
+    /// port's `MotionBricks.quantize(bits, group_size)` (INT8: `quantize(8, 64)`).
+    pub fn quantize(&mut self, bits: i32, group_size: i32) -> Result<()> {
+        let core = &mut self.core;
+        for t in [&mut core.pose.transformer, &mut core.root.shared, &mut core.root.root_token] {
+            t.quantize(group_size, bits)?;
+        }
+        // Evaluate the quantized weights once, so compiled calls don't recompute them.
+        let params: Vec<&Array> = [&core.pose.transformer, &core.root.shared, &core.root.root_token].iter().flat_map(|t| t.parameters()).collect();
+        mlx_rs::transforms::eval(params)?;
+        self.quantization = Some((bits, group_size));
+        Ok(())
     }
 
     pub fn input_names(&self) -> &'static [&'static str] {
@@ -124,6 +140,11 @@ impl MotionBricks {
     /// Positional inputs in `input_names` order (float32 / bool) -> outputs in `output_names` order.
     /// Builds the lazy graph (eager mode); evaluate with `mlx_rs::transforms::eval`.
     pub fn forward(&self, inputs: &[Array]) -> R<Vec<Array>> {
+        self.forward_with(inputs, None)
+    }
+
+    /// Like [`Self::forward`]; `num_tokens` `(B,)` int32 forces the durations (6..=16 tokens).
+    pub fn forward_with(&self, inputs: &[Array], num_tokens: Option<&Array>) -> R<Vec<Array>> {
         let steps = self.num_inference_steps;
         match &self.rig {
             Rig::G1(rig) => {
@@ -132,7 +153,7 @@ impl MotionBricks {
                 };
                 let (global_root, local_root, local_poses) = rig.preprocess(context, target)?;
                 let (pred, num_tokens) =
-                    self.core.predict(&global_root, has_g, &local_root, has_l, &local_poses, has_p, allowed, steps)?;
+                    self.core.predict_with(&global_root, has_g, &local_root, has_l, &local_poses, has_p, allowed, steps, num_tokens)?;
                 let (qpos, contacts) = rig.postprocess(&pred)?;
                 Ok(vec![qpos, num_tokens, contacts])
             }
@@ -149,7 +170,7 @@ impl MotionBricks {
                     -1,
                 )?;
                 let (pred, num_tokens) =
-                    self.core.predict(global_root, has_g, local_root, has_l, &local_poses, has_p, allowed, steps)?;
+                    self.core.predict_with(global_root, has_g, local_root, has_l, &local_poses, has_p, allowed, steps, num_tokens)?;
                 let pred = cat(
                     &[
                         &slice(&pred, -1, 0, *ga)?,
@@ -173,6 +194,15 @@ impl MotionBricks {
             })
             .collect()
     }
+}
+
+/// Convert the Hugging Face checkpoint folder of `name` into one file that both ports load
+/// (`motionbricks_mlx.convert`). `dtype` is the stored precision.
+pub fn convert(name: &str, dir: impl AsRef<Path>, output: impl AsRef<Path>, dtype: Dtype) -> Result<std::path::PathBuf> {
+    let spec = get_spec(name)?;
+    let loaded = read_checkpoints(dir, &spec)?;
+    crate::weights::save_converted(&output, &spec.name, &loaded, dtype)?;
+    Ok(output.as_ref().to_path_buf())
 }
 
 /// `mx.compile` of the whole generation. The model is shared by the closure, so its weights are

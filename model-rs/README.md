@@ -10,26 +10,40 @@ golden parity tests against NVIDIA's PyTorch model as the Python port.
 | **`motionbricks_rs::metal::model::MetalModel`** | **a model-specific Metal runtime** built from what MLX does generically: a static dispatch plan, its own fused kernels, and GEMM plans tuned per launch; FP32, FP16, BF16, INT8 | **1.96–2.06× at N=1**, 1.61–1.91× at N=2, 1.35–1.45× at N=4, 1.18–1.28× at N=8, 1.07–1.18× at N=16, 1.04–1.09× at N=32 |
 
 The repository README explains when to use which. The Metal runtime is tied to this model
-implementation and to Apple-silicon GPUs, in exchange for the lowest single-request latency.
+implementation and to Apple-silicon GPUs, in exchange for the lowest latency.
 
 ## Build, test, run
 
+Neither runtime needs Python or the sandbox:
+
 ```sh
-cd model-rs
+scripts/download_weights.sh                # checkpoints into ../checkpoints/MotionBricks (curl + shasum, verified)
 cargo build --release                      # first build compiles MLX (~6 min); needs Xcode + its Metal toolchain
-cargo test --release -- --test-threads=1   # both runtimes vs PyTorch + rig kernels vs ops (needs checkpoints/ + sandbox/golden/)
-cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 bench/requests/unitree_g1_N8.npz
-cargo run --release --example generate       -- soma ../checkpoints/MotionBricks/soma bench/requests/soma_N8.npz
-OUT=$PWD/bench/results/raw_fp32 bench/run_all.sh 4 float32 && python3 bench/report_metal.py bench/results/raw_fp32
+cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16
+cargo run --release --example generate       -- soma ../checkpoints/MotionBricks/soma 8 int8
+cargo test --release -- --test-threads=1   # 64 tests; the 16 parity tests also need the sandbox's golden fixtures
 ```
 
-```rust
-let model = MetalModel::from_checkpoints("unitree_g1", "checkpoints/MotionBricks/g1", 64)?; // max batch 64
-let (pred_qpos, pred_num_tokens, foot_contacts) = model.run(&inputs)?; // ONNX input names, NumPy-style arrays
-```
+- **Weights:** `download_weights.sh [all|soma|unitree_g1] [dir]` reads the same checksum table as
+  the Python port's `motionbricks-mlx download`
+  (`../model/motionbricks_mlx/assets/checkpoints.sha256`).
+- **Requests:** the examples take a batch size, which builds a synthetic request with
+  `motionbricks_rs::examples` (the Rust version of the Python generator), or a request `.npz`.
+- **Benchmarks** compare against Python on byte-identical `.npz` requests, so they need the Python
+  environment: `OUT=$PWD/bench/results/raw bench/run_all.sh 3 "float32 bfloat16"` and
+  `python3 bench/report_metal.py bench/results/raw`.
 
 ```rust
+use motionbricks_rs::metal::model::MetalModel;
+let model = MetalModel::from_checkpoints("unitree_g1", "checkpoints/MotionBricks/g1", 64)?;  // FP32, max batch 64
+let inputs = motionbricks_rs::examples::request("unitree_g1", 4, 0);                        // or npy::load_npz(...)
+let (pred_qpos, pred_num_tokens, foot_contacts) = model.run(&inputs)?;                       // ONNX input names
 let fast = MetalModel::from_checkpoints_with("soma", "checkpoints/MotionBricks/soma", 64, "bfloat16")?; // or float16, int8
+let forced = model.run_with_durations(&inputs, Some(&[8, 8, 12, 16]))?;                      // fixed durations
+
+let mut mlx = motionbricks_rs::MotionBricks::from_checkpoints("soma", "checkpoints/MotionBricks/soma", mlx_rs::Dtype::Float32)?;
+mlx.quantize(8, 64)?;                                                                         // INT8, like Python's quantize(8)
+motionbricks_rs::convert("soma", "checkpoints/MotionBricks/soma", "weights/soma.safetensors", mlx_rs::Dtype::Float32)?;
 ```
 
 `.cargo/config.toml` sets `DEVELOPER_DIR` to Xcode and keeps mlx-sys's `mlx.metallib` (175 MB),
@@ -179,9 +193,30 @@ compute-bound, and INT8 pays for dequantizing inside the GEMM.
 
 ## 4. Correctness
 
-`tests/metal_parity.rs` and `tests/parity.rs` cover both runtimes. They use the 5 golden request
-families per model and the Python suite's tolerances. Every sub-network is teacher-forced with
-PyTorch's exact inputs, then the full pipeline runs end to end.
+The test files mirror the Python suite (`../model/tests`) one to one, for both runtimes, with the
+same requests, checks and tolerances:
+
+| File | Counterpart | Tests | Needs |
+|---|---|---|---|
+| `tests/parity.rs` (mlx-rs) | `test_parity.py` | root, pose, VQ-VAE, end to end (eager + compiled), × 2 models, each over all 5 golden cases | checkpoints + golden fixtures |
+| `tests/metal_parity.rs` (Metal) | `test_parity.py` | the same 8; each stage teacher-forced through the runtime's buffers | checkpoints + golden fixtures |
+| `tests/model.rs` (mlx-rs) | `test_model.py` | ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16 vs FP32, converted-file round trip, multi-step decoding, INT8 vs FP32; × 2 models | checkpoints |
+| `tests/metal_model.rs` (Metal) | `test_model.py` | the same, with "chunked commits = one command buffer, runs repeat bitwise" for compiled = eager and "oversized batches are refused" for multi-step decoding, which the release-only plan doesn't run; × 2 models | checkpoints |
+| `tests/layers.rs` (mlx-rs) | `test_layers.py` | sincos table, transformer layer vs float64 PyTorch semantics (fused and fallback attention), ResConv masking and residual, decoder shapes and target override, codebook lookup and digits, rotation round trips, root integration, FP16/BF16 attention, rig kernels vs ops | nothing |
+| `tests/metal_kernels.rs` (Metal) | none (Python runs MLX's kernels) | every `gemm_mma` loader and epilogue under all 33 tile/split plans (442 launches) vs a CPU reference; FP16/BF16 GEMMs; a transformer layer in all 4 precisions with both attention kernels vs float64 | nothing |
+
+`MOTIONBRICKS_CHECKPOINTS` and `MOTIONBRICKS_GOLDEN` override the locations. Tests whose inputs
+are missing print `SKIPPED` and pass, because Rust's harness has no skip state.
+
+Porting `test_compiled_equals_eager` exposed a real difference: in the mlx-rs port (and only
+there), compiled runs differed from eager ones and could flip G1 pose tokens. MLX 0.32.2, which
+mlx-rs 0.34 links, writes scalar constants into compiled kernels with too few digits. Its
+composite attention fallback, used for head dims the fused kernels lack (the root networks' 32),
+multiplies by such a scalar. `layers.rs` now runs that fallback itself, op for op, with the scale
+stored as a `(head_dim,)` array. Eager results are bitwise unchanged, and compiled = eager holds
+bitwise, as in Python.
+
+Golden-fixture parity of the Metal runtime:
 
 | Metal runtime (FP32) vs PyTorch FP32 | SOMA | G1 |
 |---|---|---|
@@ -270,8 +305,10 @@ and the paired speedup. Per-round ranges, GPU times and the mlx-rs port are in
 | `src/metal/transformer.rs` | GEMM planning (tuned table, fitted rule, split-K, kernel specialization), INT8 weights, transformer stack |
 | `src/metal/plans/apple_m4_pro.txt` | tuned GEMM plans for the M4 Pro |
 | `src/metal/model.rs` | weights, buffers, and the per-stage encoders of a generation |
-| `src/*.rs` | the mlx-rs port (`config`, `weights`, `layers`, `networks`, `representation`, `inference`, `rig`, `model`); `kernels.rs` runs the shared rig kernels |
-| `tests/` | `parity.rs` (mlx-rs port, rig kernels vs ops), `metal_parity.rs` (Metal runtime at every precision) |
+| `src/*.rs` | the mlx-rs port (`config`, `weights` incl. `save_converted`, `layers` incl. INT8 `Linear`, `networks`, `representation`, `inference`, `rig`, `model`); `kernels.rs` runs the shared rig kernels; `examples.rs` builds synthetic requests |
+| `tests/` | see [Correctness](#4-correctness): `parity.rs`, `model.rs`, `layers.rs` (mlx-rs port); `metal_parity.rs`, `metal_model.rs`, `metal_kernels.rs` (Metal runtime); `common/` (shared helpers, float64 references) |
+| `scripts/download_weights.sh` | checkpoint download + SHA-256 verification without Python |
+| `examples/` | `generate_metal.rs`, `generate.rs`: one generation from a batch size or a request `.npz` |
 | `src/bin/` | `mbrs-bench` (benchmark); development tools: `gemm-tune` (replay and tune every GEMM launch, write plan tables), `gemm-shapes` (list a generation's GEMMs), `gemm-sweep`, `metal-stages`, `metal-precision` (FP16/BF16/INT8 vs FP32 per stage), `proto-transformer`, `metal-debug` |
 | `bench/` | interleaved Python-vs-Rust harness (`run_all.sh`, `report_metal.py`), `quick_compare.py` (one paired pass), reports and raw results |
 

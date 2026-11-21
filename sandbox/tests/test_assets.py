@@ -1,0 +1,25 @@
+"""The model package's checkpoint manifest matches upstream's own checksum table."""
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+UPSTREAM = ROOT / "sandbox" / "upstream"
+
+
+def load_fetch_assets():
+    spec = importlib.util.spec_from_file_location("fetch_assets", ROOT / "sandbox/scripts/fetch_assets.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.skipif(not (UPSTREAM / "tools/onnx/checksums.py").is_file(), reason="needs sandbox/upstream (run sandbox/setup.sh)")
+def test_checkpoint_manifest_matches_upstream():
+    from motionbricks_mlx import hub
+
+    ours = {(e.sha256, e.size, e.path) for e in hub.manifest()}
+    assert ours == load_fetch_assets().upstream_checksums()
+    assert {path.split("/")[0] for _, _, path in ours} == {"soma", "g1"}

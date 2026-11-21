@@ -11,6 +11,10 @@ uv run --all-packages python model/benchmarks/bench.py --backends mlx-fp32 mlx-i
 uv run --all-packages python model/benchmarks/report.py model/benchmarks/results/<file>.json
 ```
 
+The torch and ONNX Runtime backends need the sandbox (`sandbox/setup.sh`). The MLX port alone can
+be timed without it: `uv run --package motionbricks-mlx motionbricks-mlx bench --model soma
+--checkpoints checkpoints/MotionBricks/soma --batch 1 8 32`.
+
 The Rust ports have their own interleaved Python-vs-Rust harness in
 [`model-rs/bench`](../../model-rs/bench). The Rust Metal runtime's single-request latency is
 4.0 ms in BF16 and 5.2 ms in FP32 (see the

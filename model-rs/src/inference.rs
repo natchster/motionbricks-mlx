@@ -75,6 +75,16 @@ impl Core {
         &self, global_root: &Array, has_global: &Array, local_root: &Array, has_local: &Array, local_poses: &Array,
         has_poses: &Array, allowed: &Array, num_inference_steps: usize,
     ) -> R<(Array, Array)> {
+        self.predict_with(global_root, has_global, local_root, has_local, local_poses, has_poses, allowed, num_inference_steps, None)
+    }
+
+    /// Like [`Self::predict`]; `num_tokens` `(B,)` int32 forces the durations instead of letting the
+    /// root network choose them (Python: `core.predict(..., num_tokens=...)`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn predict_with(
+        &self, global_root: &Array, has_global: &Array, local_root: &Array, has_local: &Array, local_poses: &Array,
+        has_poses: &Array, allowed: &Array, num_inference_steps: usize, num_tokens: Option<&Array>,
+    ) -> R<(Array, Array)> {
         let (rep, dt, f32t) = (&self.rep, self.dtype, Dtype::Float32);
         let f = FRAMES_PER_TOKEN;
         let batch = global_root.dim(0);
@@ -93,7 +103,7 @@ impl Core {
 
         // 1) Duration + root path.
         let out = self.root.forward(
-            &g_n.as_dtype(dt)?, has_global, &l_n.as_dtype(dt)?, has_local, &p_n.as_dtype(dt)?, has_poses, allowed, None,
+            &g_n.as_dtype(dt)?, has_global, &l_n.as_dtype(dt)?, has_local, &p_n.as_dtype(dt)?, has_poses, allowed, num_tokens,
         )?;
         let num_tokens = out.pred_num_tokens;
         let pred_root = out.pred_root.as_dtype(f32t)?;

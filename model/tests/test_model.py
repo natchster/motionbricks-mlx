@@ -86,10 +86,11 @@ def test_low_precision_tracks_fp32(model_name, dtype):
 
 
 def test_converted_weights_round_trip(tmp_path, model_name):
+    original = load_model(model_name)  # skips without checkpoints
     path = mb.convert(model_name, CHECKPOINTS / HF_FOLDERS[model_name], tmp_path / "w.safetensors")
     reloaded = mb.load(path)
     request = examples.request(model_name, batch=2, seed=4)
-    a, b = load_model(model_name).run(request), reloaded.run(request)
+    a, b = original.run(request), reloaded.run(request)
     for key in a:
         assert np.array_equal(a[key], b[key])
 

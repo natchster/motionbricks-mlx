@@ -9,7 +9,7 @@ dev = ["pytest>=8", "pytest-benchmark>=4"]
 [tool.pytest.ini_options]
 testpaths = ["model/tests", "sandbox/tests"]
 markers = [
-    "weights: needs the Hugging Face checkpoints (run sandbox/setup.sh)",
+    "weights: needs the Hugging Face checkpoints (motionbricks-mlx download)",
     "reference: needs the upstream PyTorch reference (torch + sandbox/upstream)",
     "slow: long-running",
 ]

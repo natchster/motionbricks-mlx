@@ -46,6 +46,11 @@ unchanged from upstream tools/onnx/assets/. NVIDIA's contributions to these rig
 assets are licensed under the Apache License, Version 2.0 (upstream LICENSE,
 section "NVIDIA RIG ASSETS").
 
+model/motionbricks_mlx/assets/checkpoints.sha256 lists the released checkpoint
+files with their sizes and SHA-256 digests, copied from upstream
+tools/onnx/checksums.py (Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES,
+Apache-2.0). It is used to verify downloads; it contains no weights.
+
 -------------------------------------------------------------------------------
 Not included, and not covered by this repository's license
 -------------------------------------------------------------------------------

@@ -16,6 +16,21 @@ Rust implementation with a model-specific Metal runtime.
 | [`model-rs/`](model-rs/README.md) | **`motionbricks-rs`** (Rust). It contains an op-for-op port on mlx-rs and a **model-specific Metal runtime** (FP32, FP16, BF16, INT8), the fastest way to run MotionBricks at every batch size. |
 | [`sandbox/`](sandbox/README.md) | **`cudashim`**, a layered CUDA-emulation sandbox for M-series Macs. It maps `torch.cuda`→MPS, TensorRT→ONNX Runtime and Warp kernels→CPU, and optionally compiles CUDA C++→Metal through CuMetal. It also runs NVIDIA's upstream model as the reference oracle for both versions. |
 
+### Quick start: three independent paths
+
+The models don't need the sandbox. Pick the path you need; each one downloads the weights
+(~1.6 GB from `nvidia/MotionBricks` at the pinned revision) and verifies every file's SHA-256.
+
+| Path | Needs | Commands |
+|---|---|---|
+| **Python model only** ([Part 1](#part-1--using-the-python-model-motionbricks_mlx)) | Python 3.12, [uv](https://docs.astral.sh/uv/) (or pip); installs only `mlx` + `numpy` | `uv sync --package motionbricks-mlx`<br>`uv run --package motionbricks-mlx motionbricks-mlx download`<br>`uv run --package motionbricks-mlx motionbricks-mlx generate --model soma --checkpoints checkpoints/MotionBricks/soma --batch 4` |
+| **Rust model only** ([Part 2](#part-2--the-rust-optimized-model-model-rs)) | Rust, Xcode with its Metal toolchain; no Python | `model-rs/scripts/download_weights.sh`<br>`cd model-rs && cargo build --release`<br>`cargo run --release --example generate_metal -- soma ../checkpoints/MotionBricks/soma 4 bfloat16` |
+| **Full sandbox** ([Part 3](#part-3--benchmarking-and-development-sandbox)): NVIDIA's reference, golden fixtures, every test, benchmarks | uv; about 5 GB of disk | `sandbox/setup.sh`<br>`uv run --all-packages pytest`<br>`(cd model-rs && cargo test --release -- --test-threads=1)` |
+
+The model test suites run on the first two paths too. Without the sandbox they run every test
+except the parity tests against NVIDIA's PyTorch model, which need the sandbox's golden fixtures
+and report themselves as skipped.
+
 ### Ported and tested version
 
 | | Version |
@@ -80,15 +95,18 @@ What the table shows:
 ### Setup
 
 ```sh
-sandbox/setup.sh                                   # uv env, pinned upstream, verified weights, ONNX, golden fixtures
-uv run motionbricks-mlx generate --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 4
+uv sync --package motionbricks-mlx                      # only mlx + numpy (or: pip install ./model)
+uv run --package motionbricks-mlx motionbricks-mlx download             # both models; --model soma|unitree_g1
+uv run --package motionbricks-mlx motionbricks-mlx generate --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 4
+uv run --package motionbricks-mlx --extra test pytest model/tests       # 30 tests; +40 parity tests with the sandbox
 ```
 
-Only the weights are required for inference. Without the sandbox (no PyTorch), that is
-`uv sync --package motionbricks-mlx --extra hub`, then `uv run --package motionbricks-mlx hf download
-nvidia/MotionBricks --local-dir checkpoints/MotionBricks --revision
-3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`. The rest of `setup.sh` is for the tests and benchmarks
-(Part 3).
+`download` fetches the checkpoints over plain HTTPS from the revision this port was tested with.
+It checks each file's size and SHA-256 against upstream's own checksum table
+(`model/motionbricks_mlx/assets/checkpoints.sha256`) and skips files that are already verified.
+`--package motionbricks-mlx` keeps the sandbox's PyTorch, ONNX Runtime and Warp out of the
+environment. If you already ran `sandbox/setup.sh` (Part 3), the weights and the full environment
+are in place, and `uv run motionbricks-mlx ...` works too.
 
 ```python
 import motionbricks_mlx as mb
@@ -124,6 +142,11 @@ own inputs. Two Python optimizations were applied for this release:
   at N=32.
 
 ### Correctness
+
+`model/tests` has 70 tests:
+- **10 weight-free unit tests** (every block against NumPy derivations);
+- **20 behavioural tests** that need the checkpoints;
+- **40 parity tests** against NVIDIA's PyTorch model, which need the sandbox's golden fixtures.
 
 Every sub-network is teacher-forced with PyTorch's exact inputs from golden fixtures:
 - **Sub-networks:** root ≤ 4e-6, pose logits ≤ 8e-6 with identical argmax tokens, VQ-VAE
@@ -207,16 +230,25 @@ What changed since the first release, which was FP32 only and 0.97× Python's sp
 ### Usage
 
 ```sh
+model-rs/scripts/download_weights.sh      # curl + shasum against the same checksum table; or: all|soma|unitree_g1 [dir]
 cd model-rs
 cargo build --release      # first build compiles MLX from source (~6 min); needs Xcode + Metal toolchain
-cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 bench/requests/unitree_g1_N8.npz
+cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16   # batch 8, synthetic request
+cargo run --release --example generate -- soma ../checkpoints/MotionBricks/soma 8 int8                 # the mlx-rs port
+cargo test --release -- --test-threads=1  # 64 tests; parity tests skip without the sandbox's fixtures
 ```
+
+The examples take a batch size (a synthetic request from `motionbricks_rs::examples`, the Rust
+version of the Python generator) or a request `.npz` with the ONNX input names.
 
 ```rust
 use motionbricks_rs::metal::model::MetalModel;
 let model = MetalModel::from_checkpoints("unitree_g1", "checkpoints/MotionBricks/g1", 64)?; // FP32, max batch 64
 let (pred_qpos, pred_num_tokens, foot_contacts) = model.run(&inputs)?;  // ONNX input names, NumPy-style arrays
 let fast = MetalModel::from_checkpoints_with("soma", "checkpoints/MotionBricks/soma", 64, "bfloat16")?; // float16 | bfloat16 | int8
+let forced = model.run_with_durations(&inputs, Some(&[8, 12]))?;   // one fixed duration (6..=16 tokens) per request
+motionbricks_rs::convert("soma", "checkpoints/MotionBricks/soma", "weights/soma.safetensors", mlx_rs::Dtype::Float32)?;
+let from_file = MetalModel::from_converted("weights/soma.safetensors", 64, "float32")?;  // same file format as Python's convert
 ```
 
 `model-rs/.cargo/config.toml` points `DEVELOPER_DIR` at Xcode, so `xcode-select` can stay on the
@@ -227,8 +259,23 @@ kernels. The design, the MLX analysis that motivated it, and per-stage profiles 
 
 ### Correctness
 
-`cargo test --release -- --test-threads=1` runs the same golden fixtures and tolerances as the
-Python suite against both Rust runtimes.
+`cargo test --release -- --test-threads=1` mirrors the Python suite file by file, for both Rust
+runtimes, with the same requests, checks and tolerances:
+
+| Python (`model/tests`) | mlx-rs port (`model-rs/tests`) | Metal runtime (`model-rs/tests`) |
+|---|---|---|
+| `test_parity.py`: root, pose, VQ-VAE, end to end × 5 cases × 2 models | `parity.rs`: the same 4 stages × 2 models, each test over all 5 cases (end to end eager and compiled) | `metal_parity.rs`: the same, each stage teacher-forced through the runtime's buffers |
+| `test_model.py`: ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16, converted files, multi-step decoding, INT8 | `model.rs`: all 9, for both models | `metal_model.rs`: the same, except compiled = eager becomes "chunked commits = one command buffer" and multi-step decoding (not in the release-only plan) becomes refusing oversized batches |
+| `test_layers.py`: 10 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels |
+
+That gives 64 Rust tests: 12 weight-free, 36 behavioural and 16 parity tests. Rust's test
+harness has no skip state, so tests without their checkpoints or fixtures print `SKIPPED` and pass.
+
+Porting `compiled = eager` found a real bug: compiled mlx-rs runs could flip pose tokens. MLX 0.32.2
+(the version mlx-rs links) writes scalar constants into compiled kernels with too few digits, which
+broke the fallback attention MLX uses for the root networks' head dim 32. The port now runs that
+fallback itself with the scale stored as an array. Compiled and eager are bitwise identical again,
+as in Python.
 - **Metal runtime, FP32:** every sub-network stays within ≤ 1.2e-5 relative, and durations and pose
   tokens are identical. End to end, SOMA rotations are within ≤ 9.4e-4 and G1 `pred_qpos` within
   ≤ 1.6e-4.
@@ -264,8 +311,8 @@ and limits are in [sandbox/README.md](sandbox/README.md).
 
 ```sh
 sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden fixtures
-uv run --all-packages pytest                  # Python: 87 tests (70 model, 17 sandbox incl. 3 CuMetal)
-(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: both runtimes vs the golden fixtures
+uv run --all-packages pytest                  # Python: 88 tests (70 model, 18 sandbox incl. 3 CuMetal)
+(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 64 tests, both runtimes vs the golden fixtures
 ```
 
 - **Golden fixtures:** `sandbox/scripts/make_golden.py` records the inputs and outputs of every

@@ -68,6 +68,10 @@ Sources:
 
 ## Setup
 
+The sandbox is only needed for NVIDIA's reference model, the golden fixtures, the parity tests and
+the cross-backend benchmarks. The Python and Rust models install and run without it (see the
+repository README's quick start).
+
 ```sh
 sandbox/setup.sh                 # ~1.6 GB checkpoints + 1.5 GB local ONNX export, all verified
 uv run --all-packages cudashim-doctor
@@ -79,8 +83,9 @@ uv run --all-packages cudashim-doctor
 2. Clones NVlabs/motionbricks at the pinned v0.2.0 commit into `sandbox/upstream/`.
 3. Fetches the Git-LFS rig assets through GitHub's media endpoint and checks each one against
    its LFS pointer's SHA-256, so git-lfs isn't needed.
-4. Downloads the checkpoints from `nvidia/MotionBricks` and checks them against upstream's
-   `checksums.py`.
+4. Downloads the checkpoints from `nvidia/MotionBricks` with the model package's own downloader
+   (`motionbricks_mlx.hub`, the same one `motionbricks-mlx download` uses). It first checks that
+   the package's checksum table matches upstream's `checksums.py`.
 5. Exports the ONNX graphs with **NVIDIA's own exporter**, including its `onnx.checker` and
    interface validation. This replaces the slow 760 MB LFS downloads.
 6. Records golden fixtures with the upstream PyTorch model.
@@ -124,6 +129,7 @@ NumPy arrays or Warp CPU arrays.
 
 | Test | Proves |
 |---|---|
+| `test_assets.py` | The model package's checkpoint manifest (`model/motionbricks_mlx/assets/checkpoints.sha256`), which the model-only download paths verify against, equals upstream's `checksums.py`. |
 | `test_torch_cuda_shim.py` | `device="cuda"`, `.cuda()`, `Module.cuda()`, events, autocast, sync. Results land on MPS and match CPU numerics. |
 | `test_reference_on_mps.py` | **NVIDIA's PyTorch MotionBricks, moved with `.cuda()`**, runs on the Apple GPU and matches the CPU golden outputs. |
 | `test_tensorrt_shim.py` | **NVIDIA's own `build_serialized_engine` + `inspect_engine_tensors`** produce a plan from the G1 graph. A named-tensor `execute_async_v3` launch matches the PyTorch golden outputs. |

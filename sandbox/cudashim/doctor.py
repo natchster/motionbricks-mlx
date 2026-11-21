@@ -12,9 +12,12 @@ ROOT = Path(__file__).resolve().parents[2]
 NATIVE = ROOT / "sandbox" / "native" / "toolchains"
 
 
-def _run(cmd):
+XCODE = Path("/Applications/Xcode.app/Contents/Developer")
+
+
+def _run(cmd, env=None):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20, env=env).stdout.strip()
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
@@ -58,7 +61,14 @@ def report() -> list[tuple[str, str, str]]:
     except Exception as exc:  # noqa: BLE001
         rows.append(("warp kernels -> cpu", "missing", str(exc)))
 
+    # Like the CuMetal installer and tests: aim xcrun at Xcode per process when xcode-select points
+    # at the Command Line Tools, which have no Metal compiler.
     metal = _run(["xcrun", "-sdk", "macosx", "-f", "metal"])
+    if not metal and XCODE.is_dir():
+        import os
+
+        metal = _run(["xcrun", "-sdk", "macosx", "-f", "metal"], env={**os.environ, "DEVELOPER_DIR": str(XCODE)})
+        metal = metal and f"{metal} (DEVELOPER_DIR={XCODE})"
     rows.append(("xcode metal compiler", "ok" if metal else "missing", metal or "install Xcode + `xcodebuild -downloadComponent MetalToolchain`"))
     cumetal = shutil.which("cumetal") or next(iter(NATIVE.glob("cumetal*/bin/cumetal")), None)
     rows.append(("cuda c++ -> metal (cumetal)", "ok" if cumetal else "not installed",
