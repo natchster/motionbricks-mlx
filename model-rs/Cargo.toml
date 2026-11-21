@@ -41,3 +41,15 @@ path = "src/bin/metal_debug.rs"
 [[bin]]
 name = "metal-stages"
 path = "src/bin/metal_stages.rs"
+
+[[bin]]
+name = "metal-precision"
+path = "src/bin/metal_precision.rs"
+
+[[bin]]
+name = "gemm-shapes"
+path = "src/bin/gemm_shapes.rs"
+
+[[bin]]
+name = "gemm-tune"
+path = "src/bin/gemm_tune.rs"

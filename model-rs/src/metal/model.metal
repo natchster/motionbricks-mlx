@@ -26,7 +26,9 @@ struct Dims {
     device const float* gr [[buffer(0)]], device const float* lr [[buffer(1)]], device const float* lp [[buffer(2)]],
     device const float* stats [[buffer(3)]],  // g_mean5 g_scale5 l_mean4 l_scale4 p_mean[PD] p_scale[PD]
     device float* gn [[buffer(4)]], device float* ln [[buffer(5)]], device float* pn [[buffer(6)]],
-    device float* info [[buffer(7)]], constant Dims& d [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+    device float* info [[buffer(7)]], constant Dims& d [[buffer(8)]],
+    device T* gn_t [[buffer(9)]], device T* ln_t [[buffer(10)]], device T* pn_t [[buffer(11)]],
+    uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 8) return;
   const int b = int(gid) / 8;
   device const float* g0 = gr + b * 40;
@@ -39,10 +41,10 @@ struct Dims {
   device const float* ls = stats + 14;
   device const float* pm = stats + 18;
   device const float* ps = stats + 18 + d.PD;
-  for (int i = 0; i < 5; i++) gn[gid * 5 + i] = (rec[i] - gm[i]) / gs[i];
-  for (int i = 0; i < 4; i++) ln[gid * 4 + i] = (lr[gid * 4 + i] - lm[i]) / ls[i];
-  pn[gid * d.PD] = (rec[1] - pm[0]) / ps[0];
-  for (int i = 1; i < d.PD; i++) pn[gid * d.PD + i] = (lp[gid * (d.PD - 1) + i - 1] - pm[i]) / ps[i];
+  for (int i = 0; i < 5; i++) { float v = (rec[i] - gm[i]) / gs[i]; gn[gid * 5 + i] = v; gn_t[gid * 5 + i] = T(v); }
+  for (int i = 0; i < 4; i++) { float v = (lr[gid * 4 + i] - lm[i]) / ls[i]; ln[gid * 4 + i] = v; ln_t[gid * 4 + i] = T(v); }
+  { float v = (rec[1] - pm[0]) / ps[0]; pn[gid * d.PD] = v; pn_t[gid * d.PD] = T(v); }
+  for (int i = 1; i < d.PD; i++) { float v = (lp[gid * (d.PD - 1) + i - 1] - pm[i]) / ps[i]; pn[gid * d.PD + i] = v; pn_t[gid * d.PD + i] = T(v); }
   if (gid % 8 == 0) {
     info[b * 4 + 0] = atan2(g0[4], g0[3]);
     info[b * 4 + 1] = ox;
@@ -213,9 +215,9 @@ constant constexpr G1Off GO = {0, 9, 9 + 87, 9 + 87 + 261, 9 + 87 + 261 + 90, 9 
 // X1 (B, 9, E): row 0 = num-token query embedding, rows 1..8 = positioned frame embeddings.
 // FE (B, 8, E) = frame embeddings (start block for frames 0..3, end block for 4..7).
 [[kernel]] void root_assemble(
-    device const float* S [[buffer(0)]], device const float* Eb [[buffer(1)]],
-    device const float* pos_emb [[buffer(2)]], device const float* query_emb [[buffer(3)]],
-    device const int* nt_in [[buffer(4)]], device float* X1 [[buffer(5)]], device float* FE [[buffer(6)]],
+    device const T* S [[buffer(0)]], device const T* Eb [[buffer(1)]],
+    device const T* pos_emb [[buffer(2)]], device const T* query_emb [[buffer(3)]],
+    device const int* nt_in [[buffer(4)]], device T* X1 [[buffer(5)]], device T* FE [[buffer(6)]],
     constant Dims& d [[buffer(7)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 9 * d.E) return;
   const int c = int(gid) % d.E, r = (int(gid) / d.E) % 9, b = int(gid) / (9 * d.E);
@@ -225,19 +227,19 @@ constant constexpr G1Off GO = {0, 9, 9 + 87, 9 + 87 + 261, 9 + 87 + 261 + 90, 9 
     return;
   }
   const int f = r - 1;
-  float fe = (f < 4 ? S : Eb)[(long)(b * 8 + f) * d.E + c];
+  T fe = (f < 4 ? S : Eb)[(long)(b * 8 + f) * d.E + c];
   FE[(long)(b * 8 + f) * d.E + c] = fe;
-  X1[gid] = fe + pos_emb[f * d.E + c];
+  X1[gid] = T(float(fe) + float(pos_emb[f * d.E + c]));
 }
 
 // Duration choice (shared by the kernels below): masked logits from the first token's head.
-inline int choose(device const float* logits, device const float* allowed, device const int* nt_in, constant Dims& d, int b) {
+inline int choose(device const T* logits, device const float* allowed, device const int* nt_in, constant Dims& d, int b) {
   if (d.forced && nt_in[b] != 18) return nt_in[b] - 6;
-  device const float* l = logits + (long)b * 9 * 12;  // row b*9 of (B*9, 12)
+  device const T* l = logits + (long)b * 9 * 12;  // row b*9 of (B*9, 12)
   int best = 0;
   float bv = -INFINITY;
   for (int i = 0; i < 11; i++) {
-    float v = allowed[b * 11 + i] != 0.0f ? l[i] : -INFINITY;
+    float v = allowed[b * 11 + i] != 0.0f ? float(l[i]) : -INFINITY;
     if (v > bv) { bv = v; best = i; }
   }
   return best;
@@ -246,20 +248,20 @@ inline int choose(device const float* logits, device const float* allowed, devic
 // X2 (B, 25, E): middle token, positioned frames, position table; pad2 (B, 25);
 // nt (B), token masks m16 (B,16), m32 (B,32), m64 (B,64), pose padding (B,16), masked logits (B,12).
 [[kernel]] void root_second_input(
-    device const float* logits [[buffer(0)]], device const float* allowed [[buffer(1)]],
-    device const int* nt_in [[buffer(2)]], device const float* FE [[buffer(3)]],
-    device const float* middle_emb [[buffer(4)]], device const float* pos_table [[buffer(5)]],
-    device float* X2 [[buffer(6)]], device float* pad2 [[buffer(7)]], device int* nt [[buffer(8)]],
+    device const T* logits [[buffer(0)]], device const float* allowed [[buffer(1)]],
+    device const int* nt_in [[buffer(2)]], device const T* FE [[buffer(3)]],
+    device const T* middle_emb [[buffer(4)]], device const T* pos_table [[buffer(5)]],
+    device T* X2 [[buffer(6)]], device float* pad2 [[buffer(7)]], device int* nt [[buffer(8)]],
     device float* m16 [[buffer(9)]], device float* logits_out [[buffer(10)]], constant Dims& d [[buffer(11)]],
     device float* m32 [[buffer(12)]], device float* m64 [[buffer(13)]], device float* ppad [[buffer(14)]],
-    device const float* in_pos [[buffer(15)]], uint gid [[thread_position_in_grid]]) {
+    device const T* in_pos [[buffer(15)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 25 * d.E) return;
   const int c = int(gid) % d.E, r = (int(gid) / d.E) % 25, b = int(gid) / (25 * d.E);
   const int chosen = choose(logits, allowed, nt_in, d, b);
   const int pred = chosen + 6;
-  float v;
+  T v;
   if (r == 0) v = middle_emb[chosen * d.E + c];
-  else if (r < 9) v = FE[(long)(b * 8 + r - 1) * d.E + c] + in_pos[(r - 1) * d.E + c];  // positioned (pre-transformer)
+  else if (r < 9) v = T(float(FE[(long)(b * 8 + r - 1) * d.E + c]) + float(in_pos[(r - 1) * d.E + c]));  // positioned (pre-transformer)
   else v = pos_table[(r - 9) * d.E + c];
   X2[gid] = v;
   if (c == 0) pad2[b * 25 + r] = (r >= 9 && (r - 9) >= pred) ? 1.0f : 0.0f;
@@ -269,18 +271,18 @@ inline int choose(device const float* logits, device const float* allowed, devic
     if (c < 16) { m16[b * 16 + c] = c < pred ? 1.0f : 0.0f; ppad[b * 16 + c] = c >= pred ? 1.0f : 0.0f; }
     if (c == 0) nt[b] = pred;
     if (c < 12) {
-      device const float* l = logits + (long)b * 9 * 12;
-      logits_out[b * 12 + c] = (c < 11 && allowed[b * 11 + c] != 0.0f) ? l[c] : -INFINITY;
+      device const T* l = logits + (long)b * 9 * 12;
+      logits_out[b * 12 + c] = (c < 11 && allowed[b * 11 + c] != 0.0f) ? float(l[c]) : -INFINITY;
     }
   }
 }
 
 // Dense 64-frame decoder conditions: dense_frame (B,64,E), dense_root (B,64,5), dense_has (B,64).
 [[kernel]] void root_dense_cond(
-    device const float* FE [[buffer(0)]], device const float* gn [[buffer(1)]],
+    device const T* FE [[buffer(0)]], device const float* gn [[buffer(1)]],
     device const float* hg [[buffer(2)]], device const float* hl [[buffer(3)]], device const float* hp [[buffer(4)]],
-    device const float* no_frame [[buffer(5)]], device const int* nt [[buffer(6)]],
-    device float* dframe [[buffer(7)]], device float* droot [[buffer(8)]], device float* dhas [[buffer(9)]],
+    device const T* no_frame [[buffer(5)]], device const int* nt [[buffer(6)]],
+    device T* dframe [[buffer(7)]], device T* droot [[buffer(8)]], device float* dhas [[buffer(9)]],
     constant Dims& d [[buffer(10)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 64 * d.E) return;
   const int c = int(gid) % d.E, t = (int(gid) / d.E) % 64, b = int(gid) / (64 * d.E);
@@ -289,20 +291,20 @@ inline int choose(device const float* logits, device const float* allowed, devic
   if (t < 4) src = t;
   for (int i = 0; i < 4; i++)
     if (t == pred * 4 - 4 + i) src = 4 + i;
-  float v = no_frame[c];
+  T v = no_frame[c];
   if (src >= 0) {
     int fi = b * 8 + src;
     bool has_frame = hp[fi] != 0.0f || hg[fi] != 0.0f || hl[fi] != 0.0f;
     v = has_frame ? FE[(long)fi * d.E + c] : no_frame[c];
   }
   dframe[gid] = v;
-  if (c < 5) droot[(b * 64 + t) * 5 + c] = src >= 0 ? gn[(b * 8 + src) * 5 + c] : 0.0f;
+  if (c < 5) droot[(b * 64 + t) * 5 + c] = T(src >= 0 ? gn[(b * 8 + src) * 5 + c] : 0.0f);
   if (c == 0) dhas[b * 64 + t] = src >= 0 ? hg[b * 8 + src] : 0.0f;
 }
 
 // dst[b, r, :] = src[b, r + off, :] for r < rows_out (rows_in per batch item in src).
 [[kernel]] void copy_rows(
-    device const float* src [[buffer(0)]], device float* dst [[buffer(1)]],
+    device const T* src [[buffer(0)]], device T* dst [[buffer(1)]],
     constant int4& p [[buffer(2)]],  // B, rows_in, rows_out, off
     constant int& width [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= p.x * p.z * width) return;
@@ -313,13 +315,13 @@ inline int choose(device const float* logits, device const float* allowed, devic
 // --- root -> pose (global_root_to_local, last-frame patch, dense pose conditions) ----------------
 // One thread per (b, t). PR: normalized pred root (B,64,5).
 [[kernel]] void root_to_pose(
-    device const float* PR [[buffer(0)]], device const int* nt [[buffer(1)]],
+    device const T* PR [[buffer(0)]], device const int* nt [[buffer(1)]],
     device const float* stats [[buffer(2)]],  // as in prep
     device const float* ln [[buffer(3)]], device const float* hl [[buffer(4)]],
     device const float* pn [[buffer(5)]], device const float* hp [[buffer(6)]],
-    device const float* len_emb [[buffer(7)]],
-    device float* ext [[buffer(8)]], device float* rcond [[buffer(9)]], device float* pcond [[buffer(10)]],
-    device float* hpc [[buffer(11)]], device float* LE [[buffer(12)]],
+    device const T* len_emb [[buffer(7)]],
+    device T* ext [[buffer(8)]], device T* rcond [[buffer(9)]], device T* pcond [[buffer(10)]],
+    device float* hpc [[buffer(11)]], device T* LE [[buffer(12)]],
     constant Dims& d [[buffer(13)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 64) return;
   const int b = int(gid) / 64, t = int(gid) % 64;
@@ -329,7 +331,7 @@ inline int choose(device const float* logits, device const float* allowed, devic
   device const float* ls = stats + 14;
   const int pred = nt[b];
   const int last = pred * 4 - 1;
-  auto root = [&](int f, int i) { return PR[(b * 64 + f) * 5 + i] * gs[i] + gm[i]; };
+  auto root = [&](int f, int i) { return float(PR[(b * 64 + f) * 5 + i]) * gs[i] + gm[i]; };
   auto angle = [&](int f) {
     float h = atan2(root(f, 4), root(f, 3));
     return atan2(sin(h / 2.0f), cos(h / 2.0f)) * 2.0f;
@@ -351,8 +353,8 @@ inline int choose(device const float* logits, device const float* allowed, devic
     float h = hl[b * 8 + 7];
     for (int i = 0; i < 4; i++) lrn[i] = h * ln[(b * 8 + 7) * 4 + i] + (1.0f - h) * lrn[i];
   }
-  ext[gid * 2 + 0] = lrn[1];
-  ext[gid * 2 + 1] = lrn[2];
+  ext[gid * 2 + 0] = T(lrn[1]);
+  ext[gid * 2 + 1] = T(lrn[2]);
   rcond[gid * 4 + 0] = PR[gid * 5 + 0];
   rcond[gid * 4 + 1] = PR[gid * 5 + 2];
   rcond[gid * 4 + 2] = PR[gid * 5 + 3];
@@ -361,7 +363,7 @@ inline int choose(device const float* logits, device const float* allowed, devic
   if (t < 4) src = t;
   for (int i = 0; i < 4; i++)
     if (t == pred * 4 - 4 + i) src = 4 + i;
-  for (int i = 0; i < d.PD; i++) pcond[(long)gid * d.PD + i] = src >= 0 ? pn[(long)(b * 8 + src) * d.PD + i] : 0.0f;
+  for (int i = 0; i < d.PD; i++) pcond[(long)gid * d.PD + i] = T(src >= 0 ? pn[(long)(b * 8 + src) * d.PD + i] : 0.0f);
   hpc[gid] = src >= 0 ? hp[b * 8 + src] : 0.0f;
   if (t < 16)
     for (int i = 0; i < d.len_w; i++) LE[(b * 16 + t) * d.len_w + i] = len_emb[(pred - 6) * d.len_w + i];
@@ -369,16 +371,16 @@ inline int choose(device const float* logits, device const float* allowed, devic
 
 // --- pose tokens: argmax per head + codebook lookup -----------------------------------------------
 [[kernel]] void argmax_dequant(
-    device const float* logits [[buffer(0)]], device const float* codebook [[buffer(1)]],
-    device int* tokens [[buffer(2)]], device float* lat [[buffer(3)]],
+    device const T* logits [[buffer(0)]], device const T* codebook [[buffer(1)]],
+    device int* tokens [[buffer(2)]], device T* lat [[buffer(3)]],
     constant Dims& d [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= d.B * 16 * d.H) return;
   const int h = int(gid) % d.H, row = int(gid) / d.H;
-  device const float* l = logits + (long)row * d.H * d.codes + h * d.codes;
+  device const T* l = logits + (long)row * d.H * d.codes + h * d.codes;
   int best = 0;
-  float bv = l[0];
+  float bv = float(l[0]);
   for (int i = 1; i < d.codes; i++)
-    if (l[i] > bv) { bv = l[i]; best = i; }
+    if (float(l[i]) > bv) { bv = float(l[i]); best = i; }
   tokens[gid] = best;
   for (int i = 0; i < d.cw; i++) lat[(long)row * d.H * d.cw + h * d.cw + i] = codebook[(h * d.codes + best) * d.cw + i];
 }
@@ -387,7 +389,7 @@ inline int choose(device const float* logits, device const float* allowed, devic
 // One thread per batch item. recon (B,64,LD) normalized local; out (B,64,GD) gets the root (5).
 // mode 1 = SOMA "from_height_constraint_violation", 0 = G1 "from_pose_module".
 [[kernel]] void finish_root(
-    device const float* recon [[buffer(0)]], device const float* PR [[buffer(1)]],
+    device const T* recon [[buffer(0)]], device const T* PR [[buffer(1)]],
     device const float* stats [[buffer(2)]], device const float* gn [[buffer(3)]],
     device const float* hg [[buffer(4)]], device const int* nt [[buffer(5)]], device const float* info [[buffer(6)]],
     device float* out [[buffer(7)]], constant Dims& d [[buffer(8)]], constant int& mode [[buffer(9)]],
@@ -400,8 +402,8 @@ inline int choose(device const float* logits, device const float* allowed, devic
   float GR[64][5];
   float yaw = 0.0f, x = 0.0f, z = 0.0f;
   for (int t = 0; t < 64; t++) {
-    device const float* r = recon + (long)(b * 64 + t) * d.LD;
-    float r0 = r[0] * ls[0] + lm[0], r1 = r[1] * ls[1] + lm[1], r2 = r[2] * ls[2] + lm[2], r3 = r[3] * ls[3] + lm[3];
+    device const T* r = recon + (long)(b * 64 + t) * d.LD;
+    float r0 = float(r[0]) * ls[0] + lm[0], r1 = float(r[1]) * ls[1] + lm[1], r2 = float(r[2]) * ls[2] + lm[2], r3 = float(r[3]) * ls[3] + lm[3];
     float hd = atan2(sin(yaw / 2.0f), cos(yaw / 2.0f)) * 2.0f;
     GR[t][0] = x; GR[t][1] = r3; GR[t][2] = z; GR[t][3] = cos(hd); GR[t][4] = sin(hd);
     yaw += r0 / FPS;
@@ -414,7 +416,7 @@ inline int choose(device const float* logits, device const float* allowed, devic
     float ep = 0.0f, er = 0.0f, ws = 0.0f;
     for (int i = 0; i < 4; i++) {
       int tf = (pred - 1) * 4 + i;
-      float h_root = PR[(b * 64 + tf) * 5 + 1] * gs[1] + gm[1];
+      float h_root = float(PR[(b * 64 + tf) * 5 + 1]) * gs[1] + gm[1];
       float h_pose = GR[tf][1];
       float h_tgt = gn[(b * 8 + 4 + i) * 5 + 1] * gs[1] + gm[1];
       float w = hg[b * 8 + 4 + i];
@@ -428,7 +430,7 @@ inline int choose(device const float* logits, device const float* allowed, devic
   const float h0 = info[b * 4], ox = info[b * 4 + 1], oz = info[b * 4 + 2];
   for (int t = 0; t < 64; t++) {
     float rt[5];
-    for (int i = 0; i < 5; i++) rt[i] = use_root ? PR[(b * 64 + t) * 5 + i] * gs[i] + gm[i] : GR[t][i];
+    for (int i = 0; i < 5; i++) rt[i] = use_root ? float(PR[(b * 64 + t) * 5 + i]) * gs[i] + gm[i] : GR[t][i];
     float a = atan2(rt[4], rt[3]) + h0;
     device float* o = out + (long)(b * 64 + t) * d.GD;
     o[0] = rt[0] + ox; o[1] = rt[1]; o[2] = rt[2] + oz; o[3] = cos(a); o[4] = sin(a);
@@ -437,12 +439,12 @@ inline int choose(device const float* logits, device const float* allowed, devic
 
 // out[b, t, 5 + i] = unnormalized body feature i (thread per element).
 [[kernel]] void body_out(
-    device const float* recon [[buffer(0)]], device const float* body_stats [[buffer(1)]],
+    device const T* recon [[buffer(0)]], device const float* body_stats [[buffer(1)]],
     device float* out [[buffer(2)]], constant Dims& d [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
   const int nb = d.LD - 4;
   if (int(gid) >= d.B * 64 * nb) return;
   const int i = int(gid) % nb, row = int(gid) / nb;
-  out[(long)row * d.GD + 5 + i] = recon[(long)row * d.LD + 4 + i] * body_stats[nb + i] + body_stats[i];
+  out[(long)row * d.GD + 5 + i] = float(recon[(long)row * d.LD + 4 + i]) * body_stats[nb + i] + body_stats[i];
 }
 
 // --- Unitree G1 joint-angle decoding (G1Rig.decode / postprocess), one thread per frame -----------

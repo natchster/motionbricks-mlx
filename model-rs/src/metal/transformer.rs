@@ -2,20 +2,21 @@
 // Rust port of motionbricks_mlx (MLX port of NVlabs/motionbricks).
 // Original model: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
-//! Post-norm transformer encoder (PyTorch `nn.TransformerEncoderLayer`, ReLU FFN) on the custom
-//! Metal runtime: 7 dispatches per layer (qkv GEMM, attention, out GEMM, add+LN, FFN GEMM+ReLU,
-//! FFN GEMM, add+LN) into preallocated buffers.
+//! GEMM front-end (tile planning, split-K, kernel specialization) and the post-norm transformer
+//! encoder (PyTorch `nn.TransformerEncoderLayer`, ReLU FFN) on the custom Metal runtime.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use mlx_rs::Array;
+use mlx_rs::ops::{QuantizeOptions, quantize};
 
-use super::{Arg, Buf, Gpu, Pipeline, Recorder, as_bytes};
+use super::{Arg, Buf, Gpu, Pipeline, Precision, Recorder, as_bytes};
 use crate::ops::to_vec_f32;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 pub struct GemmParams {
     pub m: i32,
     pub n: i32,
@@ -50,31 +51,6 @@ impl GemmParams {
     pub fn new(m: usize, n: usize, k: usize) -> Self {
         GemmParams { m: m as i32, n: n as i32, k: k as i32, lda: k as i32, ldy: n as i32, ..Default::default() }
     }
-    fn steel_ok(&self) -> bool {
-        self.conv_taps == 0 && self.has_mask == 0 && self.a_relu == 0 && self.k1 == 0 && self.y_mask == 0
-            && self.y_pred == 0 && self.blend == 0 && self.r_mod == 0
-    }
-}
-
-/// One GEMM launch: operands, parameters and optional side inputs.
-pub struct GemmCall<'a> {
-    pub a: (&'a Buf, usize),
-    pub w: &'a Buf,
-    pub bias: &'a Buf,
-    pub y: (&'a Buf, usize),
-    pub p: GemmParams,
-    pub amask: Option<&'a Buf>,
-    pub res: Option<(&'a Buf, usize)>,
-    pub a2: Option<&'a Buf>,
-    pub a3: Option<&'a Buf>,
-    pub ymask: Option<&'a Buf>,
-    pub missing: Option<&'a Buf>,
-}
-
-impl<'a> GemmCall<'a> {
-    pub fn new(a: &'a Buf, w: &'a Buf, bias: &'a Buf, y: &'a Buf, p: GemmParams) -> Self {
-        GemmCall { a: (a, 0), w, bias, y: (y, 0), p, amask: None, res: None, a2: None, a3: None, ymask: None, missing: None }
-    }
 }
 
 #[repr(C)]
@@ -96,51 +72,25 @@ struct LnParams {
     eps: f32,
 }
 
-/// `GEMMParams` / `GEMMAddMMParams` of MLX's steel GEMM (mlx/backend/metal/kernels/steel/gemm/params.h).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SteelParams {
-    m: i32,
-    n: i32,
-    k: i32,
-    lda: i32,
-    ldb: i32,
-    ldd: i32,
-    tiles_n: i32,
-    tiles_m: i32,
-    batch_stride_a: i64,
-    batch_stride_b: i64,
-    batch_stride_d: i64,
-    swizzle_log: i32,
-    gemm_k_iterations_aligned: i32,
-    batch_ndim: i32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct SteelAddmm {
-    ldc: i32,
-    fdc: i32,
-    batch_stride_c: i64,
-    alpha: f32,
-    beta: f32,
-}
-
-/// The steel variant MLX selects on this GPU class (`applegpu_g16s`: bm64 bn64 bk16 wm2 wn2).
-const STEEL: &str = "steel_gemm_fused_nt_float32_float32_bm64_bn64_bk16_wm2_wn2";
-const STEEL_TILE: (usize, usize, usize, usize, usize) = (64, 64, 16, 2, 2);
-/// Plain GEMMs with more rows than this use MLX's steel kernel; fewer use gemm_mma.
-pub const STEEL_MIN_ROWS: usize = 33;
-/// Non-plain GEMMs (convs, concat, masks, blends) with at least this many rows are materialized
-/// to a plain matrix and run on steel; smaller ones use the fused gemm_mma.
-pub const MATERIALIZE_MIN_ROWS: usize = 256;
-
 pub const ACT_NONE: i32 = 0;
 pub const ACT_RELU: i32 = 1;
 pub const ACT_LEAKY: i32 = 2;
 
+/// INT8 weight in MLX's affine format (bits 8, group 64): packed u32 [N][K/4], f32 scales/biases [N][K/64].
+pub struct QWeight {
+    pub q: Buf,
+    pub scales: Buf,
+    pub biases: Buf,
+}
+
+/// A projection weight: dense `T` or INT8.
+pub enum Weight {
+    Dense(Buf),
+    Q8(QWeight),
+}
+
 /// One GEMM tile configuration (must match an instantiation in kernels.metal).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Tile {
     pub bm: usize,
     pub bn: usize,
@@ -149,20 +99,22 @@ pub struct Tile {
     pub wn: usize,
 }
 
-pub const TILES: [Tile; 13] = [
-    Tile { bm: 16, bn: 32, bk: 32, wm: 1, wn: 2 },
-    Tile { bm: 16, bn: 64, bk: 32, wm: 1, wn: 4 },
-    Tile { bm: 16, bn: 64, bk: 64, wm: 1, wn: 4 },
-    Tile { bm: 32, bn: 32, bk: 16, wm: 2, wn: 2 },
-    Tile { bm: 32, bn: 64, bk: 16, wm: 2, wn: 2 },
-    Tile { bm: 32, bn: 64, bk: 32, wm: 2, wn: 2 },
-    Tile { bm: 64, bn: 32, bk: 16, wm: 2, wn: 2 },
-    Tile { bm: 64, bn: 64, bk: 16, wm: 2, wn: 2 },
-    Tile { bm: 64, bn: 32, bk: 32, wm: 2, wn: 2 },
-    Tile { bm: 64, bn: 64, bk: 16, wm: 2, wn: 4 },
-    Tile { bm: 64, bn: 64, bk: 32, wm: 2, wn: 4 },
-    Tile { bm: 128, bn: 32, bk: 16, wm: 4, wn: 1 },
-    Tile { bm: 64, bn: 64, bk: 16, wm: 4, wn: 2 },
+const fn tile(bm: usize, bn: usize, bk: usize, wm: usize, wn: usize) -> Tile {
+    Tile { bm, bn, bk, wm, wn }
+}
+
+pub const TILES: [Tile; 11] = [
+    tile(16, 32, 32, 1, 2),
+    tile(16, 64, 32, 1, 4),
+    tile(16, 64, 64, 1, 4),
+    tile(32, 32, 16, 2, 2),
+    tile(32, 64, 16, 2, 2),
+    tile(32, 64, 32, 2, 2),
+    tile(64, 32, 16, 2, 2),
+    tile(64, 64, 16, 2, 2),
+    tile(64, 32, 32, 2, 2),
+    tile(64, 64, 16, 2, 4),
+    tile(64, 64, 32, 2, 4),
 ];
 
 /// A GEMM launch plan: tile and number of K splits.
@@ -172,293 +124,292 @@ pub struct Plan {
     pub splits: usize,
 }
 
-/// Kernels used by the runtime, resolved once.
+/// A GEMM launch class: shape plus the loader features that change the best plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PlanKey {
+    pub m: i32,
+    pub n: i32,
+    pub k: i32,
+    pub taps: i32,
+    pub up: i32,
+    pub concat: bool,
+    pub mask: bool,
+    pub arelu: bool,
+    pub q8: bool,
+}
+
+impl PlanKey {
+    pub fn of(p: &GemmParams, q8: bool) -> Self {
+        PlanKey {
+            m: p.m,
+            n: p.n,
+            k: p.k,
+            taps: p.conv_taps,
+            up: p.conv_up,
+            concat: p.k1 > 0,
+            mask: p.has_mask != 0,
+            arelu: p.a_relu != 0,
+            q8,
+        }
+    }
+
+    /// The plan-table line for this key (see `plans/`).
+    pub fn line(&self, prec: Precision, plan: &Plan) -> String {
+        let t = plan.tile;
+        format!(
+            "{} {} {} {} {} {} {} {} {} {}  {} {} {} {} {} {}",
+            prec.name(), self.m, self.n, self.k, self.taps, self.up, self.concat as i32, self.mask as i32, self.arelu as i32, self.q8 as i32,
+            t.bm, t.bn, t.bk, t.wm, t.wn, plan.splits
+        )
+    }
+}
+
+/// Tuned plans for the model's GEMM launches, measured with `gemm-tune` on an Apple M4 Pro
+/// (20-core GPU). Format per line: precision, key (m n k taps up concat mask arelu q8), plan
+/// (bm bn bk wm wn splits).
+pub const M4_PRO_PLANS: &str = include_str!("plans/apple_m4_pro.txt");
+
+/// The plan table for this device and precision. `MB_PLAN_TABLE` overrides the built-in choice:
+/// `0` disables tuned plans, any other value is the path of a table file written by `gemm-tune`.
+fn plan_table(gpu: &Gpu) -> Result<HashMap<PlanKey, Plan>> {
+    Ok(match std::env::var("MB_PLAN_TABLE") {
+        Ok(v) if v == "0" => HashMap::new(),
+        Ok(path) => parse_plans(&std::fs::read_to_string(&path).map_err(|e| anyhow!("MB_PLAN_TABLE {path}: {e}"))?, gpu.prec),
+        Err(_) if gpu.device_name() == "Apple M4 Pro" => parse_plans(M4_PRO_PLANS, gpu.prec),
+        Err(_) => HashMap::new(),
+    })
+}
+
+/// Parse the plan-table lines of one precision.
+pub fn parse_plans(text: &str, prec: Precision) -> HashMap<PlanKey, Plan> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() != 16 || f[0] != prec.name() {
+            continue;
+        }
+        let v: Vec<i32> = f[1..].iter().filter_map(|x| x.parse().ok()).collect();
+        if v.len() != 15 {
+            continue;
+        }
+        let key = PlanKey { m: v[0], n: v[1], k: v[2], taps: v[3], up: v[4], concat: v[5] != 0, mask: v[6] != 0, arelu: v[7] != 0, q8: v[8] != 0 };
+        let t = tile(v[9] as usize, v[10] as usize, v[11] as usize, v[12] as usize, v[13] as usize);
+        if TILES.contains(&t) {
+            out.entry(key).or_insert(Plan { tile: t, splits: v[14] as usize });
+        }
+    }
+    out
+}
+
+/// One GEMM launch: operands, parameters and optional side inputs.
+pub struct GemmCall<'a> {
+    pub a: (&'a Buf, usize),
+    pub w: &'a Weight,
+    pub bias: &'a Buf,
+    pub y: (&'a Buf, usize),
+    pub p: GemmParams,
+    pub amask: Option<&'a Buf>,
+    pub res: Option<(&'a Buf, usize)>,
+    pub a2: Option<&'a Buf>,
+    pub a3: Option<&'a Buf>,
+    pub ymask: Option<&'a Buf>,
+    pub missing: Option<&'a Buf>,
+}
+
+impl<'a> GemmCall<'a> {
+    pub fn new(a: &'a Buf, w: &'a Weight, bias: &'a Buf, y: &'a Buf, p: GemmParams) -> Self {
+        GemmCall { a: (a, 0), w, bias, y: (y, 0), p, amask: None, res: None, a2: None, a3: None, ymask: None, missing: None }
+    }
+}
+
+/// Loader specialization flags (function constants 0..7 of gemm_mma).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+struct Flags {
+    plain: bool,
+    conv: bool,
+    concat: bool,
+    amask: bool,
+    arelu: bool,
+    up: bool,
+    q8: bool,
+    vec: bool,
+}
+
+/// Kernels used by the runtime; GEMM pipelines are specialized lazily per (tile, flags).
 pub struct Kernels {
-    pub gemm: Vec<(Tile, Pipeline)>,
+    gpu: Gpu,
     pub reduce: Pipeline,
-    pub epilogue: Pipeline,
-    pub materialize: Pipeline,
-    /// Scratch for materialized A (M x K) and steel outputs (M x N).
-    pub a_scratch: Buf,
-    pub y_scratch: Buf,
     pub attention: Pipeline,
+    /// Simdgroup-matrix attention, keyed by (padded length, head dim).
+    attention_mma: HashMap<(usize, usize), Pipeline>,
     pub add_ln: Pipeline,
     pub dummy: Buf,
-    pub zeros: Buf,
-    /// Split-K partial sums (grown on demand at build time).
+    pub dummy_t: Buf,
+    /// Split-K partial sums.
     pub partial: Buf,
-    /// Override for sweeps: always use this plan (and never steel).
+    /// Override for sweeps: always use this plan.
     pub force: Option<Plan>,
-    steel_pipelines: HashMap<(bool, bool, bool), Pipeline>,
-    splitk_pipelines: HashMap<String, Pipeline>,
-    splitk_accum: Pipeline,
+    /// Tuned plans for this device (empty on devices without a table; `MB_PLAN_TABLE=0` disables).
+    pub table: HashMap<PlanKey, Plan>,
+    /// When set, every GEMM launch appends (params with plan, INT8) here; for profiling tools.
+    pub log: RefCell<Option<Vec<(GemmParams, bool)>>>,
+    gemm: RefCell<HashMap<(Tile, Flags), Pipeline>>,
 }
 
 impl Kernels {
     pub fn new(gpu: &Gpu) -> Result<Self> {
-        let gemm = TILES
-            .iter()
-            .map(|t| Ok((*t, gpu.pipeline(&format!("gemm_mma_{}_{}_{}_{}_{}", t.bm, t.bn, t.bk, t.wm, t.wn))?)))
-            .collect::<Result<_>>()?;
         Ok(Kernels {
-            gemm,
             reduce: gpu.pipeline("gemm_splitk_reduce")?,
-            epilogue: gpu.pipeline("epilogue_apply")?,
-            materialize: gpu.pipeline("materialize_a")?,
-            a_scratch: gpu.buffer(16 << 20),
-            y_scratch: gpu.buffer(4 << 20),
             attention: gpu.pipeline("attention")?,
+            attention_mma: [(16, 32), (16, 64), (32, 32), (32, 64)]
+                .into_iter()
+                .map(|(l, d)| Ok(((l, d), gpu.pipeline(&format!("attention_mma_{l}_{d}"))?)))
+                .collect::<Result<_>>()?,
             add_ln: gpu.pipeline("add_layernorm")?,
             dummy: gpu.buffer(4),
-            zeros: gpu.buffer(16384),
-            partial: gpu.buffer(8 << 20),
+            dummy_t: gpu.buffer_t(4),
+            partial: gpu.buffer(16 << 20),
             force: None,
-            steel_pipelines: {
-                let mut map = HashMap::new();
-                for bits in 0..8u8 {
-                    let (am, an, ak) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
-                    let consts = [(10, false), (100, true), (110, false), (200, am), (201, an), (202, ak)];
-                    map.insert((am, an, ak), gpu.mlx_pipeline(STEEL, &consts)?);
-                }
-                map
-            },
-            splitk_pipelines: {
-                let mut map = HashMap::new();
-                for (bm, bn) in [(16, 16), (16, 32), (32, 16), (32, 32)] {
-                    for mn in ["t", "n"] {
-                        for k in ["t", "n"] {
-                            let name = format!("steel_gemm_splitk_nt_float32_float32_bm{bm}_bn{bn}_bk16_wm2_wn2_MN_{mn}aligned_K_{k}aligned");
-                            map.insert(name.clone(), gpu.mlx_pipeline(&name, &[])?);
-                        }
-                    }
-                }
-                map
-            },
-            splitk_accum: gpu.mlx_pipeline("steel_gemm_splitk_accum_float32_float32_axbpy", &[])?,
+            table: plan_table(gpu)?,
+            log: RefCell::new(None),
+            gemm: RefCell::new(HashMap::new()),
+            gpu: gpu.clone(),
         })
     }
 
-    /// Heuristic plan: small row tiles for small M (no wasted rows at batch 1), and split K
-    /// until the grid has enough threadgroups to keep every GPU core streaming weights.
-    pub fn plan(&self, m: usize, n: usize, k: usize) -> Plan {
-        if let Some(p) = self.force {
-            return p;
+    fn pipeline(&self, t: Tile, f: Flags) -> Pipeline {
+        if let Some(p) = self.gemm.borrow().get(&(t, f)) {
+            return p.clone();
         }
-        let tile = if m <= 16 {
-            TILES[1] // 16x64x32, 1x4 simdgroups
-        } else if m <= 32 {
-            TILES[5] // 32x64x32
-        } else if m <= 64 && n < 1536 {
-            TILES[3] // 32x32x16
+        let name = format!("gemm_mma_{}_{}_{}_{}_{}", t.bm, t.bn, t.bk, t.wm, t.wn);
+        let consts = [(0, f.plain), (1, f.conv), (2, f.concat), (3, f.amask), (4, f.arelu), (5, f.up), (6, f.q8), (7, f.vec)];
+        let p = self.gpu.specialized(&name, &consts).expect("gemm pipeline");
+        self.gemm.borrow_mut().insert((t, f), p.clone());
+        p
+    }
+
+    /// Fallback plan (launches missing from the tuned table): the first preferred tile, among
+    /// those wasting at most a fraction of rows to padding, whose grid has enough threadgroups;
+    /// then K splits (powers of two, >= 64 K per split) until the grid fills the GPU. Fitted on
+    /// `gemm-tune` measurements: FP32 prefers 32x64 tiles, FP16/BF16 16x32 tiles (cheaper to fill
+    /// in half precision), INT8 weights 64-row tiles (each tile dequantizes its weights once).
+    pub fn heuristic(&self, m: usize, n: usize, k: usize, q8: bool) -> Plan {
+        let (prefs, g_tile, g_split, waste): (&[Tile], usize, usize, f64) = if q8 {
+            (&[TILES[6], TILES[0], TILES[3]], 320, 240, 0.4)
+        } else if self.gpu.prec == Precision::F32 {
+            (&[TILES[4], TILES[0], TILES[3]], 160, 120, 0.4)
         } else {
-            TILES[11] // 64x64x32, 2x4 simdgroups
+            (&[TILES[0], TILES[1]], 160, 120, 0.15)
         };
-        let groups = n.div_ceil(tile.bn) * m.div_ceil(tile.bm);
+        let groups = |t: &Tile| m.div_ceil(t.bm) * n.div_ceil(t.bn);
+        let fits: Vec<Tile> = prefs.iter().copied().filter(|t| (m.div_ceil(t.bm) * t.bm) as f64 <= m as f64 * (1.0 + waste)).collect();
+        let fits = if fits.is_empty() { vec![*prefs.last().unwrap()] } else { fits };
+        let tile = fits.iter().copied().find(|t| groups(t) >= g_tile).unwrap_or(*fits.last().unwrap());
         let mut splits = 1;
-        while groups * splits < 128 && k / (splits * 2) >= 256 && splits < 8 {
+        while groups(&tile) * splits < g_split && k / (splits * 2) >= 64 && splits < 8 {
             splits *= 2;
         }
         Plan { tile, splits }
     }
 
-    /// `Y = epilogue(A Wᵀ + b)`: MLX's steel kernel for large plain GEMMs (as MLX itself would
-    /// dispatch them), the model-specific `gemm_mma` otherwise (plus a reduce when split over K).
+    /// The plan for a dense GEMM of this shape (forced, else the heuristic).
+    pub fn plan(&self, m: usize, n: usize, k: usize) -> Plan {
+        self.force.unwrap_or_else(|| self.heuristic(m, n, k, false))
+    }
+
+    /// The plan for a launch: forced, else tuned, else the heuristic.
+    pub fn plan_for(&self, p: &GemmParams, q8: bool) -> Plan {
+        if let Some(f) = self.force {
+            return f;
+        }
+        let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
+        self.table.get(&PlanKey::of(p, q8)).copied().unwrap_or_else(|| self.heuristic(m, n, k, q8))
+    }
+
+    /// `Y = epilogue(A Wᵀ + b)` with the planned kernel (plus a reduce dispatch when split over K).
     pub fn run(&self, rec: &mut Recorder, g: &GemmCall) {
         let mut p = g.p;
         let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        if self.force.is_none() && m >= STEEL_MIN_ROWS && p.steel_ok() && g.res.is_none() && p.act == 0 {
-            self.steel(rec, g.a, g.w, g.bias, g.y, p, None);
-            return;
+        let q8 = matches!(g.w, Weight::Q8(_));
+        let mut plan = self.plan_for(&p, q8);
+        while plan.splits > 1 && (plan.splits * m * n > self.partial.len || k / plan.splits < plan.tile.bk) {
+            plan.splits /= 2;
         }
-        if self.force.is_none() && (m >= MATERIALIZE_MIN_ROWS || (m >= STEEL_MIN_ROWS && p.steel_ok()))
-            && m * k <= self.a_scratch.len && m * n <= self.y_scratch.len
-        {
-            self.materialized(rec, g);
-            return;
-        }
-        let plan = self.plan(m, n, k);
         let t = plan.tile;
         let k_split = (k.div_ceil(plan.splits)).div_ceil(t.bk) * t.bk;
         let splits = k.div_ceil(k_split);
         p.k_split = k_split as i32;
         p.splits = splits as i32;
-        let d = &self.dummy;
-        let (rb, roff) = g.res.unwrap_or((d, 0));
-        let pso = &self.gemm.iter().find(|(tt, _)| *tt == t).expect("tile instantiated").1;
-        let out = if splits > 1 { (&self.partial, 0) } else { g.y };
+        let conv = p.conv_taps > 1;
+        let concat = p.k1 > 0;
+        let m4 = |v: i32| v % 4 == 0;
+        let vec = m4(p.k) && m4(p.lda) && (!conv || m4(p.conv_cin)) && (!concat || (m4(p.k1) && m4(p.k2) && m4(p.lda2) && m4(p.lda3)));
+        let flags = Flags {
+            plain: vec
+                && m % t.bm == 0
+                && n % t.bn == 0
+                && k % t.bk == 0
+                && (!conv || p.conv_cin as usize % t.bk == 0)
+                && (!concat || (p.k1 as usize % t.bk == 0 && p.k2 as usize % t.bk == 0)),
+            conv,
+            concat,
+            amask: p.has_mask != 0,
+            arelu: p.a_relu != 0,
+            up: p.conv_up == 2,
+            q8,
+            vec,
+        };
+        let pso = self.pipeline(t, flags);
+        if let Some(log) = self.log.borrow_mut().as_mut() {
+            log.push((p, q8));
+        }
+        let (d, dt) = (&self.dummy, &self.dummy_t);
+        let (rb, roff) = g.res.unwrap_or((dt, 0));
+        let (wd, wq, qs, qb) = match g.w {
+            Weight::Dense(b) => (b, d, d, d),
+            Weight::Q8(q) => (dt, &q.q, &q.scales, &q.biases),
+        };
         let args = [
-            Arg::Buf(g.a.0, g.a.1 * 4),
-            Arg::Buf(g.w, 0),
+            Arg::Buf(g.a.0, g.a.1),
+            Arg::Buf(wd, 0),
             Arg::Buf(g.bias, 0),
-            Arg::Buf(out.0, out.1 * 4),
+            Arg::Buf(g.y.0, g.y.1),
             Arg::Bytes(as_bytes(&p)),
             Arg::Buf(g.amask.unwrap_or(d), 0),
-            Arg::Buf(rb, roff * 4),
-            Arg::Buf(g.a2.unwrap_or(d), 0),
-            Arg::Buf(g.a3.unwrap_or(d), 0),
+            Arg::Buf(rb, roff),
+            Arg::Buf(g.a2.unwrap_or(dt), 0),
+            Arg::Buf(g.a3.unwrap_or(dt), 0),
             Arg::Buf(g.ymask.unwrap_or(d), 0),
-            Arg::Buf(g.missing.unwrap_or(d), 0),
+            Arg::Buf(g.missing.unwrap_or(dt), 0),
+            Arg::Buf(wq, 0),
+            Arg::Buf(qs, 0),
+            Arg::Buf(qb, 0),
+            Arg::Buf(&self.partial, 0),
         ];
-        rec.dispatch(pso, &args, (n.div_ceil(t.bn), m.div_ceil(t.bm), splits), (t.wm * t.wn * 32, 1, 1));
+        rec.dispatch(&pso, &args, (n.div_ceil(t.bn), m.div_ceil(t.bm), splits), (t.wm * t.wn * 32, 1, 1));
         if splits > 1 {
             let args = [
                 Arg::Buf(&self.partial, 0),
                 Arg::Buf(g.bias, 0),
-                Arg::Buf(g.y.0, g.y.1 * 4),
+                Arg::Buf(g.y.0, g.y.1),
                 Arg::Bytes(as_bytes(&p)),
-                Arg::Buf(rb, roff * 4),
+                Arg::Buf(rb, roff),
                 Arg::Buf(g.ymask.unwrap_or(d), 0),
-                Arg::Buf(g.missing.unwrap_or(d), 0),
+                Arg::Buf(g.missing.unwrap_or(dt), 0),
             ];
             rec.dispatch(&self.reduce, &args, ((m * n).div_ceil(256), 1, 1), (256, 1, 1));
         }
     }
 
-    /// Compatibility wrapper used by the sweep: plain GEMM with optional residual.
     #[allow(clippy::too_many_arguments)]
-    pub fn gemm(
-        &self, rec: &mut Recorder, a: (&Buf, usize), w: &Buf, bias: &Buf, y: (&Buf, usize), p: GemmParams,
-        mask: Option<&Buf>, res: Option<(&Buf, usize)>,
-    ) {
-        let mut g = GemmCall::new(a.0, w, bias, y.0, p);
-        g.a = a;
-        g.y = y;
-        g.amask = mask;
-        g.res = res;
-        self.run(rec, &g);
-    }
-
-    /// Large GEMM with extras: materialize A (unless already plain), steel into a scratch output,
-    /// then apply the full epilogue into Y.
-    fn materialized(&self, rec: &mut Recorder, g: &GemmCall) {
-        let p = g.p;
-        let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        let d = &self.dummy;
-        let plain = p.conv_taps == 0 && p.k1 == 0 && p.a_relu == 0 && p.has_mask == 0;
-        let a = if plain {
-            g.a
-        } else {
-            let args = [
-                Arg::Buf(g.a.0, g.a.1 * 4),
-                Arg::Buf(g.a2.unwrap_or(d), 0),
-                Arg::Buf(g.a3.unwrap_or(d), 0),
-                Arg::Buf(g.amask.unwrap_or(d), 0),
-                Arg::Buf(&self.a_scratch, 0),
-                Arg::Bytes(as_bytes(&p)),
-            ];
-            let items = if (k % 4 == 0) && (p.lda % 4 == 0) { m * k / 4 } else { m * k };
-            rec.dispatch(&self.materialize, &args, (items.div_ceil(256), 1, 1), (256, 1, 1));
-            (&self.a_scratch, 0)
-        };
-        let mut sp = GemmParams::new(m, n, k);
-        sp.lda = if plain { p.lda } else { k as i32 };
-        self.steel(rec, a, g.w, g.bias, (&self.y_scratch, 0), sp, None);
-        let (rb, roff) = g.res.unwrap_or((d, 0));
-        let args = [
-            Arg::Buf(&self.y_scratch, 0),
-            Arg::Buf(g.y.0, g.y.1 * 4),
-            Arg::Bytes(as_bytes(&p)),
-            Arg::Buf(&self.zeros, 0),
-            Arg::Buf(rb, roff * 4),
-            Arg::Buf(g.ymask.unwrap_or(d), 0),
-            Arg::Buf(g.missing.unwrap_or(d), 0),
-        ];
-        rec.dispatch(&self.epilogue, &args, ((m * n).div_ceil(256), 1, 1), (256, 1, 1));
-    }
-
-    /// MLX's steel GEMM (`addmm` with a broadcast bias), then activation / residual if needed.
-    #[allow(clippy::too_many_arguments)]
-    fn steel(&self, rec: &mut Recorder, a: (&Buf, usize), w: &Buf, bias: &Buf, y: (&Buf, usize), p: GemmParams, res: Option<(&Buf, usize)>) {
-        let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        // MLX's rule (steel_matmul_axpby): small M*N with large K goes to split-K.
-        let (tm16, tn16, tk16) = (m.div_ceil(16), n.div_ceil(16), k / 16);
-        if tm16 * tn16 <= 2048 && tk16 >= 8 && k >= m.max(n) && p.ldy as usize == n {
-            self.steel_splitk(rec, a, w, bias, y, p);
-        } else {
-            self.steel_regular(rec, a, w, bias, y, p);
-        }
-        let _ = res;
-    }
-
-    /// `steel_gemm_splitk_axpby` as in MLX: partials into a scratch buffer, then the accumulate
-    /// kernel adds the broadcast bias (alpha = beta = 1).
-    fn steel_splitk(&self, rec: &mut Recorder, a: (&Buf, usize), w: &Buf, bias: &Buf, y: (&Buf, usize), p: GemmParams) {
-        let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        let (tm32, tn32, tk16) = (m.div_ceil(32), n.div_ceil(32), k / 16);
-        let bm = if m < 40 { 16 } else { 32 };
-        let bn = if n < 40 { 16 } else { 32 };
-        let bk = 16;
-        let partitions = (tk16 / (tm32 * tn32)).max(1).next_power_of_two().clamp(2, 32);
-        let iters = (k / bk) / partitions;
-        let mn_aligned = m % bm == 0 && n % bn == 0;
-        let k_aligned = k % bk == 0;
-        let name = format!(
-            "steel_gemm_splitk_nt_float32_float32_bm{bm}_bn{bn}_bk16_wm2_wn2_MN_{}aligned_K_{}aligned",
-            if mn_aligned { "t" } else { "n" },
-            if k_aligned { "t" } else { "n" }
-        );
-        let params: [i32; 13] = [
-            m as i32, n as i32, k as i32, p.lda, k as i32, n as i32, n.div_ceil(bn) as i32, m.div_ceil(bm) as i32,
-            partitions as i32, (m * n) as i32, (iters * bk) as i32, 0, iters as i32,
-        ];
-        assert!(partitions * m * n <= self.partial.len, "split-K scratch too small");
-        let args = [Arg::Buf(a.0, a.1 * 4), Arg::Buf(w, 0), Arg::Buf(&self.partial, 0), Arg::Bytes(as_bytes(&params))];
-        rec.dispatch(&self.splitk_pipelines[&name], &args, (n.div_ceil(bn), m.div_ceil(bm), partitions), (32, 2, 2));
-        let (parts, stride, ldd, ldc, fdc, alpha, beta) = (partitions as i32, (m * n) as i32, n as i32, 0i32, 1i32, 1f32, 1f32);
-        let args = [
-            Arg::Buf(&self.partial, 0),
-            Arg::Buf(y.0, y.1 * 4),
-            Arg::Bytes(as_bytes(&parts)),
-            Arg::Bytes(as_bytes(&stride)),
-            Arg::Bytes(as_bytes(&ldd)),
-            Arg::Buf(bias, 0),
-            Arg::Bytes(as_bytes(&ldc)),
-            Arg::Bytes(as_bytes(&fdc)),
-            Arg::Bytes(as_bytes(&alpha)),
-            Arg::Bytes(as_bytes(&beta)),
-        ];
-        rec.dispatch_threads(&self.splitk_accum, &args, (n, m, 1), (32.min(n), 8, 1));
-    }
-
-    fn steel_regular(&self, rec: &mut Recorder, a: (&Buf, usize), w: &Buf, bias: &Buf, y: (&Buf, usize), p: GemmParams) {
-        let (bm, bn, bk, wm, wn) = STEEL_TILE;
-        let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        let pso = &self.steel_pipelines[&(m % bm == 0, n % bn == 0, k % bk == 0)];
-        let sp = SteelParams {
-            m: p.m,
-            n: p.n,
-            k: p.k,
-            lda: p.lda,
-            ldb: p.k,
-            ldd: p.ldy,
-            tiles_n: n.div_ceil(bn) as i32,
-            tiles_m: m.div_ceil(bm) as i32,
-            batch_stride_a: 0,
-            batch_stride_b: 0,
-            batch_stride_d: 0,
-            swizzle_log: 0,
-            gemm_k_iterations_aligned: (k / bk) as i32,
-            batch_ndim: 1,
-        };
-        let ap = SteelAddmm { ldc: 0, fdc: 1, batch_stride_c: 0, alpha: 1.0, beta: 1.0 };
-        let args = [
-            Arg::Buf(a.0, a.1 * 4),
-            Arg::Buf(w, 0),
-            Arg::Buf(bias, 0),
-            Arg::Buf(y.0, y.1 * 4),
-            Arg::Bytes(as_bytes(&sp)),
-            Arg::Bytes(as_bytes(&ap)),
-        ];
-        rec.dispatch(pso, &args, (n.div_ceil(bn), m.div_ceil(bm), 1), (32, wn, wm));
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear(&self, rec: &mut Recorder, a: &Buf, w: &Buf, bias: &Buf, y: &Buf, m: usize, n: usize, k: usize, act: i32) {
+    pub fn linear(&self, rec: &mut Recorder, a: &Buf, w: &Weight, bias: &Buf, y: &Buf, m: usize, n: usize, k: usize, act: i32) {
         let mut p = GemmParams::new(m, n, k);
         p.act = act;
         self.run(rec, &GemmCall::new(a, w, bias, y, p));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_layernorm(&self, rec: &mut Recorder, x: &Buf, r: &Buf, w: &Buf, b: &Buf, y: &Buf, rows: usize, d: usize) {
         let p = LnParams { d: d as i32, eps: 1e-5 };
         let args = [Arg::Buf(x, 0), Arg::Buf(r, 0), Arg::Buf(w, 0), Arg::Buf(b, 0), Arg::Buf(y, 0), Arg::Bytes(as_bytes(&p))];
@@ -478,24 +429,47 @@ impl Kernels {
             scale: (1.0 / (hd as f64).sqrt()) as f32,
         };
         let args = [Arg::Buf(qkv, 0), Arg::Buf(pad.unwrap_or(&self.dummy), 0), Arg::Buf(out, 0), Arg::Bytes(as_bytes(&p))];
+        let lp = if l <= 16 { 16 } else { 32 };
+        if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= 32 && std::env::var_os("MB_SCALAR_ATTENTION").is_none()) {
+            rec.dispatch(pso, &args, (b * h, 1, 1), (lp * 4, 1, 1));
+            return;
+        }
         rec.threadgroup_memory(3 * l * (hd + 1) * 4, 0);
         rec.dispatch(&self.attention, &args, (b * h, 1, 1), (l * 32, 1, 1));
     }
 }
 
+fn tensor<'a>(tensors: &'a HashMap<String, Array>, name: &str) -> Result<&'a Array> {
+    tensors.get(name).ok_or_else(|| anyhow!("missing weight {name}"))
+}
+
+/// Upload a tensor converted to the network element type `T`.
 pub fn upload(gpu: &Gpu, tensors: &HashMap<String, Array>, name: &str) -> Result<Buf> {
-    let t = tensors.get(name).ok_or_else(|| anyhow!("missing weight {name}"))?;
-    Ok(gpu.upload(&to_vec_f32(t)?))
+    Ok(gpu.upload_t(&to_vec_f32(tensor(tensors, name)?)?))
+}
+
+/// Upload a projection weight, dense or INT8-quantized exactly like `mlx.nn.quantize` (affine, group 64).
+pub fn upload_weight(gpu: &Gpu, tensors: &HashMap<String, Array>, name: &str, int8: bool) -> Result<Weight> {
+    if !int8 {
+        return Ok(Weight::Dense(upload(gpu, tensors, name)?));
+    }
+    let w = tensor(tensors, name)?;
+    let (q, scales, biases) = quantize(w, QuantizeOptions { group_size: Some(64), bits: Some(8), ..Default::default() })
+        .map_err(|e| anyhow!("quantizing {name}: {e:?}"))?;
+    let biases = biases.ok_or_else(|| anyhow!("affine quantization returned no biases"))?;
+    q.eval()?;
+    let qv: Vec<u32> = q.as_slice::<u32>().to_vec();
+    Ok(Weight::Q8(QWeight { q: gpu.upload_u32(&qv), scales: gpu.upload(&to_vec_f32(&scales)?), biases: gpu.upload(&to_vec_f32(&biases)?) }))
 }
 
 struct Layer {
-    in_w: Buf,
+    in_w: Weight,
     in_b: Buf,
-    out_w: Buf,
+    out_w: Weight,
     out_b: Buf,
-    l1_w: Buf,
+    l1_w: Weight,
     l1_b: Buf,
-    l2_w: Buf,
+    l2_w: Weight,
     l2_b: Buf,
     n1_w: Buf,
     n1_b: Buf,
@@ -510,7 +484,7 @@ pub struct Transformer {
     pub ffn: usize,
 }
 
-/// Scratch buffers for up to `rows` tokens.
+/// Scratch buffers (network element type) for up to `rows` tokens.
 pub struct Scratch {
     pub x2: Buf,
     pub qkv: Buf,
@@ -521,24 +495,32 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new(gpu: &Gpu, rows: usize, d: usize, ffn: usize) -> Self {
-        Scratch { x2: gpu.buffer(rows * d), qkv: gpu.buffer(rows * 3 * d), attn: gpu.buffer(rows * d), proj: gpu.buffer(rows * d), ff: gpu.buffer(rows * ffn) }
+        Scratch {
+            x2: gpu.buffer_t(rows * d),
+            qkv: gpu.buffer_t(rows * 3 * d),
+            attn: gpu.buffer_t(rows * d),
+            proj: gpu.buffer_t(rows * d),
+            ff: gpu.buffer_t(rows * ffn),
+        }
     }
 }
 
 impl Transformer {
-    pub fn load(gpu: &Gpu, tensors: &HashMap<String, Array>, prefix: &str, n_layers: usize, heads: usize) -> Result<Self> {
+    /// `int8`: quantize the four projections of every layer (as the Python port's `quantize(8)`).
+    pub fn load(gpu: &Gpu, tensors: &HashMap<String, Array>, prefix: &str, n_layers: usize, heads: usize, int8: bool) -> Result<Self> {
         let mut layers = Vec::new();
         for i in 0..n_layers {
             let p = |n: &str| format!("{prefix}.layers.{i}.{n}");
             let u = |n: &str| upload(gpu, tensors, &p(n));
+            let w = |n: &str| upload_weight(gpu, tensors, &p(n), int8);
             layers.push(Layer {
-                in_w: u("self_attn.in_proj.weight")?,
+                in_w: w("self_attn.in_proj.weight")?,
                 in_b: u("self_attn.in_proj.bias")?,
-                out_w: u("self_attn.out_proj.weight")?,
+                out_w: w("self_attn.out_proj.weight")?,
                 out_b: u("self_attn.out_proj.bias")?,
-                l1_w: u("linear1.weight")?,
+                l1_w: w("linear1.weight")?,
                 l1_b: u("linear1.bias")?,
-                l2_w: u("linear2.weight")?,
+                l2_w: w("linear2.weight")?,
                 l2_b: u("linear2.bias")?,
                 n1_w: u("norm1.weight")?,
                 n1_b: u("norm1.bias")?,
@@ -551,7 +533,7 @@ impl Transformer {
         Ok(Transformer { layers, d, heads, ffn })
     }
 
-    /// In place on `x` (batch * len rows of d). `pad`: (batch, len) bytes, 1 = padded key.
+    /// In place on `x` (batch * len rows of d). `pad`: (batch, len) float, 1 = padded key.
     #[allow(clippy::too_many_arguments)]
     pub fn encode(&self, k: &Kernels, rec: &mut Recorder, x: &Buf, pad: Option<&Buf>, batch: usize, len: usize, s: &Scratch) {
         self.encode_parts(k, rec, x, pad, batch, len, s, 7);
@@ -563,13 +545,25 @@ impl Transformer {
         let (rows, d, f) = (batch * len, self.d, self.ffn);
         let (g, a, n) = (parts & 1 != 0, parts & 2 != 0, parts & 4 != 0);
         for l in &self.layers {
-            if g { k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE); }
-            if a { k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads); }
-            if g { k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE); }
-            if n { k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d); }
-            if g { k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU); }
-            if g { k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE); }
-            if n { k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d); }
+            if g {
+                k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE);
+            }
+            if a {
+                k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads);
+            }
+            if g {
+                k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
+            }
+            if n {
+                k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
+            }
+            if g {
+                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
+                k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
+            }
+            if n {
+                k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
+            }
         }
     }
 }

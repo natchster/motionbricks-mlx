@@ -13,7 +13,8 @@ uv run --all-packages python model/benchmarks/report.py model/benchmarks/results
 
 The Rust ports have their own interleaved Python-vs-Rust harness in
 [`model-rs/bench`](../../model-rs/bench). The Rust Metal runtime's single-request latency is
-7.1 ms (see the [repository README](../../README.md#part-2--the-rust-optimized-model-model-rs)).
+4.0 ms in BF16 and 5.2 ms in FP32 (see the
+[repository README](../../README.md#part-2--the-rust-optimized-model-model-rs)).
 
 ## Results
 
@@ -87,4 +88,5 @@ after a 13–48 s first compile. For CPU-only use, ONNX Runtime is the better ch
 | Row-contiguous Conv1d weights | no measurable effect; not used |
 
 Beyond MLX itself, the Rust Metal runtime in [`model-rs`](../../model-rs/README.md) replaces the
-generic graph executor with a model-specific dispatch plan and kernels: 1.5× faster at N=1.
+generic graph executor with a model-specific dispatch plan and kernels: about 2× faster at N=1
+and 1.04–1.09× at N=32, at every precision.

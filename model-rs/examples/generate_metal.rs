@@ -2,9 +2,11 @@
 // Rust port of motionbricks_mlx (MLX port of NVlabs/motionbricks).
 // Original model: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
-//! Generate motions with the custom Metal runtime (FP32, release configuration).
+//! Generate motions with the custom Metal runtime (release configuration).
 //!
-//!     cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 bench/requests/unitree_g1_N8.npz
+//!     cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 bench/requests/unitree_g1_N8.npz [bfloat16]
+//!
+//! The optional last argument is the precision: float32 (default), float16, bfloat16 or int8.
 
 use std::time::Instant;
 
@@ -14,10 +16,12 @@ use motionbricks_rs::npy::load_npz;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let [_, name, checkpoints, request] = &args[..] else {
-        anyhow::bail!("usage: generate_metal <soma|unitree_g1> <checkpoint dir> <request.npz>");
+    let (name, checkpoints, request, precision) = match &args[..] {
+        [_, n, c, r] => (n, c, r, "float32"),
+        [_, n, c, r, p] => (n, c, r, p.as_str()),
+        _ => anyhow::bail!("usage: generate_metal <soma|unitree_g1> <checkpoint dir> <request.npz> [float32|float16|bfloat16|int8]"),
     };
-    let model = MetalModel::from_checkpoints(name, checkpoints, 64)?;
+    let model = MetalModel::from_checkpoints_with(name, checkpoints, 64, precision)?;
     let inputs = load_npz(request)?;
     model.run(&inputs)?; // warm-up
     let t = Instant::now();
@@ -26,6 +30,6 @@ fn main() -> Result<()> {
     for (i, n) in tokens.iter().enumerate() {
         println!("request {i}: {n} tokens = {} frames ({:.2} s of motion)", 4 * n, 4.0 * *n as f32 / 30.0);
     }
-    println!("{} values{} in {ms:.2} ms", motion.len(), contacts.map(|c| format!(" + {} contact values", c.len())).unwrap_or_default());
+    println!("{precision}: {} values{} in {ms:.2} ms", motion.len(), contacts.map(|c| format!(" + {} contact values", c.len())).unwrap_or_default());
     Ok(())
 }

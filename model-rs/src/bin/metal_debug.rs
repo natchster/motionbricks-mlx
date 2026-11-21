@@ -15,7 +15,7 @@ use motionbricks_rs::npy::load_npz;
 use motionbricks_rs::ops::{i, to_vec_f32};
 use motionbricks_rs::weights::{Weights, read_checkpoints};
 
-fn put(dst: &Buf, v: &[f32]) { dst.as_mut_slice()[..v.len()].copy_from_slice(v); }
+fn put(dst: &Buf, v: &[f32]) { dst.write_f32(v); }
 fn rel(a: &[f32], b: &[f32]) -> f64 {
     let n = a.iter().zip(b).map(|(x, y)| (x - y).abs() as f64).fold(0.0, f64::max);
     n / b.iter().map(|v| v.abs() as f64).fold(1e-12, f64::max)
@@ -37,8 +37,11 @@ fn main() -> Result<()> {
     let b = &m.b;
     let mask = |k: &str| g[k].to_f32().into_iter().map(|x| (x != 0.0) as i32 as f32).collect::<Vec<_>>();
     put(&b.gn, &g["root_in.global_root"].to_f32());
+    put(&b.gn_t, &g["root_in.global_root"].to_f32());
     put(&b.ln, &g["root_in.local_root"].to_f32());
+    put(&b.ln_t, &g["root_in.local_root"].to_f32());
     put(&b.pn, &g["root_in.poses"].to_f32());
+    put(&b.pn_t, &g["root_in.poses"].to_f32());
     put(&b.hg, &mask("root_in.has_global"));
     put(&b.hl, &mask("root_in.has_local"));
     put(&b.hp, &mask("root_in.has_poses"));
@@ -49,14 +52,14 @@ fn main() -> Result<()> {
     let mut rec = Recorder::new(&m.gpu);
     m.encode_root_a(&mut rec, &d);
     wait(&rec.commit());
-    let x2 = b.x2.as_slice()[..n * 25 * 512].to_vec();
+    let x2 = b.x2.to_f32(n * 25 * 512);
     let pad2: Vec<i32> = b.pad2.as_slice()[..n * 25].iter().map(|&v| v as i32).collect();
     // transformer
     let y_ref = to_vec_f32(&tf.forward(&arr(&x2, &[n as i32, 25, 512]), Some(&Array::from_slice(&pad2, &[n as i32, 25]).ne(i(0))?))?)?;
     let mut rec = Recorder::new(&m.gpu);
     m.encode_root_b(&mut rec, &d, 0, true);
     wait(&rec.commit());
-    println!("root-token transformer rel err {:.2e}", rel(&b.x2.as_slice()[..n * 25 * 512], &y_ref));
+    println!("root-token transformer rel err {:.2e}", rel(&b.x2.to_f32(n * 25 * 512), &y_ref));
     // full decoder from the Metal decoder inputs
     let [h, h2, _t1] = m.scratch();
     let _ = (h, h2);
@@ -75,6 +78,6 @@ fn main() -> Result<()> {
         m.encode_root_b(&mut rec, &d, limit, false);
         wait(&rec.commit());
     }
-    println!("decoder (from identical inputs) rel err {:.2e}; vs golden {:.2e}", rel(&b.pr.as_slice()[..n * 64 * 5], &pr_ref), rel(&pr_ref, &g["root_out.pred_global_root_values"].to_f32()));
+    println!("decoder (from identical inputs) rel err {:.2e}; vs golden {:.2e}", rel(&b.pr.to_f32(n * 64 * 5), &pr_ref), rel(&pr_ref, &g["root_out.pred_global_root_values"].to_f32()));
     Ok(())
 }

@@ -17,7 +17,7 @@ use mlx_rs::{Array, Dtype};
 use motionbricks_rs::config::get_spec;
 use motionbricks_rs::layers::TransformerEncoder;
 use motionbricks_rs::metal::transformer::{Kernels, Scratch, Transformer};
-use motionbricks_rs::metal::{Gpu, Recorder, wait};
+use motionbricks_rs::metal::{Gpu, Precision, Recorder, wait};
 use motionbricks_rs::ops::{i, to_vec_f32};
 use motionbricks_rs::weights::{Weights, read_checkpoints};
 
@@ -33,16 +33,26 @@ fn main() -> Result<()> {
     let prefix = "pose.transformer_model";
     let (layers, heads, len, d) = (16, 16, 16usize, 1024usize);
 
-    let gpu = Gpu::new()?;
+    // Usage: proto-transformer [float32|float16|bfloat16] [batches...]
+    let dtype = std::env::args().nth(1).unwrap_or("float32".into());
+    let batches: Vec<usize> = std::env::args().skip(2).map(|v| v.parse().unwrap()).collect();
+    let batches = if batches.is_empty() { vec![1, 2, 4, 8, 16, 32] } else { batches };
+    let prec = Precision::parse(&dtype)?;
+    let gpu = Gpu::with_precision(prec)?;
     let kernels = Kernels::new(&gpu)?;
-    let metal = Transformer::load(&gpu, &loaded.tensors, prefix, layers, heads)?;
-    let mut w = Weights::new(loaded.tensors.clone(), Dtype::Float32);
+    let metal = Transformer::load(&gpu, &loaded.tensors, prefix, layers, heads, false)?;
+    let mlx_dtype = match prec {
+        Precision::F32 => Dtype::Float32,
+        Precision::F16 => Dtype::Float16,
+        Precision::BF16 => Dtype::Bfloat16,
+    };
+    let mut w = Weights::new(loaded.tensors.clone(), mlx_dtype);
     let mlx_tf = Rc::new(TransformerEncoder::load(&mut w, prefix, layers, heads as i32)?);
     let tf = mlx_tf.clone();
     let mut mlx_fn = compile(move |a: &[Array]| Ok(vec![tf.forward(&a[0], Some(&a[1]))?]), None);
 
     let iters = 40;
-    for batch in [1usize, 2, 4, 8, 16, 32] {
+    for batch in batches {
         let rows = batch * len;
         let mut seed = 12345u64;
         let x: Vec<f32> = (0..rows * d)
@@ -56,19 +66,19 @@ fn main() -> Result<()> {
         let _ = valid;
 
         // MLX reference.
-        let xa = Array::from_slice(&x, &[batch as i32, len as i32, d as i32]);
+        let xa = Array::from_slice(&x, &[batch as i32, len as i32, d as i32]).as_dtype(mlx_dtype)?;
         let pada = Array::from_slice(&pad.iter().map(|&v| v as i32).collect::<Vec<_>>(), &[batch as i32, len as i32]).ne(i(0))?;
         let want = to_vec_f32(&mlx_fn(&[xa.clone(), pada.clone()])?[0])?;
 
         // Metal.
-        let xb = gpu.upload(&x);
-        let padb = gpu.upload_bytes(&pad);
+        let xb = gpu.upload_t(&x);
+        let padb = gpu.upload(&pad.iter().map(|&v| v as f32).collect::<Vec<_>>());
         let scratch = Scratch::new(&gpu, rows, d, metal.ffn);
         let mut rec = Recorder::new(&gpu);
         metal.encode(&kernels, &mut rec, &xb, Some(&padb), batch, len, &scratch);
         let dispatches = rec.dispatches;
         wait(&rec.commit());
-        let got = xb.as_slice().to_vec();
+        let got = xb.to_f32(rows * d);
         let num = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         let den = want.iter().map(|v| v.abs()).fold(0f32, f32::max);
 
@@ -94,7 +104,7 @@ fn main() -> Result<()> {
         let (mut met_seq, mut met_gpu) = (Vec::new(), Vec::new());
         for it in 0..iters + 5 {
             let t = Instant::now();
-            xb.as_mut_slice().copy_from_slice(&x);
+            xb.write_f32(&x);
             let mut rec = Recorder::new(&gpu);
             metal.encode(&kernels, &mut rec, &xb, Some(&padb), batch, len, &scratch);
             let g = wait(&rec.commit());

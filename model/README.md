@@ -119,4 +119,5 @@ Other tests cover:
 That is 3–4.5× faster than NVIDIA's PyTorch model on MPS at batch 1, and 4.9–5.7× the throughput
 of ONNX Runtime at batch 32. Full tables, the comparison with an RTX 4090 + TensorRT, and a profile
 of where the time goes: [benchmarks/README.md](benchmarks/README.md). For the lowest single-request
-latency (7.1 ms), see the Rust Metal runtime in [`model-rs`](../model-rs/README.md).
+latency (4.0 ms in BF16, about 2× faster than MLX at every precision), see the Rust Metal runtime in
+[`model-rs`](../model-rs/README.md).

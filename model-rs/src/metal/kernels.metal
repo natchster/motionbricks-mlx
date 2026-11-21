@@ -2,18 +2,20 @@
 // Rust port of motionbricks_mlx (MLX port of NVlabs/motionbricks).
 // Original model: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
+//
 // Model-specific Metal kernels for MotionBricks (static shapes: <= 32 tokens, <= 64 frames).
-// FP32 storage and accumulation. Weights keep the PyTorch/MLX layout: Linear W[N][K],
-// Conv1d W[N][k][Cin] (channels-last), so a conv is a GEMM over K' = k * Cin.
+// `T` (float, half or bfloat) is the network element type, set by the host before compiling
+// (`typedef ... T;`). Accumulation, masks, split-K partials and normalization math are float.
+// Weights keep the PyTorch/MLX layout: Linear W[N][K], Conv1d W[N][k][Cin] (channels-last), so a
+// conv is a GEMM over K' = k * Cin. INT8 weights use MLX's affine format (bits 8, group 64):
+// packed uint32 [N][K/4] (first element in the low byte), float scales/biases [N][K/64].
 #include <metal_stdlib>
 using namespace metal;
 
+typedef vec<T, 4> T4;
+
 // ---------------------------------------------------------------------------------------------
-// GEMM: Y[m, n] = act( sum_k A(m, k) * W[n, k] + bias[n] )  (+ optional residual R[m, n])
-//
-// A is either a plain row-major matrix (conv_taps == 0) or the implicit im2col of a channels-last
-// sequence for a k-tap dilated Conv1d (conv_taps > 0): A(m, tap * Cin + c) = X[b, t + (tap - c0) * d, c]
-// with zero padding and an optional per-frame input mask (multiplied in, like `x * mask`).
+// GEMM: Y[m, n] = epilogue( sum_k A(m, k) * W[n, k] + bias[n] )
 // ---------------------------------------------------------------------------------------------
 struct GemmParams {
   int M, N, K;
@@ -43,166 +45,292 @@ inline float activate(float v, int act) {
   return act == 1 ? max(v, 0.0f) : (act == 2 ? max(v * 0.01f, v) : v);
 }
 
-struct ASources {
-  device const float* A;
-  device const float* A2;
-  device const float* A3;
-  device const float* mask;
-};
-
-// Source address of A(m, k); returns -1 for implicit zero padding. `mrow` gets the mask index.
-inline long a_index(constant GemmParams& p, int m, int k, thread int& mrow, thread int& seg) {
-  if (p.conv_taps == 0) {
-    mrow = m;
-    if (p.k1 == 0 || k < p.k1) { seg = 0; return (long)m * p.lda + k; }
-    if (k < p.k1 + p.k2) { seg = 1; return (long)m * p.lda2 + (k - p.k1); }
-    seg = 2;
-    return (long)m * p.lda3 + (k - p.k1 - p.k2);
-  }
-  seg = 0;
-  int tap = k / p.conv_cin, c = k - tap * p.conv_cin;
-  int b = m / p.conv_T, t = m - b * p.conv_T;
-  int ts = t + (tap - p.conv_taps / 2) * p.conv_dil;
-  if (ts < 0 || ts >= p.conv_T) return -1;
-  mrow = b * p.conv_T + ts;
-  long src_row = p.conv_up == 2 ? (long)b * (p.conv_T / 2) + ts / 2 : (long)mrow;
-  return src_row * p.lda + c;
-}
-
-inline float a_finish(float v, constant GemmParams& p, int mrow, device const float* mask) {
-  if (p.a_relu) v = max(v, 0.0f);
-  return p.has_mask ? v * mask[mrow] : v;
-}
-
-inline float4 a_finish4(float4 v, constant GemmParams& p, int mrow, device const float* mask) {
-  if (p.a_relu) v = max(v, float4(0.0f));
-  return p.has_mask ? v * mask[mrow] : v;
-}
-
-inline float load_a(thread const ASources& s, constant GemmParams& p, int m, int k) {
-  int mrow, seg;
-  long idx = a_index(p, m, k, mrow, seg);
-  if (idx < 0) return 0.0f;
-  device const float* base = seg == 0 ? s.A : (seg == 1 ? s.A2 : s.A3);
-  return a_finish(base[idx], p, mrow, s.mask);
-}
-
-// 4 consecutive k (never straddling a segment or tap: all boundaries are multiples of 4).
-inline float4 load_a4(thread const ASources& s, constant GemmParams& p, int m, int k) {
-  if (m >= p.M || k >= p.K) return float4(0.0f);
-  int mrow, seg;
-  long idx = a_index(p, m, k, mrow, seg);
-  if (idx < 0) return float4(0.0f);
-  device const float* base = seg == 0 ? s.A : (seg == 1 ? s.A2 : s.A3);
-  return a_finish4(*(device const float4*)(base + idx), p, mrow, s.mask);
-}
+// Loader specialization (function constants; undefined = false).
+constant bool fc_plain [[function_constant(0)]];   // M/N/K tile-aligned, conv taps / concat segments constant per K tile
+constant bool fc_conv [[function_constant(1)]];    // implicit Conv1d im2col
+constant bool fc_concat [[function_constant(2)]];  // A = [A | A2 | A3] along K
+constant bool fc_amask [[function_constant(3)]];   // A rows multiplied by amask
+constant bool fc_arelu [[function_constant(4)]];   // relu(A)
+constant bool fc_up [[function_constant(5)]];      // conv over 2x nearest-upsampled frames
+constant bool fc_q8 [[function_constant(6)]];      // W is INT8 (affine, group 64)
+constant bool fc_vec [[function_constant(7)]];     // all K extents / strides multiples of 4
+#define FC(x) (is_function_constant_defined(x) && x)
+constant bool PLAIN = FC(fc_plain);
+constant bool CONV = FC(fc_conv);
+constant bool CONCAT = FC(fc_concat);
+constant bool AMASK = FC(fc_amask);
+constant bool ARELU = FC(fc_arelu);
+constant bool UP = FC(fc_up);
+constant bool Q8 = FC(fc_q8);
+constant bool VEC = FC(fc_vec);
 
 struct Epi {
-  device const float* bias;
-  device const float* R;
+  device const T* bias;
+  device const T* R;
   device const float* ymask;
-  device const float* missing;
+  device const T* missing;
 };
 
 // Shared epilogue (direct GEMM output and split-K reduce). Returns false if the row is skipped.
 inline bool epilogue(thread const Epi& e, constant GemmParams& p, int m, int n, thread float& v) {
   if (p.y_pred && e.ymask[m] == 0.0f) return false;
-  v = activate(v + e.bias[n], p.act);
-  if (p.has_res) v += e.R[(long)(p.r_mod ? m % p.r_mod : m) * p.ldr + n];
+  v = activate(v + float(e.bias[n]), p.act);
+  if (p.has_res) v += float(e.R[(p.r_mod ? m % p.r_mod : m) * p.ldr + n]);
   if (p.y_mask) v *= e.ymask[m];
   if (p.blend) {
     float h = e.ymask[m];
-    v = v * h + e.missing[(long)(m % p.blend_mod) * p.N + n] * (1.0f - h);
+    v = v * h + float(e.missing[(m % p.blend_mod) * p.N + n]) * (1.0f - h);
   }
   return true;
 }
 
-inline bool vec_ok(constant GemmParams& p) {
-  return (p.K & 3) == 0 && (p.lda & 3) == 0 && (p.conv_taps == 0 || (p.conv_cin & 3) == 0) &&
-         (p.k1 == 0 || ((p.k1 & 3) == 0 && (p.k2 & 3) == 0 && (p.lda2 & 3) == 0 && (p.lda3 & 3) == 0));
+// Per-thread A-row context, computed once per kernel.
+struct ARow {
+  bool ok;        // row < M
+  int row;        // m (clamped)
+  int b, t;       // conv: sequence and frame
+  float mask;     // non-conv row mask
+};
+
+inline ARow a_row(constant GemmParams& p, device const float* amask, int m) {
+  ARow r;
+  r.ok = m < p.M;
+  r.row = min(m, p.M - 1);
+  r.b = CONV ? r.row / p.conv_T : 0;
+  r.t = CONV ? r.row - r.b * p.conv_T : 0;
+  r.mask = (AMASK && !CONV) ? amask[r.row] : 1.0f;
+  return r;
 }
 
-// GEMM on simdgroup matrices. Threadgroup tile BM x BN, WM x WN simdgroups, each owning a
-// (BM/WM) x (BN/WN) block of 8x8 accumulators. A and W tiles are staged in threadgroup memory
-// with float4 loads (W rows are contiguous along K, i.e. the "NT" layout); the epilogue writes
-// each lane's accumulator elements straight to memory (MLX's fragment coordinate mapping).
-// Split-K: grid.z partitions K; with splits > 1 the raw partial sums go to Y as [z][M][N] and
-// gemm_splitk_reduce applies bias / activation / residual.
+inline float4 a_post(float4 v, float mask) {
+  if (ARELU) v = max(v, float4(0.0f));
+  if (AMASK) v *= mask;
+  return v;
+}
+
+// 4 consecutive k of A(m, k) (never straddling a tap or concat segment: boundaries are multiples of 4).
+inline float4 load_a4(device const T* A, device const T* A2, device const T* A3, device const float* amask,
+                      constant GemmParams& p, thread const ARow& r, int k, int kend) {
+  if (!r.ok || k >= kend) return float4(0.0f);
+  if (CONV) {
+    int tap = k / p.conv_cin, c = k - tap * p.conv_cin;
+    int ts = r.t + (tap - p.conv_taps / 2) * p.conv_dil;
+    if (ts < 0 || ts >= p.conv_T) return float4(0.0f);
+    int src_row = UP ? r.b * (p.conv_T / 2) + ts / 2 : r.b * p.conv_T + ts;
+    float m = AMASK ? amask[r.b * p.conv_T + ts] : 1.0f;
+    return a_post(float4(*(device const T4*)(A + src_row * p.lda + c)), m);
+  }
+  if (CONCAT) {
+    if (k >= p.k1 + p.k2) return a_post(float4(*(device const T4*)(A3 + r.row * p.lda3 + (k - p.k1 - p.k2))), r.mask);
+    if (k >= p.k1) return a_post(float4(*(device const T4*)(A2 + r.row * p.lda2 + (k - p.k1))), r.mask);
+  }
+  return a_post(float4(*(device const T4*)(A + r.row * p.lda + k)), r.mask);
+}
+
+inline float load_a1(device const T* A, device const T* A2, device const T* A3, device const float* amask,
+                     constant GemmParams& p, thread const ARow& r, int k, int kend) {
+  if (!r.ok || k >= kend) return 0.0f;
+  float v, m = r.mask;
+  if (CONV) {
+    int tap = k / p.conv_cin, c = k - tap * p.conv_cin;
+    int ts = r.t + (tap - p.conv_taps / 2) * p.conv_dil;
+    if (ts < 0 || ts >= p.conv_T) return 0.0f;
+    int src_row = UP ? r.b * (p.conv_T / 2) + ts / 2 : r.b * p.conv_T + ts;
+    m = AMASK ? amask[r.b * p.conv_T + ts] : 1.0f;
+    v = float(A[src_row * p.lda + c]);
+  } else if (CONCAT && k >= p.k1 + p.k2) {
+    v = float(A3[r.row * p.lda3 + (k - p.k1 - p.k2)]);
+  } else if (CONCAT && k >= p.k1) {
+    v = float(A2[r.row * p.lda2 + (k - p.k1)]);
+  } else {
+    v = float(A[r.row * p.lda + k]);
+  }
+  if (ARELU) v = max(v, 0.0f);
+  if (AMASK) v *= m;
+  return v;
+}
+
+// 4 consecutive k of W row n (T or dequantized INT8: w = scale * q + bias).
+inline float4 load_w4(device const T* W, device const uint* Wq, device const float* qs, device const float* qb,
+                      constant GemmParams& p, int n, int k) {
+  if (Q8) {
+    uint q = Wq[n * (p.K / 4) + k / 4];
+    int g = n * (p.K / 64) + k / 64;
+    float s = qs[g], bb = qb[g];
+    return float4(float(q & 0xff), float((q >> 8) & 0xff), float((q >> 16) & 0xff), float(q >> 24)) * s + bb;
+  }
+  return float4(*(device const T4*)(W + n * p.K + k));
+}
+
+// GEMM on simdgroup matrices, structured like MLX's steel GEMM: each simdgroup owns TM x TN 8x8
+// fragments interleaved across the threadgroup tile; fragments are loaded lane-wise from
+// threadgroup memory (stored as T, accumulated as float); serpentine multiply-accumulate order.
+// Per-thread load slots are fixed for the whole K loop. Split-K writes float partials to P.
 template <int BM, int BN, int BK, int WM, int WN>
 [[kernel]] void gemm_mma(
-    device const float* A [[buffer(0)]], device const float* W [[buffer(1)]],
-    device const float* bias [[buffer(2)]], device float* Y [[buffer(3)]],
-    constant GemmParams& p [[buffer(4)]], device const float* mask [[buffer(5)]],
-    device const float* R [[buffer(6)]], device const float* A2 [[buffer(7)]],
-    device const float* A3 [[buffer(8)]], device const float* ymask [[buffer(9)]],
-    device const float* missing [[buffer(10)]],
+    device const T* A [[buffer(0)]], device const T* W [[buffer(1)]], device const T* bias [[buffer(2)]],
+    device T* Y [[buffer(3)]], constant GemmParams& p [[buffer(4)]], device const float* amask [[buffer(5)]],
+    device const T* R [[buffer(6)]], device const T* A2 [[buffer(7)]], device const T* A3 [[buffer(8)]],
+    device const float* ymask [[buffer(9)]], device const T* missing [[buffer(10)]],
+    device const uint* Wq [[buffer(11)]], device const float* qs [[buffer(12)]], device const float* qb [[buffer(13)]],
+    device float* P [[buffer(14)]],
     uint3 tgid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-  const ASources src{A, A2, A3, mask};
   const Epi epi{bias, R, ymask, missing};
   constexpr int NT = WM * WN * 32;
-  constexpr int TM = BM / WM, TN = BN / WN, FM = TM / 8, FN = TN / 8;
-  constexpr int LDS = BK + 4;
-  threadgroup float As[BM * LDS];
-  threadgroup float Bs[BN * LDS];
+  constexpr int TM = BM / (8 * WM), TN = BN / (8 * WN);
+  constexpr int LDS = BK + 16 / sizeof(T);
+  constexpr int SA = (BM * BK / 4 + NT - 1) / NT, SB = (BN * BK / 4 + NT - 1) / NT;
+  threadgroup T As[BM * LDS];
+  threadgroup T Bs[BN * LDS];
   const int m0 = int(tgid.y) * BM, n0 = int(tgid.x) * BN;
   const int kbeg = int(tgid.z) * p.k_split, kend = min(p.K, kbeg + p.k_split);
-  const int sm = (int(sg) / WN) * TM, sn = (int(sg) % WN) * TN;
-  simdgroup_float8x8 acc[FM][FN];
-  _Pragma("clang loop unroll(full)") for (int i = 0; i < FM; i++)
-    _Pragma("clang loop unroll(full)") for (int j = 0; j < FN; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-  const bool vec = vec_ok(p);
+  const short qid = short(lane) / 4;
+  const short fm = (qid & 4) + ((short(lane) / 2) % 4);
+  const short fn = (qid & 2) * 2 + (short(lane) % 2) * 2;
+  const short tm = 8 * (short(sg) / WN), tn = 8 * (short(sg) % WN);
+  simdgroup_float8x8 acc[TM][TN];
+  _Pragma("clang loop unroll(full)") for (int i = 0; i < TM; i++)
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < TN; j++) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  // Load slots (vector paths): tile row / column per slot, fixed across the K loop.
+  int a_r[SA], a_c[SA], b_r[SB], b_c[SB];
+  ARow arow[SA];
+  device const T* a_src[SA];
+  device const T* b_src[SB];
+  _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++) {
+    int i = min(int(tid) + s * NT, BM * BK / 4 - 1);
+    a_r[s] = i / (BK / 4);
+    a_c[s] = (i % (BK / 4)) * 4;
+    arow[s] = a_row(p, amask, m0 + a_r[s]);
+    a_src[s] = A + arow[s].row * p.lda + a_c[s];
+  }
+  _Pragma("clang loop unroll(full)") for (int s = 0; s < SB; s++) {
+    int i = min(int(tid) + s * NT, BN * BK / 4 - 1);
+    b_r[s] = i / (BK / 4);
+    b_c[s] = (i % (BK / 4)) * 4;
+    b_src[s] = W + min(n0 + b_r[s], p.N - 1) * p.K + b_c[s];
+  }
+  // INT8 plain path: packed row pointers and the row's group scales/biases (BK divides the
+  // quantization group of 64, so one tile column block lies in a single group).
+  device const uint* bq_src[SB];
+  device const float* bs_src[SB];
+  device const float* bb_src[SB];
+  if (PLAIN && Q8) {
+    _Pragma("clang loop unroll(full)") for (int s = 0; s < SB; s++) {
+      const int row = min(n0 + b_r[s], p.N - 1);
+      bq_src[s] = Wq + row * (p.K / 4) + b_c[s] / 4;
+      bs_src[s] = qs + row * (p.K / 64);
+      bb_src[s] = qb + row * (p.K / 64);
+    }
+  }
+  const threadgroup T* a_base = As + (tm + fm) * LDS + fn;
+  const threadgroup T* b_base = Bs + (tn + fn) * LDS + fm;
+
   for (int k0 = kbeg; k0 < kend; k0 += BK) {
-    if (vec) {
-      for (int i = int(tid); i < BM * BK / 4; i += NT) {
-        int r = i / (BK / 4), c = (i % (BK / 4)) * 4;
-        float4 v = (k0 + c < kend) ? load_a4(src, p, m0 + r, k0 + c) : float4(0.0f);
-        *(threadgroup float4*)(As + r * LDS + c) = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (PLAIN) {
+      if (CONV) {
+        // Tile-aligned implicit conv: the tap (and so the frame offset) is constant per K tile.
+        const int tap = k0 / p.conv_cin, c0 = k0 - tap * p.conv_cin;
+        const int off = (tap - p.conv_taps / 2) * p.conv_dil;
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++) {
+          const int ts = arow[s].t + off;
+          T4 v = T4(0);
+          if (ts >= 0 && ts < p.conv_T) {
+            const int src = UP ? arow[s].b * (p.conv_T / 2) + ts / 2 : arow[s].b * p.conv_T + ts;
+            float4 x = float4(*(device const T4*)(A + src * p.lda + c0 + a_c[s]));
+            if (ARELU) x = max(x, float4(0.0f));
+            if (AMASK) x *= amask[arow[s].b * p.conv_T + ts];
+            v = T4(x);
+          }
+          *(threadgroup T4*)(As + a_r[s] * LDS + a_c[s]) = v;
+        }
+      } else if (CONCAT) {
+        // Segment boundaries are tile-aligned: one source per K tile.
+        device const T* src = A;
+        int ld = p.lda, kk = k0;
+        if (k0 >= p.k1 + p.k2) { src = A3; ld = p.lda3; kk = k0 - p.k1 - p.k2; }
+        else if (k0 >= p.k1) { src = A2; ld = p.lda2; kk = k0 - p.k1; }
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++) {
+          const float4 x = a_post(float4(*(device const T4*)(src + arow[s].row * ld + kk + a_c[s])), arow[s].mask);
+          *(threadgroup T4*)(As + a_r[s] * LDS + a_c[s]) = T4(x);
+        }
+      } else if (ARELU || AMASK) {
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++)
+          *(threadgroup T4*)(As + a_r[s] * LDS + a_c[s]) = T4(a_post(float4(*(device const T4*)(a_src[s] + k0)), arow[s].mask));
+      } else {
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++)
+          *(threadgroup T4*)(As + a_r[s] * LDS + a_c[s]) = *(device const T4*)(a_src[s] + k0);
       }
-      for (int i = int(tid); i < BN * BK / 4; i += NT) {
-        int r = i / (BK / 4), c = (i % (BK / 4)) * 4;
-        int gn = n0 + r, gk = k0 + c;
-        float4 v = (gn < p.N && gk < kend) ? *(device const float4*)(W + (long)gn * p.K + gk) : float4(0.0f);
-        *(threadgroup float4*)(Bs + r * LDS + c) = v;
+      if (Q8) {
+        const int g = k0 / 64;
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SB; s++) {
+          const uint q = bq_src[s][k0 / 4];
+          const float sc = bs_src[s][g], bi = bb_src[s][g];
+          const float4 w = float4(float(q & 0xff), float((q >> 8) & 0xff), float((q >> 16) & 0xff), float(q >> 24)) * sc + bi;
+          *(threadgroup T4*)(Bs + b_r[s] * LDS + b_c[s]) = T4(w);
+        }
+      } else {
+        _Pragma("clang loop unroll(full)") for (int s = 0; s < SB; s++)
+          *(threadgroup T4*)(Bs + b_r[s] * LDS + b_c[s]) = *(device const T4*)(b_src[s] + k0);
+      }
+    } else if (VEC) {
+      _Pragma("clang loop unroll(full)") for (int s = 0; s < SA; s++)
+        *(threadgroup T4*)(As + a_r[s] * LDS + a_c[s]) = T4(load_a4(A, A2, A3, amask, p, arow[s], k0 + a_c[s], kend));
+      _Pragma("clang loop unroll(full)") for (int s = 0; s < SB; s++) {
+        int gn = n0 + b_r[s], gk = k0 + b_c[s];
+        float4 w = (gn < p.N && gk < kend) ? load_w4(W, Wq, qs, qb, p, gn, gk) : float4(0.0f);
+        *(threadgroup T4*)(Bs + b_r[s] * LDS + b_c[s]) = T4(w);
       }
     } else {
       for (int i = int(tid); i < BM * BK; i += NT) {
-        int r = i / BK, c = i % BK, gm = m0 + r, gk = k0 + c;
-        As[r * LDS + c] = (gm < p.M && gk < kend) ? load_a(src, p, gm, gk) : 0.0f;
+        int r = i / BK, c = i % BK;
+        ARow ar = a_row(p, amask, m0 + r);
+        As[r * LDS + c] = T(load_a1(A, A2, A3, amask, p, ar, k0 + c, kend));
       }
       for (int i = int(tid); i < BN * BK; i += NT) {
         int r = i / BK, c = i % BK, gn = n0 + r, gk = k0 + c;
-        Bs[r * LDS + c] = (gn < p.N && gk < kend) ? W[(long)gn * p.K + gk] : 0.0f;
+        Bs[r * LDS + c] = (gn < p.N && gk < kend) ? W[gn * p.K + gk] : T(0.0f);
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     _Pragma("clang loop unroll(full)") for (int kk = 0; kk < BK; kk += 8) {
-      simdgroup_float8x8 a[FM], b[FN];
-      _Pragma("clang loop unroll(full)") for (int i = 0; i < FM; i++) simdgroup_load(a[i], As + (sm + 8 * i) * LDS + kk, LDS);
-      _Pragma("clang loop unroll(full)") for (int j = 0; j < FN; j++) simdgroup_load(b[j], Bs + (sn + 8 * j) * LDS + kk, LDS, ulong2(0, 0), true);
-      _Pragma("clang loop unroll(full)") for (int i = 0; i < FM; i++)
-        _Pragma("clang loop unroll(full)") for (int j = 0; j < FN; j++) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+      simdgroup_float8x8 a[TM], b[TN];
+      simdgroup_barrier(mem_flags::mem_none);
+      _Pragma("clang loop unroll(full)") for (int i = 0; i < TM; i++) {
+        const threadgroup T* ap = a_base + (i * 8 * WM) * LDS + kk;
+        reinterpret_cast<thread float2&>(a[i].thread_elements()) = float2(float(ap[0]), float(ap[1]));
+      }
+      simdgroup_barrier(mem_flags::mem_none);
+      _Pragma("clang loop unroll(full)") for (int j = 0; j < TN; j++) {
+        const threadgroup T* bp = b_base + (j * 8 * WN) * LDS + kk;
+        reinterpret_cast<thread float2&>(b[j].thread_elements()) = float2(float(bp[0]), float(bp[LDS]));
+      }
+      simdgroup_barrier(mem_flags::mem_none);
+      _Pragma("clang loop unroll(full)") for (int i = 0; i < TM; i++) {
+        _Pragma("clang loop unroll(full)") for (int jj = 0; jj < TN; jj++) {
+          const int j = (i % 2) ? (TN - 1 - jj) : jj;  // serpentine order
+          simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+      }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-  const short qid = short(lane) / 4;
-  const short fm = (qid & 4) + ((short(lane) / 2) % 4);
-  const short fn = (qid & 2) * 2 + (short(lane) % 2) * 2;
   const bool split = p.splits > 1;
-  _Pragma("clang loop unroll(full)") for (int i = 0; i < FM; i++) {
-    _Pragma("clang loop unroll(full)") for (int j = 0; j < FN; j++) {
+  _Pragma("clang loop unroll(full)") for (int i = 0; i < TM; i++) {
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < TN; j++) {
       auto e = acc[i][j].thread_elements();
-      const int gm = m0 + sm + 8 * i + fm;
-      const int gn = n0 + sn + 8 * j + fn;
+      const int gm = m0 + tm + i * 8 * WM + fm;
+      const int gn = n0 + tn + j * 8 * WN + fn;
       if (gm >= p.M) continue;
       _Pragma("clang loop unroll(full)") for (int c = 0; c < 2; c++) {
         const int n = gn + c;
         if (n >= p.N) continue;
         if (split) {
-          Y[((long)tgid.z * p.M + gm) * p.N + n] = e[c];
+          P[(int(tgid.z) * p.M + gm) * p.N + n] = e[c];
         } else {
           float v = e[c];
-          if (epilogue(epi, p, gm, n, v)) Y[(long)gm * p.ldy + n] = v;
+          if (epilogue(epi, p, gm, n, v)) Y[gm * p.ldy + n] = T(v);
         }
       }
     }
@@ -211,9 +339,9 @@ template <int BM, int BN, int BK, int WM, int WN>
 
 #define MMA(BM, BN, BK, WM, WN) \
   template [[host_name("gemm_mma_" #BM "_" #BN "_" #BK "_" #WM "_" #WN)]] [[kernel]] void gemm_mma<BM, BN, BK, WM, WN>( \
-      device const float*, device const float*, device const float*, device float*, \
-      constant GemmParams&, device const float*, device const float*, device const float*, \
-      device const float*, device const float*, device const float*, uint3, uint, uint, uint);
+      device const T*, device const T*, device const T*, device T*, constant GemmParams&, device const float*, \
+      device const T*, device const T*, device const T*, device const float*, device const T*, \
+      device const uint*, device const float*, device const float*, device float*, uint3, uint, uint, uint);
 MMA(16, 32, 32, 1, 2)
 MMA(16, 64, 32, 1, 4)
 MMA(16, 64, 64, 1, 4)
@@ -225,93 +353,55 @@ MMA(64, 64, 16, 2, 2)
 MMA(64, 32, 32, 2, 2)
 MMA(64, 64, 16, 2, 4)
 MMA(64, 64, 32, 2, 4)
-MMA(128, 32, 16, 4, 1)
-MMA(64, 64, 16, 4, 2)
-
-// Epilogue on a finished steel GEMM output YS (M x N, bias already added: pass zeros as bias),
-// written to Y with the full set of options (activation, residual, output mask, predicate, blend).
-[[kernel]] void epilogue_apply(
-    device const float* YS [[buffer(0)]], device float* Y [[buffer(1)]], constant GemmParams& p [[buffer(2)]],
-    device const float* zeros [[buffer(3)]], device const float* R [[buffer(4)]],
-    device const float* ymask [[buffer(5)]], device const float* missing [[buffer(6)]],
-    uint gid [[thread_position_in_grid]]) {
-  if (int(gid) >= p.M * p.N) return;
-  const int m = int(gid) / p.N, n = int(gid) % p.N;
-  const Epi epi{zeros, R, ymask, missing};
-  float v = YS[gid];
-  if (epilogue(epi, p, m, n, v)) Y[(long)m * p.ldy + n] = v;
-}
-
-// Materialize the effective A operand (conv im2col with dilation/upsampling, concatenation,
-// relu, row mask) as a plain M x K matrix, so large GEMMs can use the steel kernel.
-[[kernel]] void materialize_a(
-    device const float* A [[buffer(0)]], device const float* A2 [[buffer(1)]], device const float* A3 [[buffer(2)]],
-    device const float* mask [[buffer(3)]], device float* out [[buffer(4)]], constant GemmParams& p [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-  const ASources src{A, A2, A3, mask};
-  if (vec_ok(p)) {
-    const int kq = p.K / 4;
-    if (int(gid) >= p.M * kq) return;
-    const int m = int(gid) / kq, k = (int(gid) % kq) * 4;
-    *(device float4*)(out + (long)m * p.K + k) = load_a4(src, p, m, k);
-  } else {
-    if (int(gid) >= p.M * p.K) return;
-    const int m = int(gid) / p.K, k = int(gid) % p.K;
-    out[gid] = load_a(src, p, m, k);
-  }
-}
 
 // Sum split-K partials [splits][M][N], then the shared epilogue.
 [[kernel]] void gemm_splitk_reduce(
-    device const float* P [[buffer(0)]], device const float* bias [[buffer(1)]],
-    device float* Y [[buffer(2)]], constant GemmParams& p [[buffer(3)]],
-    device const float* R [[buffer(4)]], device const float* ymask [[buffer(5)]],
-    device const float* missing [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+    device const float* P [[buffer(0)]], device const T* bias [[buffer(1)]],
+    device T* Y [[buffer(2)]], constant GemmParams& p [[buffer(3)]],
+    device const T* R [[buffer(4)]], device const float* ymask [[buffer(5)]],
+    device const T* missing [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
   const int total = p.M * p.N;
   if (int(gid) >= total) return;
   const int m = int(gid) / p.N, n = int(gid) % p.N;
   float s = 0.0f;
-  for (int z = 0; z < p.splits; z++) s += P[(long)z * total + gid];
+  for (int z = 0; z < p.splits; z++) s += P[z * total + int(gid)];
   const Epi epi{bias, R, ymask, missing};
-  if (epilogue(epi, p, m, n, s)) Y[(long)m * p.ldy + n] = s;
+  if (epilogue(epi, p, m, n, s)) Y[m * p.ldy + n] = T(s);
 }
 
 // ---------------------------------------------------------------------------------------------
 // Multi-head self-attention for short sequences (L <= 32) straight from the packed in_proj
 // output qkv (B, L, 3D); key padding mask pad (B, L), 1 = padded. One threadgroup per (b, head),
-// one simdgroup per query, one lane per key. Output (B, L, D) in the layout out_proj expects.
+// Q/K/V of the head staged in threadgroup memory; one simdgroup per query, one lane per key.
 // ---------------------------------------------------------------------------------------------
 struct AttnParams { int B, L, D, H, hd, has_pad; float scale; };
 
 [[kernel]] void attention(
-    device const float* qkv [[buffer(0)]], device const float* pad [[buffer(1)]],
-    device float* out [[buffer(2)]], constant AttnParams& p [[buffer(3)]],
+    device const T* qkv [[buffer(0)]], device const float* pad [[buffer(1)]],
+    device T* out [[buffer(2)]], constant AttnParams& p [[buffer(3)]],
     threadgroup float* shm [[threadgroup(0)]],
     uint gid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]],
     uint nt [[threads_per_threadgroup]]) {
-  // Q, K, V of one (batch, head) staged once in threadgroup memory (L x (hd + 1) each, sized by
-  // the host); then one simdgroup per query and one lane per key.
   const int LD = p.hd + 1;
   threadgroup float* Qs = shm;
   threadgroup float* Ks = shm + p.L * LD;
   threadgroup float* Vs = shm + 2 * p.L * LD;
   const int b = int(gid) / p.H, h = int(gid) % p.H;
-  const long row3 = 3L * p.D;
-  device const float* base = qkv + (long)b * p.L * row3 + h * p.hd;
+  const int row3 = 3 * p.D;
+  device const T* base = qkv + b * p.L * row3 + h * p.hd;
   for (int i = int(tid); i < p.L * p.hd; i += int(nt)) {
     int j = i / p.hd, c = i % p.hd;
-    device const float* r = base + j * row3 + c;
-    Qs[j * LD + c] = r[0];
-    Ks[j * LD + c] = r[p.D];
-    Vs[j * LD + c] = r[2 * p.D];
+    device const T* r = base + j * row3 + c;
+    Qs[j * LD + c] = float(r[0]);
+    Ks[j * LD + c] = float(r[p.D]);
+    Vs[j * LD + c] = float(r[2 * p.D]);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const int q = int(sg), j = int(lane);
   if (q >= p.L) return;
   float s = -INFINITY;
   if (j < p.L && !(p.has_pad && pad[b * p.L + j] != 0.0f)) {
-    // 4 independent accumulators: the dot product is latency-bound, not throughput-bound.
     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
     for (int i = 0; i < p.hd; i += 4) {
       a0 = fma(Qs[q * LD + i], Ks[j * LD + i], a0);
@@ -332,12 +422,119 @@ struct AttnParams { int B, L, D, H, hd, has_pad; float scale; };
       o1 = fma(simd_shuffle(pj, ushort(jj + 1)), Vs[(jj + 1) * LD + i], o1);
     }
     if (jj < p.L) o0 = fma(simd_shuffle(pj, ushort(jj)), Vs[jj * LD + i], o0);
-    out[((long)b * p.L + q) * p.D + h * p.hd + i] = o0 + o1;
+    out[(b * p.L + q) * p.D + h * p.hd + i] = T(o0 + o1);
   }
 }
 
+// Attention on simdgroup matrices for L <= LP (LP = 16 or 32) and head dim HD: one threadgroup
+// per (b, head), one simdgroup per 8 queries. Q/K/V of the head are staged in threadgroup memory
+// (rows >= L zeroed); S = Q K^T in float fragments, masked softmax per row (4 lanes per row),
+// O = P V written straight to the output rows.
+template <int LP, int HD>
+[[kernel]] void attention_mma(
+    device const T* qkv [[buffer(0)]], device const float* pad [[buffer(1)]],
+    device T* out [[buffer(2)]], constant AttnParams& p [[buffer(3)]],
+    uint gid [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint tid [[thread_index_in_threadgroup]]) {
+  constexpr int LD = HD + 16 / sizeof(T), LS = LP + 4, NT = LP * 4;
+  threadgroup T Qs[LP * LD], Ks[LP * LD], Vs[LP * LD];
+  threadgroup float Ss[LP * LS];
+  const int b = int(gid) / p.H, h = int(gid) % p.H;
+  const int row3 = 3 * p.D;
+  device const T* base = qkv + b * p.L * row3 + h * HD;
+  _Pragma("clang loop unroll(full)") for (int i = int(tid); i < LP * HD / 4; i += NT) {
+    const int j = i / (HD / 4), c = (i % (HD / 4)) * 4;
+    T4 q = T4(0), k = T4(0), v = T4(0);
+    if (j < p.L) {
+      device const T* r = base + j * row3 + c;
+      q = *(device const T4*)r;
+      k = *(device const T4*)(r + p.D);
+      v = *(device const T4*)(r + 2 * p.D);
+    }
+    *(threadgroup T4*)(Qs + j * LD + c) = q;
+    *(threadgroup T4*)(Ks + j * LD + c) = k;
+    *(threadgroup T4*)(Vs + j * LD + c) = v;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const short qid = short(lane) / 4;
+  const short fm = (qid & 4) + ((short(lane) / 2) % 4);
+  const short fn = (qid & 2) * 2 + (short(lane) % 2) * 2;
+  const int r0 = int(sg) * 8;
+
+  simdgroup_float8x8 S[LP / 8];
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < LP / 8; j++) S[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  _Pragma("clang loop unroll(full)") for (int kk = 0; kk < HD; kk += 8) {
+    simdgroup_float8x8 a;
+    const threadgroup T* ap = Qs + (r0 + fm) * LD + kk + fn;
+    reinterpret_cast<thread float2&>(a.thread_elements()) = float2(float(ap[0]), float(ap[1]));
+    _Pragma("clang loop unroll(full)") for (int j = 0; j < LP / 8; j++) {
+      simdgroup_float8x8 bm;  // K^T: element (k, key) = K[key][k]
+      const threadgroup T* bp = Ks + (j * 8 + fn) * LD + kk + fm;
+      reinterpret_cast<thread float2&>(bm.thread_elements()) = float2(float(bp[0]), float(bp[LD]));
+      simdgroup_multiply_accumulate(S[j], a, bm, S[j]);
+    }
+  }
+  _Pragma("clang loop unroll(full)") for (int j = 0; j < LP / 8; j++) {
+    auto e = S[j].thread_elements();
+    _Pragma("clang loop unroll(full)") for (int c = 0; c < 2; c++) {
+      const int key = j * 8 + fn + c;
+      const bool ok = key < p.L && !(p.has_pad && pad[b * p.L + key] != 0.0f);
+      Ss[(r0 + fm) * LS + key] = ok ? e[c] * p.scale : -INFINITY;
+    }
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+  {
+    threadgroup float* sr = Ss + (r0 + int(lane) / 4) * LS;
+    float mx = -INFINITY;
+    _Pragma("clang loop unroll(full)") for (int c = int(lane) % 4; c < LP; c += 4) mx = max(mx, sr[c]);
+    mx = max(mx, simd_shuffle_xor(mx, ushort(1)));
+    mx = max(mx, simd_shuffle_xor(mx, ushort(2)));
+    float sum = 0.0f;
+    _Pragma("clang loop unroll(full)") for (int c = int(lane) % 4; c < LP; c += 4) {
+      const float e = sr[c] == -INFINITY ? 0.0f : exp(sr[c] - mx);
+      sr[c] = e;
+      sum += e;
+    }
+    sum += simd_shuffle_xor(sum, ushort(1));
+    sum += simd_shuffle_xor(sum, ushort(2));
+    _Pragma("clang loop unroll(full)") for (int c = int(lane) % 4; c < LP; c += 4) sr[c] = sr[c] / sum;
+  }
+  simdgroup_barrier(mem_flags::mem_threadgroup);
+
+  simdgroup_float8x8 O[HD / 8];
+  _Pragma("clang loop unroll(full)") for (int c = 0; c < HD / 8; c++) O[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  _Pragma("clang loop unroll(full)") for (int kk = 0; kk < LP; kk += 8) {
+    simdgroup_float8x8 a;
+    reinterpret_cast<thread float2&>(a.thread_elements()) = *(const threadgroup float2*)(Ss + (r0 + fm) * LS + kk + fn);
+    _Pragma("clang loop unroll(full)") for (int c = 0; c < HD / 8; c++) {
+      simdgroup_float8x8 bm;  // V: element (key, dim)
+      const threadgroup T* bp = Vs + (kk + fm) * LD + c * 8 + fn;
+      reinterpret_cast<thread float2&>(bm.thread_elements()) = float2(float(bp[0]), float(bp[1]));
+      simdgroup_multiply_accumulate(O[c], a, bm, O[c]);
+    }
+  }
+  const int q = r0 + fm;
+  if (q < p.L) {
+    device T* o = out + (b * p.L + q) * p.D + h * HD + fn;
+    _Pragma("clang loop unroll(full)") for (int c = 0; c < HD / 8; c++) {
+      auto e = O[c].thread_elements();
+      o[c * 8] = T(e[0]);
+      o[c * 8 + 1] = T(e[1]);
+    }
+  }
+}
+
+#define ATTN(LP, HD) \
+  template [[host_name("attention_mma_" #LP "_" #HD)]] [[kernel]] void attention_mma<LP, HD>( \
+      device const T*, device const float*, device T*, constant AttnParams&, uint, uint, uint, uint);
+ATTN(16, 32)
+ATTN(16, 64)
+ATTN(32, 32)
+ATTN(32, 64)
+
 // ---------------------------------------------------------------------------------------------
-// y = LayerNorm(x + r) * w + b over the last axis; one threadgroup per row.
+// y = LayerNorm(x + r) * w + b over the last axis (float math); one threadgroup per row.
+// In half precision x + r is rounded to T first, as in MLX where the add is a T op.
 // ---------------------------------------------------------------------------------------------
 struct LnParams { int D; float eps; };
 
@@ -352,20 +549,21 @@ inline float tg_sum(float v, threadgroup float* red, uint sg, uint lane, uint ns
 }
 
 [[kernel]] void add_layernorm(
-    device const float* x [[buffer(0)]], device const float* r [[buffer(1)]],
-    device const float* w [[buffer(2)]], device const float* bvec [[buffer(3)]],
-    device float* y [[buffer(4)]], constant LnParams& p [[buffer(5)]],
+    device const T* x [[buffer(0)]], device const T* r [[buffer(1)]],
+    device const T* w [[buffer(2)]], device const T* bvec [[buffer(3)]],
+    device T* y [[buffer(4)]], constant LnParams& p [[buffer(5)]],
     uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
     uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
   threadgroup float red[32];
-  device const float* xr = x + (long)row * p.D;
-  device const float* rr = r + (long)row * p.D;
+  device const T* xr = x + row * p.D;
+  device const T* rr = r + row * p.D;
   float sum = 0.0f;
-  for (int i = int(tid); i < p.D; i += int(nt)) sum += xr[i] + rr[i];
+  for (int i = int(tid); i < p.D; i += int(nt)) sum += float(T(xr[i] + rr[i]));
   const float mean = tg_sum(sum, red, sg, lane, nsg) / p.D;
   float var = 0.0f;
-  for (int i = int(tid); i < p.D; i += int(nt)) { float d = xr[i] + rr[i] - mean; var += d * d; }
+  for (int i = int(tid); i < p.D; i += int(nt)) { float d = float(T(xr[i] + rr[i])) - mean; var += d * d; }
   const float inv = rsqrt(tg_sum(var, red, sg, lane, nsg) / p.D + p.eps);
-  for (int i = int(tid); i < p.D; i += int(nt)) y[(long)row * p.D + i] = (xr[i] + rr[i] - mean) * inv * w[i] + bvec[i];
+  for (int i = int(tid); i < p.D; i += int(nt))
+    y[row * p.D + i] = T((float(T(xr[i] + rr[i])) - mean) * inv * float(w[i]) + float(bvec[i]));
 }

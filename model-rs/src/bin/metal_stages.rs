@@ -12,10 +12,13 @@ use motionbricks_rs::npy::load_npz;
 
 fn main() -> Result<()> {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let prec = std::env::args().nth(1).unwrap_or("float32".into());
+    let batches: Vec<usize> = std::env::args().skip(2).map(|v| v.parse().unwrap()).collect();
+    let batches = if batches.is_empty() { vec![1, 32] } else { batches };
     for name in ["soma", "unitree_g1"] {
         let folder = if name == "soma" { "soma" } else { "g1" };
-        let m = MetalModel::from_checkpoints(name, here.join("../checkpoints/MotionBricks").join(folder), 64)?;
-        for batch in [1usize, 32] {
+        let m = MetalModel::from_checkpoints_with(name, here.join("../checkpoints/MotionBricks").join(folder), 64, &prec)?;
+        for &batch in &batches {
             let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
             m.run(&req)?;
             let d = m.dims(batch, false);
@@ -35,7 +38,25 @@ fn main() -> Result<()> {
             m.encode(&mut probe, &d);
             let dispatches = probe.dispatches;
             wait(&probe.commit());
-            println!("{name:<10} N={batch:<2} GPU ms: input {input:.2} | root {root:.2} | root->pose {r2p:.2} | pose {pose:.2} | vq {vq:.2} | finish {fin:.2} | whole {all:.2} | {dispatches} dispatches");
+            // End to end (upload, encode, wait, read back): chunked commits vs one command buffer.
+            let e2e = |chunked: bool| -> f64 {
+                let mut v: Vec<f64> = (0..25)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        let n = m.upload_inputs(&req).unwrap();
+                        let mut r = if chunked { m.recorder() } else { Recorder::new(&m.gpu) };
+                        m.encode(&mut r, &m.dims(n, false));
+                        wait(&r.commit());
+                        std::hint::black_box(m.outputs(n));
+                        t.elapsed().as_secs_f64() * 1e3
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[12]
+            };
+            let (single, chunked) = (e2e(false), e2e(true));
+            println!("{name:<10} {prec:<8} N={batch:<2} end to end ms: one command buffer {single:.2} | chunked commits {chunked:.2}");
+            println!("{name:<10} {prec:<8} N={batch:<2} GPU ms: input {input:.2} | root {root:.2} | root->pose {r2p:.2} | pose {pose:.2} | vq {vq:.2} | finish {fin:.2} | whole {all:.2} | {dispatches} dispatches");
         }
     }
     Ok(())

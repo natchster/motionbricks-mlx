@@ -19,8 +19,9 @@ compilation, reduced-precision and quantization options.
 
 model-rs/ is a Rust port of model/motionbricks_mlx (files carrying the header "Rust
 port of motionbricks_mlx"): an op-for-op port on mlx-rs, and a model-specific Metal
-runtime (custom Metal kernels plus MLX's precompiled kernels, loaded at run time from
-the locally built MLX library; MLX is MIT-licensed and not redistributed here).
+runtime with its own Metal kernels. Its GEMM kernel follows the tiling scheme of MLX's
+steel GEMM (fragment layout, interleaved simdgroup tiles, serpentine accumulation);
+MLX is MIT-licensed, Copyright © 2023 Apple Inc., and is not redistributed here.
 model/motionbricks_mlx/assets/rig_kernels.metal holds Metal transcriptions of the
 upstream rig geometry, shared by both ports.
 

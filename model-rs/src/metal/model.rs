@@ -6,8 +6,9 @@
 //!
 //! One generation is a fixed list of dispatches recorded into a single serial command buffer:
 //! rig/glue kernels from `model.metal`, the generalized `gemm_mma` (implicit dilated convs with
-//! upsampling, concatenated inputs, masked/predicated/blended epilogues), MLX's own steel GEMM for
-//! large plain matrix products, fused attention and add+LayerNorm. All buffers are allocated once.
+//! upsampling, concatenated inputs, masked/predicated/blended epilogues, INT8 weights),
+//! fused attention and add+LayerNorm. Network tensors use one element type (FP32, FP16 or BF16);
+//! INT8 mode quantizes the transformer projections like the Python port. All buffers are allocated once.
 //! The release configuration (one MaskGIT step) makes the pose network's token embedding a
 //! constant, which is computed at load time.
 
@@ -17,13 +18,16 @@ use std::path::Path;
 use anyhow::{Result, anyhow, bail};
 use mlx_rs::Array;
 
-use super::transformer::{ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, Scratch, Transformer, upload};
-use super::{Arg, Buf, Gpu, Pipeline, Recorder, as_bytes, wait};
+use super::transformer::{ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, Scratch, Transformer, Weight, upload};
+use super::{Arg, Buf, Gpu, Pipeline, Precision, Recorder, as_bytes, wait};
 use crate::config::{FinalRootMode, Kind, ModelSpec, get_spec};
 use crate::npy::{Npy, load_npz_bytes};
 use crate::ops::to_vec_f32;
 use crate::representation::MotionRepresentation;
 use crate::weights::read_checkpoints;
+
+/// Dispatch counts after which a generation's recording is committed (see `MetalModel::recorder`).
+pub const FLUSH_AT: [usize; 3] = [8, 40, 120];
 
 const G1_RIG: &[u8] = include_bytes!("../../../model/motionbricks_mlx/assets/g1_model_rig.npz");
 const SOMA_RIG: &[u8] = include_bytes!("../../../model/motionbricks_mlx/assets/soma_model_rig.npz");
@@ -44,14 +48,14 @@ pub struct Dims {
 }
 
 struct Lin {
-    w: Buf,
+    w: Weight,
     b: Buf,
     n: usize,
     k: usize,
 }
 
 struct Conv {
-    w: Buf,
+    w: Weight,
     b: Buf,
     n: usize,
     cin: usize,
@@ -95,11 +99,11 @@ impl Loader<'_> {
     }
     fn lin(&self, p: &str) -> Result<Lin> {
         let s = self.shape(&format!("{p}.weight"));
-        Ok(Lin { w: self.buf(&format!("{p}.weight"))?, b: self.buf(&format!("{p}.bias"))?, n: s[0], k: s[1] })
+        Ok(Lin { w: Weight::Dense(self.buf(&format!("{p}.weight"))?), b: self.buf(&format!("{p}.bias"))?, n: s[0], k: s[1] })
     }
     fn conv(&self, p: &str, dil: usize) -> Result<Conv> {
         let s = self.shape(&format!("{p}.weight")); // (out, k, in), already channels-last
-        Ok(Conv { w: self.buf(&format!("{p}.weight"))?, b: self.buf(&format!("{p}.bias"))?, n: s[0], taps: s[1], cin: s[2], dil })
+        Ok(Conv { w: Weight::Dense(self.buf(&format!("{p}.weight"))?), b: self.buf(&format!("{p}.bias"))?, n: s[0], taps: s[1], cin: s[2], dil })
     }
     fn fc(&self, p: &str) -> Result<FcBlock> {
         Ok(FcBlock { layers: vec![self.lin(&format!("{p}.fc_layers.0"))?, self.lin(&format!("{p}.fc_layers.1"))?], proj: self.lin(&format!("{p}.forward_projection"))? })
@@ -141,6 +145,9 @@ pub struct Bufs {
     pub gn: Buf,
     pub ln: Buf,
     pub pn: Buf,
+    pub gn_t: Buf,
+    pub ln_t: Buf,
+    pub pn_t: Buf,
     pub info: Buf,
     // root network
     x0: Buf,
@@ -193,6 +200,9 @@ pub struct MetalModel {
     pub k: Kernels,
     pub spec: ModelSpec,
     pub max_batch: usize,
+    /// Network element type, and whether the transformer projections are INT8.
+    pub prec: Precision,
+    pub int8: bool,
     pd: usize,
     ld: usize,
     gd: usize,
@@ -248,17 +258,26 @@ fn leaky(v: Vec<f32>) -> Vec<f32> {
 }
 
 impl Bufs {
-    pub fn dframe_debug(&self) -> &[f32] { self.dframe.as_slice() }
-    pub fn droot_debug(&self) -> &[f32] { self.droot.as_slice() }
-    pub fn dhas_debug(&self) -> &[f32] { self.dhas.as_slice() }
+    pub fn dframe_debug(&self) -> Vec<f32> { self.dframe.to_f32(self.dframe.len) }
+    pub fn droot_debug(&self) -> Vec<f32> { self.droot.to_f32(self.droot.len) }
+    pub fn dhas_debug(&self) -> Vec<f32> { self.dhas.as_slice().to_vec() }
 }
 
 impl MetalModel {
+    /// FP32 model.
     pub fn from_checkpoints(name: &str, dir: impl AsRef<Path>, max_batch: usize) -> Result<Self> {
+        Self::from_checkpoints_with(name, dir, max_batch, "float32")
+    }
+
+    /// `precision`: "float32", "float16", "bfloat16", or "int8" (FP32 activations with INT8
+    /// transformer projections, as `motionbricks_mlx.MotionBricks.quantize(8)`).
+    pub fn from_checkpoints_with(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: &str) -> Result<Self> {
+        let prec = Precision::parse(precision)?;
+        let int8 = precision == "int8";
         let spec = get_spec(name)?;
         let loaded = read_checkpoints(dir, &spec)?;
         let rep = MotionRepresentation::new(spec.num_joints, &loaded.mean, &loaded.std)?;
-        let gpu = Gpu::new()?;
+        let gpu = Gpu::with_precision(prec)?;
         let k = Kernels::new(&gpu)?;
         let l = Loader { gpu: &gpu, t: &loaded.tensors };
         let j = spec.num_joints as usize;
@@ -279,9 +298,14 @@ impl MetalModel {
         let (w0, b0, n0, k0) = fc("pose.proj_pose_token_emb.fc_layers.0")?;
         let (w1, b1, n1, k1) = fc("pose.proj_pose_token_emb.fc_layers.1")?;
         let (w2, b2, n2, k2) = fc("pose.proj_pose_token_emb.forward_projection")?;
-        let h0 = leaky(cpu_linear(&tok, &w0, &b0, n0, k0));
-        let h1 = leaky(cpu_linear(&h0, &w1, &b1, n1, k1));
-        let token_const = cpu_linear(&h1, &w2, &b2, n2, k2); // 640 = 4 frames x 160
+        // Mirror the network's precision: weights and every intermediate rounded to T.
+        let rt = |v: Vec<f32>| prec.decode(&prec.encode(&v));
+        let leaky_t = |v: Vec<f32>| v.into_iter().map(|x| prec.decode(&prec.encode(&[x * 0.01]))[0].max(x)).collect::<Vec<f32>>();
+        let (w0, b0, w1, b1, w2, b2) = (rt(w0), rt(b0), rt(w1), rt(b1), rt(w2), rt(b2));
+        let h0 = leaky_t(rt(cpu_linear(&rt(tok), &w0, &b0, n0, k0)));
+        let h1 = leaky_t(rt(cpu_linear(&h0, &w1, &b1, n1, k1)));
+        let token_const = rt(cpu_linear(&h1, &w2, &b2, n2, k2)); // 640 = 4 frames x 160
+        let _ = leaky;
 
         // Rig.
         let (rig_f, rig_i, soma_capture, soma_standard) = match spec.kind {
@@ -322,7 +346,7 @@ impl MetalModel {
 
         let pos_table = |name: &str, n: usize| -> Result<Buf> {
             let v = l.vec(name)?; // (seq, 1, dim)
-            Ok(gpu.upload(&v[..n * (v.len() / l.shape(name)[0])]))
+            Ok(gpu.upload_t(&v[..n * (v.len() / l.shape(name)[0])]))
         };
         let sp = spec.root;
         let pp = spec.pose;
@@ -341,8 +365,8 @@ impl MetalModel {
             root_pos: pos_table("root.position_emb.embed", 16)?,
             logit_head: l.lin("root.proj_num_token_output_logit")?,
             middle_emb: l.buf("root.middle_token_emb.weight")?,
-            shared: Transformer::load(&gpu, &loaded.tensors, "root.shared_transformer_model", sp.n_layers_shared, sp.n_head as usize)?,
-            root_token: Transformer::load(&gpu, &loaded.tensors, "root.root_token_transformer_model", sp.n_layers_root_token, sp.n_head as usize)?,
+            shared: Transformer::load(&gpu, &loaded.tensors, "root.shared_transformer_model", sp.n_layers_shared, sp.n_head as usize, int8)?,
+            root_token: Transformer::load(&gpu, &loaded.tensors, "root.root_token_transformer_model", sp.n_layers_root_token, sp.n_head as usize, int8)?,
             root_dec: l.decoder("root.conv_output")?,
             p_root: l.lin("pose.proj_local_root_values")?,
             p_local_pose: l.lin("pose.proj_local_pose")?,
@@ -350,9 +374,9 @@ impl MetalModel {
             len_emb_host: l.vec("pose.proj_num_valid_positions.weight")?,
             p_input: l.lin("pose.proj_input.0")?,
             pose_pos: pos_table("pose.position_emb.embed", 16)?,
-            pose_tf: Transformer::load(&gpu, &loaded.tensors, "pose.transformer_model", pp.n_layers, pp.n_head as usize)?,
+            pose_tf: Transformer::load(&gpu, &loaded.tensors, "pose.transformer_model", pp.n_layers, pp.n_head as usize, int8)?,
             p_logits: l.lin("pose.proj_pose_output_logit")?,
-            token_const: gpu.upload(&token_const),
+            token_const: gpu.upload_t(&token_const),
             codebook: l.buf("vqvae.quantizer.vq.codebook.embed")?,
             codebook_host: l.vec("vqvae.quantizer.vq.codebook.embed")?,
             vq_dec: l.decoder("vqvae.decoder")?,
@@ -373,6 +397,8 @@ impl MetalModel {
             k,
             spec,
             max_batch,
+            prec,
+            int8,
             pd,
             ld,
             gd,
@@ -383,7 +409,8 @@ impl MetalModel {
 
     #[allow(clippy::too_many_arguments)]
     fn alloc(gpu: &Gpu, b: usize, pd: usize, ld: usize, gd: usize, heads: usize, codes: usize, cw: usize) -> Bufs {
-        let f = |n: usize| gpu.buffer(n);
+        let f = |n: usize| gpu.buffer(n); // float32 (inputs, masks, rig, outputs)
+        let t = |n: usize| gpu.buffer_t(n); // network element type
         Bufs {
             ctx: f(b * 4 * 36),
             tgt: f(b * 4 * 36),
@@ -398,16 +425,19 @@ impl MetalModel {
             gn: f(b * 8 * 5),
             ln: f(b * 8 * 4),
             pn: f(b * 8 * pd),
+            gn_t: t(b * 8 * 5),
+            ln_t: t(b * 8 * 4),
+            pn_t: t(b * 8 * pd),
             info: f(b * 4),
-            x0: f(b * 8 * 384),
-            fa: f(b * 8 * 512),
-            fb: f(b * 8 * 512),
-            s: f(b * 8 * 512),
-            e: f(b * 8 * 512),
-            fe: f(b * 8 * 512),
-            x1: f(b * 9 * 512),
-            log1: f(b * 9 * 12),
-            x2: f(b * 25 * 512),
+            x0: t(b * 8 * 384),
+            fa: t(b * 8 * 512),
+            fb: t(b * 8 * 512),
+            s: t(b * 8 * 512),
+            e: t(b * 8 * 512),
+            fe: t(b * 8 * 512),
+            x1: t(b * 9 * 512),
+            log1: t(b * 9 * 12),
+            x2: t(b * 25 * 512),
             pad2: f(b * 25),
             nt: f(b),
             m16: f(b * 16),
@@ -415,26 +445,26 @@ impl MetalModel {
             m64: f(b * 64),
             ppad: f(b * 16),
             logits: f(b * 12),
-            dec_in: f(b * 16 * 512),
-            dframe: f(b * 64 * 512),
-            droot: f(b * 64 * 5),
+            dec_in: t(b * 16 * 512),
+            dframe: t(b * 64 * 512),
+            droot: t(b * 64 * 5),
             dhas: f(b * 64),
-            pr: f(b * 64 * 5),
-            h: f(b * 64 * 512),
-            h2: f(b * 64 * 512),
-            t1: f(b * 64 * 512),
-            ext: f(b * 64 * 2),
-            rcond: f(b * 64 * 4),
-            pcond: f(b * 64 * pd),
+            pr: t(b * 64 * 5),
+            h: t(b * 64 * 512),
+            h2: t(b * 64 * 512),
+            t1: t(b * 64 * 512),
+            ext: t(b * 64 * 2),
+            rcond: t(b * 64 * 4),
+            pcond: t(b * 64 * pd),
             hpc: f(b * 64),
-            le: f(b * 16 * 128),
-            re: f(b * 16 * 256),
-            pe: f(b * 64 * 160),
-            px: f(b * 16 * 1024),
-            plog: f(b * 16 * heads * codes),
+            le: t(b * 16 * 128),
+            re: t(b * 16 * 256),
+            pe: t(b * 64 * 160),
+            px: t(b * 16 * 1024),
+            plog: t(b * 16 * heads * codes),
             tokens: f(b * 16 * heads),
-            lat: f(b * 16 * heads * cw),
-            recon: f(b * 64 * ld),
+            lat: t(b * 16 * heads * cw),
+            recon: t(b * 64 * ld),
             out: f(b * 64 * gd),
             qpos: f(b * 64 * 36),
             contacts: f(b * 64 * 4),
@@ -479,7 +509,11 @@ impl MetalModel {
                 self.launch(rec, "soma_retarget", &args, n * 8 * j as usize);
             }
         }
-        let args = [Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0), Arg::Buf(&b.ln, 0), Arg::Buf(&b.pn, 0), Arg::Buf(&b.info, 0), Arg::Bytes(as_bytes(d))];
+        let args = [
+            Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0),
+            Arg::Buf(&b.ln, 0), Arg::Buf(&b.pn, 0), Arg::Buf(&b.info, 0), Arg::Bytes(as_bytes(d)), Arg::Buf(&b.gn_t, 0),
+            Arg::Buf(&b.ln_t, 0), Arg::Buf(&b.pn_t, 0),
+        ];
         self.launch(rec, "prep", &args, n * 8);
     }
 
@@ -598,9 +632,9 @@ impl MetalModel {
     pub fn encode_root_a(&self, rec: &mut Recorder, d: &Dims) {
         let (b, n) = (&self.b, d.b as usize);
         let rows = n * 8;
-        self.blend_linear(rec, &self.proj_local_pose, &b.pn, rows, &b.x0, 0, 384, &b.hp, &self.no_local_pose, 1);
-        self.blend_linear(rec, &self.proj_local_root, &b.ln, rows, &b.x0, 256, 384, &b.hl, &self.no_local_root, 1);
-        self.blend_linear(rec, &self.proj_global_root, &b.gn, rows, &b.x0, 320, 384, &b.hg, &self.no_global_root, 1);
+        self.blend_linear(rec, &self.proj_local_pose, &b.pn_t, rows, &b.x0, 0, 384, &b.hp, &self.no_local_pose, 1);
+        self.blend_linear(rec, &self.proj_local_root, &b.ln_t, rows, &b.x0, 256, 384, &b.hl, &self.no_local_root, 1);
+        self.blend_linear(rec, &self.proj_global_root, &b.gn_t, rows, &b.x0, 320, 384, &b.hg, &self.no_global_root, 1);
         self.fcblock(rec, &self.fc_start, &b.x0, rows, &b.s);
         self.fcblock(rec, &self.fc_end, &b.x0, rows, &b.e);
         let args = [Arg::Buf(&b.s, 0), Arg::Buf(&b.e, 0), Arg::Buf(&self.input_pos, 0), Arg::Buf(&self.query_emb, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.x1, 0), Arg::Buf(&b.fe, 0), Arg::Bytes(as_bytes(d))];
@@ -768,11 +802,17 @@ impl MetalModel {
         }
     }
 
-    /// ONNX-Runtime-style call: upload, one command buffer, wait, read back.
+    /// A recorder for one generation. It commits early (after a few dispatches, then in chunks)
+    /// so the GPU runs the first stages while the CPU encodes the rest.
+    pub fn recorder(&self) -> Recorder {
+        Recorder::new(&self.gpu).with_flushes(&FLUSH_AT)
+    }
+
+    /// ONNX-Runtime-style call: upload, record (committing in chunks), wait, read back.
     pub fn run(&self, inputs: &HashMap<String, Npy>) -> Result<(Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
         let n = self.upload_inputs(inputs)?;
         let d = self.dims(n, false);
-        let mut rec = Recorder::new(&self.gpu);
+        let mut rec = self.recorder();
         self.encode(&mut rec, &d);
         wait(&rec.commit());
         Ok(self.outputs(n))

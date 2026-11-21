@@ -40,14 +40,16 @@ def fmt_ratio(values):
 
 def main():
     runs, loads = load()
-    dtypes = sorted({k[0] for k in runs}, key=lambda d: d != "float32")
+    order = ["float32", "bfloat16", "float16", "int8"]
+    dtypes = sorted({k[0] for k in runs}, key=lambda d: order.index(d) if d in order else len(order))
     models = ["soma", "unitree_g1"]
     print(f"Rounds: {len({k[1] for k in runs})} per dtype; 1-min load average during runs: "
           f"median {statistics.median(loads):.1f}, range {min(loads):.1f}–{max(loads):.1f}.\n")
     for dtype in dtypes:
         for model in models:
             rounds = [v for k, v in runs.items() if k[0] == dtype and k[2] == model and len(v) == 2]
-            if not rounds:
+            # mlx-rs rows only (the Metal runtime is in report_metal.py; mlx-rs has no INT8 mode)
+            if not rounds or not any(k.endswith("/compiled") for r in rounds for k in r["rust"]):
                 continue
             print(f"#### {model}, {dtype}: median ms per batched call (Rust ÷ Python, median and range over {len(rounds)} rounds)\n")
             print("| N | mode | Python core | Rust core | core ratio | Python graph build | Rust graph build | "

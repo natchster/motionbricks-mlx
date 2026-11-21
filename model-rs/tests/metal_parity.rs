@@ -21,7 +21,7 @@ fn root() -> PathBuf {
 }
 
 fn put(dst: &Buf, v: &[f32]) {
-    dst.as_mut_slice()[..v.len()].copy_from_slice(v);
+    dst.write_f32(v); // converts to the buffer's element type
 }
 
 fn put_i(dst: &Buf, v: &[i32]) {
@@ -72,6 +72,9 @@ fn run(name: &str) {
         put(&b.gn, &f("root_in.global_root"));
         put(&b.ln, &f("root_in.local_root"));
         put(&b.pn, &f("root_in.poses"));
+        put(&b.gn_t, &f("root_in.global_root"));
+        put(&b.ln_t, &f("root_in.local_root"));
+        put(&b.pn_t, &f("root_in.poses"));
         put(&b.hg, &mask(&g["root_in.has_global"]));
         put(&b.hl, &mask(&g["root_in.has_local"]));
         put(&b.hp, &mask(&g["root_in.has_poses"]));
@@ -87,7 +90,7 @@ fn run(name: &str) {
         let e = rel(got, &want, |k| want[k].is_finite());
         assert!(e < 1e-4, "{case}: root logits rel {e}");
         assert_eq!(m.num_tokens(n), g["root_out.pred_num_tokens"].to_i32(), "{case}: durations");
-        let e2 = rel(&b.pr.as_slice()[..n * 64 * 5], &f("root_out.pred_global_root_values"), |_| true);
+        let e2 = rel(&b.pr.to_f32(n * 64 * 5), &f("root_out.pred_global_root_values"), |_| true);
         assert!(e2 < 1e-4, "{case}: root path rel {e2}");
 
         // Pose network, teacher-forced (release config: every input token is the mask token).
@@ -106,7 +109,7 @@ fn run(name: &str) {
         m.encode_pose(&mut rec, &m.dims(n, false));
         wait(&rec.commit());
         let want = f("pose_out.pose_logits");
-        let got = &b.plog.as_slice()[..want.len()];
+        let got = &b.plog.to_f32(want.len());
         let e3 = rel(got, &want, |_| true);
         assert!(e3 < 1e-4, "{case}: pose logits rel {e3}");
         let codes = m.spec.vq.codes_per_head as usize;
@@ -131,7 +134,7 @@ fn run(name: &str) {
         m.encode_vq(&mut rec, &m.dims(n, false));
         wait(&rec.commit());
         let want = f("vq_out.recon_state");
-        let e4 = rel(&b.recon.as_slice()[..want.len()], &want, |_| true);
+        let e4 = rel(&b.recon.to_f32(want.len()), &want, |_| true);
         assert!(e4 < 1e-4, "{case}: vq decoder rel {e4}");
 
         // End to end.
@@ -168,4 +171,57 @@ fn metal_soma_matches_pytorch() {
 #[test]
 fn metal_unitree_g1_matches_pytorch() {
     run("unitree_g1");
+}
+
+/// FP16 / BF16 / INT8 track FP32 with the Python port's criteria (test_model.py): >= 75% of
+/// durations agree with the FP32 model, outputs finite, and median |diff| < 0.05 over the rows
+/// whose duration agrees. (Checked by hand against the Python port at the same precision: the
+/// same durations and the same error magnitudes, e.g. SOMA BF16 4.4e-2 vs Python 4.5e-2.)
+fn low_precision(name: &str) {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let folder = if name == "soma" { "soma" } else { "g1" };
+    let dir = root().join("checkpoints/MotionBricks").join(folder);
+    if !dir.is_dir() {
+        return;
+    }
+    let fp32 = MetalModel::from_checkpoints(name, &dir, 8).expect("model loads");
+    let requests: Vec<HashMap<String, Npy>> = CASES
+        .iter()
+        .map(|case| {
+            let g = load_npz(root().join("sandbox/golden").join(name).join(format!("{case}.npz"))).unwrap();
+            g.into_iter().filter_map(|(k, v)| k.strip_prefix("in.").map(|s| (s.to_string(), v))).collect()
+        })
+        .collect();
+    let reference: Vec<_> = requests.iter().map(|r| fp32.run(r).unwrap()).collect();
+    for precision in ["float16", "bfloat16", "int8"] {
+        let m = MetalModel::from_checkpoints_with(name, &dir, 8, precision).expect("model loads");
+        let (mut agree, mut total, mut diffs) = (0usize, 0usize, Vec::new());
+        for (inputs, (want, want_t, _)) in requests.iter().zip(&reference) {
+            let (out, durations, _) = m.run(inputs).unwrap();
+            assert!(out.iter().all(|v| v.is_finite()), "{name} {precision}: non-finite output");
+            let per = out.len() / durations.len();
+            for (i, (&a, &b)) in durations.iter().zip(want_t).enumerate() {
+                total += 1;
+                if a == b {
+                    agree += 1;
+                    diffs.extend((0..per).map(|k| (out[i * per + k] - want[i * per + k]).abs()));
+                }
+            }
+        }
+        diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = diffs[diffs.len() / 2];
+        println!("{name} {precision}: durations agree {agree}/{total}, median |diff vs FP32| {median:.2e}");
+        assert!(agree * 4 >= total * 3, "{name} {precision}: only {agree}/{total} durations match FP32");
+        assert!(median < 0.05, "{name} {precision}: median diff {median}");
+    }
+}
+
+#[test]
+fn metal_soma_low_precision_tracks_fp32() {
+    low_precision("soma");
+}
+
+#[test]
+fn metal_unitree_g1_low_precision_tracks_fp32() {
+    low_precision("unitree_g1");
 }

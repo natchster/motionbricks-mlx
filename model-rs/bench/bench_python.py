@@ -46,7 +46,9 @@ def main():
     a = p.parse_args()
 
     start = time.perf_counter()
-    model = mb.load(a.model, CKPT[a.model], dtype=a.dtype)
+    model = mb.load(a.model, CKPT[a.model], dtype="float32" if a.dtype == "int8" else a.dtype)
+    if a.dtype == "int8":
+        model.quantize(bits=8)  # FP32 activations, INT8 transformer projections
     if a.contiguous_weights:
         from mlx.utils import tree_flatten, tree_unflatten
         convs = [(k, mx.contiguous(v)) for k, v in tree_flatten(model.core.parameters())

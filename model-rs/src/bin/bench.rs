@@ -21,7 +21,7 @@ use anyhow::Result;
 use mlx_rs::Array;
 use mlx_rs::transforms::{async_eval, eval};
 use motionbricks_rs::metal::model::MetalModel;
-use motionbricks_rs::metal::{Recorder, wait};
+use motionbricks_rs::metal::wait;
 use motionbricks_rs::npy::load_npz;
 use motionbricks_rs::ops::{to_vec_f32, to_vec_i32};
 use motionbricks_rs::{MotionBricks, compiled, parse_dtype};
@@ -112,15 +112,18 @@ fn main() -> Result<()> {
     let folder = if args.model == "soma" { "soma" } else { "g1" };
     let ckpt = args.checkpoints.clone().unwrap_or_else(|| here.join("../checkpoints/MotionBricks").join(folder));
     let load_start = Instant::now();
-    let model = Rc::new(MotionBricks::from_checkpoints_with(&args.model, &ckpt, parse_dtype(&args.dtype)?, args.contiguous)?);
+    // The mlx-rs port has no INT8 mode; its rows are skipped for --dtype int8.
+    let mlx_dtype = if args.dtype == "int8" { "float32" } else { args.dtype.as_str() };
+    let model = Rc::new(MotionBricks::from_checkpoints_with(&args.model, &ckpt, parse_dtype(mlx_dtype)?, args.contiguous)?);
+    let run_mlx = args.dtype != "int8";
     let load_s = load_start.elapsed().as_secs_f64();
     let mut forward = compiled(model.clone());
-    let metal = if args.dtype == "float32" { Some(MetalModel::from_checkpoints(&args.model, &ckpt, 64)?) } else { None };
+    let metal = Some(MetalModel::from_checkpoints_with(&args.model, &ckpt, 64, &args.dtype)?);
 
     let mut report = BTreeMap::new();
     for &batch in &args.batches {
         let request = load_npz(here.join("bench/requests").join(format!("{}_N{batch}.npz", args.model)))?;
-        for mode in ["compiled", "eager"] {
+        for mode in ["compiled", "eager"].into_iter().filter(|_| run_mlx) {
             let keys = ["prepare", "graph", "eval_wall", "eval_cpu", "to_host", "total", "core"];
             let mut samples: BTreeMap<&str, Vec<f64>> = keys.iter().map(|k| (*k, Vec::new())).collect();
             let mut first_ms = 0.0;
@@ -172,7 +175,7 @@ fn main() -> Result<()> {
                 let n = mm.upload_inputs(&request)?;
                 let t1 = Instant::now();
                 let d = mm.dims(n, false);
-                let mut rec = Recorder::new(&mm.gpu);
+                let mut rec = mm.recorder();
                 mm.encode(&mut rec, &d);
                 let cb = rec.commit();
                 let t2 = Instant::now();
@@ -212,7 +215,7 @@ fn main() -> Result<()> {
     }
 
     // A stream of single requests: back to back, or pipelined (encode i+1 while the GPU runs i).
-    if args.stream > 0 {
+    if args.stream > 0 && run_mlx {
         let request = load_npz(here.join("bench/requests").join(format!("{}_N1.npz", args.model)))?;
         let inputs = model.prepare(&request)?;
         for _ in 0..args.warmup {
