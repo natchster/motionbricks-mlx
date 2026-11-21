@@ -25,7 +25,7 @@ scripts/download_weights.sh                # checkpoints into ../checkpoints/Mot
 cargo build --release                      # first build compiles MLX (~6 min); needs Xcode + its Metal toolchain
 cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16
 cargo run --release --example generate       -- soma ../checkpoints/MotionBricks/soma 8 int8
-cargo test --release -- --test-threads=1   # 126 tests; the parity tests also need the sandbox's fixtures
+cargo test --release -- --test-threads=1   # 128 tests; the parity tests also need the sandbox's fixtures
 ```
 
 - **Weights:** `download_weights.sh [all|soma|unitree_g1] [dir]` reads the same checksum table as
@@ -192,7 +192,10 @@ batch sizes too.
   `gemm-tune` measures them by replaying each launch with its real shape and loader flags. On
   other GPUs, or for other batch sizes, a rule fitted on the same data picks the plan:
   - 32×64 tiles for FP32, 16×32 for FP16/BF16 and 64-row tiles for INT8 weights;
-  - then K splits until the grid fills the GPU.
+  - then K splits until the grid fills the GPU, counted in threadgroups per GPU core. The core
+    count comes from the IORegistry (`MB_GPU_CORES` overrides it). That scaling is untested on
+    Macs other than the M4 Pro; see the
+    [user guide](../docs/user_guide.md#other-apple-silicon-macs-not-tested).
 
   `MB_PLAN_TABLE=0` disables the table, and `MB_PLAN_TABLE=<file>` loads a table tuned on
   another Mac. Every line is checked (malformed ones fail with their line number); a launch

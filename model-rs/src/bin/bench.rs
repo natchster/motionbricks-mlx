@@ -120,6 +120,10 @@ fn main() -> Result<()> {
         "mlx" => None,
         _ => Some(MetalModel::from_checkpoints_with(&args.model, &ckpt, 64, args.dtype.as_str())?),
     };
+    if let Some(mm) = &metal {
+        // stderr, so the stdout rows (parsed by bench/run_all.sh) stay as they are.
+        eprintln!("GPU: {}; GEMM plans: {}", mm.gpu.info.summary(), mm.k.plan_source);
+    }
 
     let mut report = BTreeMap::new();
     for &batch in &args.batches {

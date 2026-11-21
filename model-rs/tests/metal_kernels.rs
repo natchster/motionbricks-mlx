@@ -430,3 +430,80 @@ fn buffers_check_element_type_and_bounds() {
     assert!(refused(&|| drop(f.to_f32(5))), "read past the end");
     assert!(refused(&|| f.fill_f32(0, 3, [1.0].into_iter())), "short iterator");
 }
+
+/// The fallback rule with explicit threadgroup targets and split cap. On the 20-core M4 Pro it was
+/// fitted with 160/120 (INT8 weights 320/240) and at most 8 splits.
+fn heuristic_reference(prec: Precision, (m, n, k): (usize, usize, usize), q8: bool, targets: (usize, usize, usize, usize), cap: usize) -> Plan {
+    let (prefs, g_tile, g_split, waste): (&[_], usize, usize, f64) = if q8 {
+        (&[TILES[6], TILES[0], TILES[3]], targets.2, targets.3, 0.4)
+    } else if prec == Precision::F32 {
+        (&[TILES[4], TILES[0], TILES[3]], targets.0, targets.1, 0.4)
+    } else {
+        (&[TILES[0], TILES[1]], targets.0, targets.1, 0.15)
+    };
+    let groups = |t: &motionbricks_rs::metal::transformer::Tile| m.div_ceil(t.bm) * n.div_ceil(t.bn);
+    let fits: Vec<_> = prefs.iter().copied().filter(|t| (m.div_ceil(t.bm) * t.bm) as f64 <= m as f64 * (1.0 + waste)).collect();
+    let fits = if fits.is_empty() { vec![*prefs.last().unwrap()] } else { fits };
+    let tile = fits.iter().copied().find(|t| groups(t) >= g_tile).unwrap_or(*fits.last().unwrap());
+    let mut splits = 1;
+    while groups(&tile) * splits < g_split && k / (splits * 2) >= 64 && splits < cap {
+        splits *= 2;
+    }
+    Plan { tile, splits }
+}
+
+#[test]
+fn fallback_plans_scale_with_the_gpu_core_count() {
+    let _gpu = gpu_lock();
+    let shapes: Vec<(usize, usize, usize)> = [1usize, 8, 24, 64, 200, 512, 2048]
+        .iter()
+        .flat_map(|&m| [64usize, 256, 512, 1024, 2048].into_iter().flat_map(move |n| [64usize, 268, 512, 2048, 4096].into_iter().map(move |k| (m, n, k))))
+        .collect();
+    for prec in [Precision::F32, Precision::F16, Precision::BF16] {
+        let mut k = Kernels::new(&Gpu::with_precision(prec).unwrap()).unwrap();
+        for q8 in [false, true].into_iter().filter(|&q| !q || prec == Precision::F32) {
+            for &s in &shapes {
+                // 20 cores: exactly the fitted rule with its absolute targets.
+                k.cores = 20;
+                assert_eq!(k.heuristic(s.0, s.1, s.2, q8), heuristic_reference(prec, s, q8, (160, 120, 320, 240), 8), "{prec:?} q8={q8} {s:?}");
+                // Other core counts: 8 / 6 threadgroups per core (16 / 12 for INT8 weights).
+                for cores in [8, 10, 16, 40, 60, 80] {
+                    k.cores = cores;
+                    let targets = (8 * cores, 6 * cores, 16 * cores, 12 * cores);
+                    let want = heuristic_reference(prec, s, q8, targets, Kernels::heuristic_split_cap(cores));
+                    assert_eq!(k.heuristic(s.0, s.1, s.2, q8), want, "{prec:?} q8={q8} {s:?} at {cores} cores");
+                }
+            }
+        }
+        // A batch-1 projection fills a large GPU with more K splits.
+        let (s20, s80) = {
+            k.cores = 20;
+            let a = k.heuristic(8, 512, 2048, false).splits;
+            k.cores = 80;
+            (a, k.heuristic(8, 512, 2048, false).splits)
+        };
+        assert!(s80 > s20, "{prec:?}: 80 cores use {s80} splits, 20 cores {s20}");
+    }
+    for (cores, cap) in [(8, 8), (10, 8), (16, 8), (20, 8), (30, 16), (40, 16), (60, 32), (80, 32)] {
+        assert_eq!(Kernels::heuristic_split_cap(cores), cap, "{cores} cores");
+    }
+}
+
+#[test]
+fn gpu_info_describes_this_gpu() {
+    let _gpu = gpu_lock();
+    let gpu = Gpu::new().unwrap();
+    let info = &gpu.info;
+    assert!(info.apple_family >= 7, "{info:?}");
+    assert!(info.architecture.starts_with("applegpu_"), "{info:?}");
+    assert!(info.max_threadgroup_memory >= motionbricks_rs::metal::THREADGROUP_MEMORY, "{info:?}");
+    assert!((1..=1024).contains(&info.cores), "{info:?}");
+    if std::env::var_os("MB_GPU_CORES").is_none() {
+        // Apple silicon publishes the core count in the IORegistry (`gpu-core-count`).
+        assert_eq!(info.cores_source, "IORegistry", "{info:?}");
+    }
+    let k = Kernels::new(&gpu).unwrap();
+    assert_eq!(k.cores, info.cores);
+    assert!(k.max_splits() >= Kernels::heuristic_split_cap(info.cores));
+    assert!(!k.plan_source.is_empty());
+}

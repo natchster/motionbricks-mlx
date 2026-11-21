@@ -27,6 +27,10 @@ use crate::representation::MotionRepresentation;
 use crate::weights::read_checkpoints;
 
 /// Dispatch counts after which a generation's recording is committed (see `MetalModel::recorder`).
+/// They don't depend on the GPU: encoding a dispatch takes well under a microsecond of CPU time,
+/// while every dispatch of the model runs for microseconds on the GPU even on the largest Apple
+/// GPUs (small launches are bound by latency and memory, not by core count). So after the first
+/// small chunk, the GPU never waits for the CPU, whatever its core count.
 pub const FLUSH_AT: [usize; 3] = [8, 40, 120];
 /// Largest `max_batch` (the kernels index buffers with 32-bit integers).
 pub const MAX_BATCH: usize = 16384;

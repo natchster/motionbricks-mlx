@@ -156,9 +156,10 @@ class MotionBricks(nn.Module):
 
     def quantize(self, bits: int = 8, group_size: int = 64) -> MotionBricks:
         """Experimental: affine-quantize the transformer projections (q/k/v/out + FFN) of the
-        root and pose networks. 8-bit cuts the transformer weights about 4x. Batch 1 is bound
-        by streaming those weights, so it is also the fastest option there; at larger batches
-        MLX's quantized GEMM is slower than FP32 (see model/benchmarks). Durations matched
+        root and pose networks. 8-bit cuts the transformer weights about 4x. On the M4 Pro it was
+        measured on, batch 1 is bound by streaming those weights, so it is also the fastest option
+        there, and at larger batches MLX's quantized GEMM is slower than FP32 (see model/benchmarks);
+        other Macs may differ. Durations matched
         FP32 on all test requests at 8 bits; check agreement for your own inputs.
 
         A model is quantized once; load it again for other settings."""

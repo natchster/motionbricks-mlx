@@ -219,12 +219,133 @@ impl Buf {
     }
 }
 
+/// GPU cores of the Mac the launch-size rules were fitted on (an Apple M4 Pro with a 20-core GPU).
+/// Without a core count, the runtime assumes this one.
+pub const REFERENCE_GPU_CORES: usize = 20;
+/// SIMD-group width every kernel's launch geometry assumes (all Apple GPUs).
+pub const SIMD_WIDTH: usize = 32;
+/// Threadgroup memory the kernels may use (every Apple GPU family provides 32 KB).
+pub const THREADGROUP_MEMORY: usize = 32 << 10;
+/// Largest threadgroup the model's dispatches use (GEMM tiles of 8 SIMD groups, the 256-thread
+/// glue, reduce and layer-norm kernels). Every pipeline must allow it.
+pub const MAX_THREADGROUP_THREADS: usize = 256;
+
+/// What the runtime knows about its GPU. Metal exposes neither the core count nor the memory
+/// bandwidth, so the core count comes from the IORegistry (`AGXAccelerator`'s `gpu-core-count`,
+/// the value System Information shows), unless `MB_GPU_CORES` overrides it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuInfo {
+    /// Marketing name, e.g. "Apple M4 Pro".
+    pub name: String,
+    /// Metal architecture name, e.g. "applegpu_g16s" (GPU generation and tier).
+    pub architecture: String,
+    /// Highest supported `MTLGPUFamily::AppleN` (8 = M2, 9 = M3/M4, 10 = M5, 11 = M6), or 0 if below Apple7.
+    pub apple_family: u32,
+    /// GPU cores used to size launches.
+    pub cores: usize,
+    /// Where `cores` came from: "MB_GPU_CORES", "IORegistry" or "default" ([`REFERENCE_GPU_CORES`]).
+    pub cores_source: &'static str,
+    /// `maxThreadgroupMemoryLength` in bytes.
+    pub max_threadgroup_memory: usize,
+}
+
+impl GpuInfo {
+    /// One line for logs, e.g. "Apple M4 Pro (applegpu_g16s, Apple9 family, 20 GPU cores from IORegistry)".
+    pub fn summary(&self) -> String {
+        format!("{} ({}, Apple{} family, {} GPU cores from {})", self.name, self.architecture, self.apple_family, self.cores, self.cores_source)
+    }
+
+    fn query(device: &Device) -> Result<Self> {
+        // Raw values (AppleN = 1000 + N) also probe families newer than this SDK's constants.
+        let apple_family = (7..=16)
+            .rev()
+            .find(|&n| device.supportsFamily(objc2_metal::MTLGPUFamily(1000 + n as isize)))
+            .unwrap_or(0);
+        let (cores, cores_source) = match std::env::var("MB_GPU_CORES") {
+            Ok(v) if !v.trim().is_empty() => {
+                let n: usize = v.trim().parse().map_err(|_| anyhow!("MB_GPU_CORES must be a positive integer, got {v:?}"))?;
+                anyhow::ensure!(n > 0, "MB_GPU_CORES must be a positive integer, got {v:?}");
+                (n, "MB_GPU_CORES")
+            }
+            _ => match iokit::gpu_core_count() {
+                Some(n) => (n, "IORegistry"),
+                None => (REFERENCE_GPU_CORES, "default"),
+            },
+        };
+        Ok(GpuInfo {
+            name: device.name().to_string(),
+            architecture: device.architecture().name().to_string(),
+            apple_family,
+            cores,
+            cores_source,
+            max_threadgroup_memory: device.maxThreadgroupMemoryLength(),
+        })
+    }
+}
+
+/// The GPU core count from the IORegistry (`AGXAccelerator` service, `gpu-core-count` property).
+mod iokit {
+    use std::ffi::{c_char, c_void};
+
+    type CFTypeRef = *const c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
+        fn IORegistryEntryCreateCFProperty(entry: u32, key: CFTypeRef, allocator: CFTypeRef, options: u32) -> CFTypeRef;
+        fn IOObjectRelease(object: u32) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(allocator: CFTypeRef, string: *const c_char, encoding: u32) -> CFTypeRef;
+        fn CFGetTypeID(cf: CFTypeRef) -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFNumberGetValue(number: CFTypeRef, number_type: isize, value: *mut c_void) -> bool;
+        fn CFRelease(cf: CFTypeRef);
+    }
+
+    const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
+    const SINT64: isize = 4; // kCFNumberSInt64Type
+
+    pub fn gpu_core_count() -> Option<usize> {
+        // SAFETY: plain IOKit/CoreFoundation calls; every object created here is released here.
+        // IOServiceGetMatchingService consumes the matching dictionary. Main port 0 is the default.
+        unsafe {
+            let matching = IOServiceMatching(c"AGXAccelerator".as_ptr());
+            if matching.is_null() {
+                return None;
+            }
+            let service = IOServiceGetMatchingService(0, matching);
+            if service == 0 {
+                return None;
+            }
+            let key = CFStringCreateWithCString(std::ptr::null(), c"gpu-core-count".as_ptr(), UTF8);
+            let value = if key.is_null() { std::ptr::null() } else { IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0) };
+            if !key.is_null() {
+                CFRelease(key);
+            }
+            IOObjectRelease(service);
+            if value.is_null() {
+                return None;
+            }
+            let mut n: i64 = 0;
+            let ok = CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, SINT64, (&mut n as *mut i64).cast());
+            CFRelease(value);
+            (ok && n > 0).then_some(n as usize)
+        }
+    }
+}
+
 /// Device, queue, kernel libraries and a pipeline cache. Cheap to clone (shared handles).
 #[derive(Clone)]
 pub struct Gpu {
     pub device: Retained<Device>,
     pub queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pub prec: Precision,
+    /// The device's name, architecture, family and core count (queried once).
+    pub info: Rc<GpuInfo>,
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
     pipelines: Rc<RefCell<HashMap<String, Pipeline>>>,
 }
@@ -236,17 +357,25 @@ impl Gpu {
 
     pub fn with_precision(prec: Precision) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice().context("no Metal device")?;
+        let info = GpuInfo::query(&device)?;
+        // simdgroup_matrix needs Apple7 (M1) or later; the kernels also assume 32 KB of threadgroup memory.
+        if info.apple_family < 7 {
+            bail!("{}: the Metal runtime needs an Apple7-family GPU (M1) or later", info.name);
+        }
+        if info.max_threadgroup_memory < THREADGROUP_MEMORY {
+            bail!("{}: {} bytes of threadgroup memory, the kernels need {THREADGROUP_MEMORY}", info.name, info.max_threadgroup_memory);
+        }
         let queue = device.newCommandQueue().context("no command queue")?;
         let source = format!("#include <metal_stdlib>\ntypedef {} T;\n{KERNELS}", prec.metal());
         let library = device
             .newLibraryWithSource_options_error(&NSString::from_str(&source), None)
             .map_err(|e| anyhow!("Metal compile error: {}", e.localizedDescription()))?;
-        Ok(Gpu { device, queue, prec, library, pipelines: Rc::new(RefCell::new(HashMap::new())) })
+        Ok(Gpu { device, queue, prec, info: Rc::new(info), library, pipelines: Rc::new(RefCell::new(HashMap::new())) })
     }
 
     /// The Metal device name, e.g. "Apple M4 Pro".
     pub fn device_name(&self) -> String {
-        self.device.name().to_string()
+        self.info.name.clone()
     }
 
     /// One of our kernels specialized with boolean function constants (index, value).
@@ -268,6 +397,12 @@ impl Gpu {
             .device
             .newComputePipelineStateWithFunction_error(&f)
             .map_err(|e| anyhow!("pipeline {name}: {}", e.localizedDescription()))?;
+        if p.threadExecutionWidth() != SIMD_WIDTH {
+            bail!("pipeline {name}: SIMD-group width {}, the kernels assume {SIMD_WIDTH}", p.threadExecutionWidth());
+        }
+        if p.maxTotalThreadsPerThreadgroup() < MAX_THREADGROUP_THREADS {
+            bail!("pipeline {name}: at most {} threads per threadgroup, the dispatches use up to {MAX_THREADGROUP_THREADS}", p.maxTotalThreadsPerThreadgroup());
+        }
         self.pipelines.borrow_mut().insert(key, p.clone());
         Ok(p)
     }

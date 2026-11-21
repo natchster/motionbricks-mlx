@@ -218,7 +218,7 @@ cd model-rs
 cargo build --release      # first build compiles MLX from source (~6 min); needs Xcode + Metal toolchain
 cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16   # batch 8, synthetic request
 cargo run --release --example generate -- soma ../checkpoints/MotionBricks/soma 8 int8                 # the mlx-rs port
-cargo test --release -- --test-threads=1  # 126 tests; parity tests print SKIPPED without the sandbox's fixtures
+cargo test --release -- --test-threads=1  # 128 tests; parity tests print SKIPPED without the sandbox's fixtures
 ```
 
 The examples take either of two inputs:
@@ -260,10 +260,10 @@ runtimes, with the same requests, checks and tolerances:
 |---|---|---|
 | `test_parity.py`: root, pose, VQ-VAE, end to end × 5 cases × 2 models | `parity.rs`: the same 4 stages × 2 models, each test over all 5 cases (end to end eager and compiled) | `metal_parity.rs`: the same, each stage teacher-forced through the runtime's buffers |
 | `test_model.py`: ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16, converted files, multi-step decoding, INT8 | `model.rs`: all 9 (compiled = eager also bitwise), plus malformed inputs being errors, for both models | `metal_model.rs`: the same, except compiled = eager becomes "chunked commits = one command buffer" and multi-step decoding (not in the release-only plan) becomes refusing oversized batches, plus malformed inputs and runtime-only checks (re-encoding, untuned batch sizes, plan rule) |
-| `test_layers.py`: 18 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels |
+| `test_layers.py`: 18 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels; also the fallback plan rule at other GPU core counts |
 | `test_runtime.py`: the Runtime API ([section 4](#4-the-runtime-api)) | `runtime.rs`: the same checks; the end-to-end generations run on both backends | (shared with mlx-rs in `runtime.rs`) |
 
-That gives 126 Rust tests, including 15 unit tests inside the crate (NPY parsing, the model
+That gives 128 Rust tests, including 15 unit tests inside the crate (NPY parsing, the model
 contract, ops, bench statistics), plus one ignored CPU benchmark of the runtime.
 
 Porting `compiled = eager` found a real bug: compiled mlx-rs runs could flip pose tokens. MLX 0.32.2
@@ -457,11 +457,69 @@ the reports pair runs within a round.
 
 ## 6. Tuning and profiling
 
+### Other Apple silicon Macs (not tested)
+
+> [!IMPORTANT]
+> Every number in this guide comes from one Mac: a Mac mini with an M4 Pro (20-core GPU, 273 GB/s).
+> The adaptations below let the code run sensibly on M2, M3, M4 and M5 chips in base, Pro, Max and
+> Ultra form. **They have not been tested or benchmarked on any of those Macs.** On this M4 Pro
+> they change nothing: the same plans, the same speed.
+
+**What adapts by itself:**
+- **Python port and mlx-rs port:**
+  - MLX picks its own kernels for each GPU.
+  - On M5 chips, MLX 0.30 and later uses the GPU's Neural Accelerators on macOS 26.2 and later. Both ports link MLX 0.32.
+  - The custom rig kernels launch one thread per row or element, so they don't depend on the core count.
+- **Metal runtime (`model-rs`): what it reads at load.** It reads the GPU's name, architecture, Apple
+  GPU family and core count. Metal exposes neither the core count nor the memory bandwidth. The core
+  count therefore comes from the IORegistry (`gpu-core-count`, the number System Information shows),
+  and `MB_GPU_CORES=<n>` overrides it. `mbrs-bench` (on stderr) and `gemm-tune` print what they found,
+  for example: `GPU: Apple M4 Pro (applegpu_g16s, Apple9 family, 20 GPU cores from IORegistry); GEMM
+  plans: built-in table plans/apple_m4_pro.txt`.
+- **Metal runtime: how GEMMs are planned.**
+  - The built-in plan table is used on every M4 Pro, the 16- and 20-core versions alike.
+  - Elsewhere, the fallback rule sizes each GEMM grid by threadgroups per GPU core: at least 8, and 6
+    after split-K (16 and 12 with INT8 weights).
+  - It allows up to 8 K-splits on GPUs of up to 20 cores, 16 up to 40 cores and 32 beyond. A GEMM of a
+    single request can then still occupy an Ultra.
+  - On a 20-core GPU, this reproduces the fitted plans exactly.
+- **Metal runtime: what it checks at load.**
+  - The GPU is Apple7 (M1) or later.
+  - It has 32 KB of threadgroup memory.
+  - Its SIMD-groups are 32 wide.
+  - Every pipeline accepts the 256-thread threadgroups the dispatches use.
+
+  Each of these holds on every Apple GPU family through Apple11 ([Metal feature set
+  tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf)). If one ever fails, loading
+  stops with an error instead of producing wrong results.
+- **Nothing in the code depends on memory bandwidth.**
+
+**What to expect (inferred, not measured):**
+- **Single requests:** these are bound by memory traffic and launch latency, so their latency
+  should scale roughly with memory bandwidth more than with core count.
+- **Large batches:** these scale more with GPU cores.
+- **Metal runtime vs Python MLX:** the 2× advantage at batch 1 was measured on this M4 Pro only. On
+  M5 chips, MLX's GEMMs use the Neural Accelerators and the Metal runtime's do not: its
+  simdgroup-matrix kernels don't use Metal 4 tensor operations. So MLX may close the gap at large
+  batches there. `mbrs-bench` times both runtimes side by side.
+- **Plans tuned for your Mac:** for the best Metal runtime plans on another Mac, measure a table for
+  it (next section). That replaces the fallback rule with plans timed on your GPU.
+
+| Chip | GPU family | GPU cores | Memory bandwidth |
+|---|---|---|---|
+| [M2](https://support.apple.com/111867) / [Pro, Max](https://support.apple.com/111340) / [Ultra](https://support.apple.com/111835) | Apple8 | 8–10 / 16–19, 30–38 / 60–76 | 100 / 200, 400 / 800 GB/s |
+| [M3](https://support.apple.com/118551) / [Pro, Max](https://support.apple.com/117736) / [Ultra](https://support.apple.com/122211) | Apple9 | 8–10 / 14–18, 30–40 / 60–80 | 100 / 150, 300–400 / 819 GB/s |
+| [M4](https://support.apple.com/122209) / [Pro, Max](https://support.apple.com/121553) | Apple9 | 8–10 / 16–20, 32–40 | 120 / 273, 410–546 GB/s |
+| [M5](https://www.apple.com/macbook-air/specs/) / [Pro, Max](https://www.apple.com/macbook-pro/specs/) / [Ultra](https://www.apple.com/mac-studio/specs/) | Apple10 | 8–10 / 16–20, 32–40 / 64–80 | 153 / 307, 460–614 / 1,200 GB/s |
+
+There is no M4 Ultra. M6 chips (Apple11) are detected the same way, also untested.
+
 ### Tuning the Metal runtime for another Mac
 
 The GEMM plan table (`model-rs/src/metal/plans/apple_m4_pro.txt`) is used only on GPUs named
-"Apple M4 Pro" (it was measured on the 20-core GPU). Other Macs use a fitted rule, which on the M4 Pro makes GEMMs 1–7% slower than the table. To
-measure a table for your own GPU:
+"Apple M4 Pro". It was measured on the 20-core GPU. Other Macs use the fallback rule scaled to
+their core count (previous section). On the M4 Pro, that rule makes GEMMs 1–7% slower than the
+table. To measure a table for your own GPU:
 
 ```sh
 uv run --package motionbricks-mlx python model-rs/bench/make_requests.py   # the requests gemm-tune replays
@@ -539,7 +597,7 @@ Research notes, sources and limits are in [sandbox/README.md](../sandbox/README.
 ```sh
 sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden + runtime fixtures (rerun-safe; --force regenerates)
 uv run --all-packages pytest                  # Python: 210 tests (181 model, 29 sandbox incl. 3 CuMetal)
-(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 126 tests, both runtimes vs the fixtures
+(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 128 tests, both runtimes vs the fixtures
 ```
 
 - **Golden fixtures:** `sandbox/scripts/make_golden.py` records the inputs and outputs of every

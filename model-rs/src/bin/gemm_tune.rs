@@ -66,6 +66,7 @@ fn main() -> Result<()> {
     let batches = if batches.is_empty() { vec![1, 2, 4, 8, 16, 32] } else { batches };
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut m = MetalModel::from_checkpoints_with(name, checkpoint_dir(name), 64, prec)?;
+    println!("GPU: {}; GEMM plans: {}", m.gpu.info.summary(), m.k.plan_source);
     if list_only {
         for &batch in &batches {
             let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
@@ -188,7 +189,8 @@ fn main() -> Result<()> {
     if let Ok(path) = std::env::var("TUNE_TABLE") {
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        writeln!(f, "# {name} {prec}")?;
+        let g = &m.gpu.info;
+        writeln!(f, "# {name} {prec}, measured on {} ({}, {} GPU cores)", g.name, g.architecture, g.cores)?;
         for l in &table {
             writeln!(f, "{l}")?;
         }

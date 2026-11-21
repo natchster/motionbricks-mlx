@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlx_rs::Array;
 use mlx_rs::ops::{QuantizeOptions, quantize};
+use objc2_metal::MTLComputePipelineState;
 
-use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, Recorder, as_bytes};
+use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, REFERENCE_GPU_CORES, Recorder, THREADGROUP_MEMORY, as_bytes};
 use crate::ops::to_vec_f32;
 
 #[repr(C)]
@@ -92,8 +93,6 @@ pub const MAX_ATTENTION_LEN: usize = 32;
 pub const MMA_HEAD_DIMS: [usize; 2] = [32, 64];
 /// Split-K partial sums buffer of [`Kernels::new`] (float32 elements).
 pub const PARTIAL_MAX: usize = 16 << 20;
-/// Threadgroup memory every Apple GPU provides (the scalar attention fallback stages Q/K/V there).
-const THREADGROUP_MEMORY: usize = 32 << 10;
 
 /// INT8 weight in MLX's affine format (bits 8, group 64): packed u32 [N][K/4], f32 scales/biases [N][K/64].
 pub struct QWeight {
@@ -191,16 +190,25 @@ pub const M4_PRO_PLANS: &str = include_str!("plans/apple_m4_pro.txt");
 /// The plan table for this device and precision. `MB_PLAN_TABLE` overrides the built-in choice:
 /// `0` disables tuned plans, any other non-empty value is the path of a table file written by
 /// `gemm-tune` (an empty value counts as unset).
-fn plan_table(gpu: &Gpu) -> Result<HashMap<PlanKey, Plan>> {
+///
+/// The built-in table applies to every "Apple M4 Pro" (16- and 20-core GPUs): the same GPU
+/// generation, cache and memory bandwidth as the one it was measured on. Other Macs get the
+/// fallback rule, which scales with the GPU core count, unless `MB_PLAN_TABLE` names a table
+/// measured on them. Returns the plans and a description of where they came from.
+fn plan_table(gpu: &Gpu) -> Result<(HashMap<PlanKey, Plan>, String)> {
     match std::env::var_os("MB_PLAN_TABLE") {
-        Some(v) if v == "0" => Ok(HashMap::new()),
+        Some(v) if v == "0" => Ok((HashMap::new(), "none (MB_PLAN_TABLE=0): fallback rule".into())),
         Some(v) if !v.is_empty() => {
             let path = PathBuf::from(v);
             let text = std::fs::read_to_string(&path).with_context(|| format!("MB_PLAN_TABLE {}", path.display()))?;
-            parse_plans(&text, gpu.prec).with_context(|| format!("MB_PLAN_TABLE {}", path.display()))
+            let plans = parse_plans(&text, gpu.prec).with_context(|| format!("MB_PLAN_TABLE {}", path.display()))?;
+            Ok((plans, format!("MB_PLAN_TABLE {}", path.display())))
         }
-        _ if gpu.device_name() == "Apple M4 Pro" => parse_plans(M4_PRO_PLANS, gpu.prec).context("built-in plan table plans/apple_m4_pro.txt"),
-        _ => Ok(HashMap::new()),
+        _ if gpu.info.name == "Apple M4 Pro" => {
+            let plans = parse_plans(M4_PRO_PLANS, gpu.prec).context("built-in plan table plans/apple_m4_pro.txt")?;
+            Ok((plans, "built-in table plans/apple_m4_pro.txt".into()))
+        }
+        _ => Ok((HashMap::new(), format!("none for {}: fallback rule for {} GPU cores", gpu.info.name, gpu.info.cores))),
     }
 }
 
@@ -297,6 +305,10 @@ pub struct Kernels {
     pub force: Option<Plan>,
     /// Tuned plans for this device (empty on devices without a table; `MB_PLAN_TABLE=0` disables).
     pub table: HashMap<PlanKey, Plan>,
+    /// Where `table` came from (`MB_PLAN_TABLE`, the built-in table, or none).
+    pub plan_source: String,
+    /// GPU cores the fallback plans are sized for (from [`super::GpuInfo`]; settable for tests).
+    pub cores: usize,
     /// When set, every GEMM launch appends (params with plan, INT8) here; for profiling tools.
     pub log: RefCell<Option<Vec<(GemmParams, bool)>>>,
     gemm: RefCell<HashMap<(Tile, Flags), Pipeline>>,
@@ -312,6 +324,7 @@ impl Kernels {
 
     /// Like [`Kernels::new`] with a split-K partial buffer of `len` float32 elements.
     pub fn with_partial_len(gpu: &Gpu, len: usize) -> Result<Self> {
+        let (table, plan_source) = plan_table(gpu)?;
         Ok(Kernels {
             reduce: gpu.pipeline("gemm_splitk_reduce")?,
             attention: gpu.pipeline("attention")?,
@@ -325,7 +338,9 @@ impl Kernels {
             dummy_t: gpu.buffer_t(4),
             partial: gpu.buffer(len),
             force: None,
-            table: plan_table(gpu)?,
+            table,
+            plan_source,
+            cores: gpu.info.cores,
             log: RefCell::new(None),
             gemm: RefCell::new(HashMap::new()),
             warming: Cell::new(false),
@@ -384,23 +399,37 @@ impl Kernels {
     /// then K splits (powers of two, >= 64 K per split) until the grid fills the GPU. Fitted on
     /// `gemm-tune` measurements: FP32 prefers 32x64 tiles, FP16/BF16 16x32 tiles (cheaper to fill
     /// in half precision), INT8 weights 64-row tiles (each tile dequantizes its weights once).
+    ///
+    /// "Enough" and "fills" are threadgroups per GPU core (8 and 6, or 16 and 12 for INT8 weights,
+    /// which were 160/120 and 320/240 on the 20-core GPU of the fit), and the split cap grows with
+    /// the core count ([`Kernels::heuristic_split_cap`]). On a 20-core GPU the plans are the
+    /// fitted ones; other core counts follow the same rule but have not been measured.
     pub fn heuristic(&self, m: usize, n: usize, k: usize, q8: bool) -> Plan {
-        let (prefs, g_tile, g_split, waste): (&[Tile], usize, usize, f64) = if q8 {
-            (&[TILES[6], TILES[0], TILES[3]], 320, 240, 0.4)
+        let (prefs, tile_per_core, split_per_core, waste): (&[Tile], usize, usize, f64) = if q8 {
+            (&[TILES[6], TILES[0], TILES[3]], 16, 12, 0.4)
         } else if self.gpu.prec == Precision::F32 {
-            (&[TILES[4], TILES[0], TILES[3]], 160, 120, 0.4)
+            (&[TILES[4], TILES[0], TILES[3]], 8, 6, 0.4)
         } else {
-            (&[TILES[0], TILES[1]], 160, 120, 0.15)
+            (&[TILES[0], TILES[1]], 8, 6, 0.15)
         };
+        let (g_tile, g_split) = (tile_per_core * self.cores, split_per_core * self.cores);
+        let cap = Self::heuristic_split_cap(self.cores);
         let groups = |t: &Tile| m.div_ceil(t.bm) * n.div_ceil(t.bn);
         let fits: Vec<Tile> = prefs.iter().copied().filter(|t| (m.div_ceil(t.bm) * t.bm) as f64 <= m as f64 * (1.0 + waste)).collect();
         let fits = if fits.is_empty() { vec![*prefs.last().unwrap()] } else { fits };
         let tile = fits.iter().copied().find(|t| groups(t) >= g_tile).unwrap_or(*fits.last().unwrap());
         let mut splits = 1;
-        while groups(&tile) * splits < g_split && k / (splits * 2) >= 64 && splits < 8 {
+        while groups(&tile) * splits < g_split && k / (splits * 2) >= 64 && splits < cap {
             splits *= 2;
         }
         Plan { tile, splits }
+    }
+
+    /// Most K splits the fallback plan uses: 8 up to the 20-core reference GPU, then growing in
+    /// proportion to the core count (powers of two: 16 for 40 cores, 32 for 80), so that small
+    /// launches can still fill larger GPUs.
+    pub fn heuristic_split_cap(cores: usize) -> usize {
+        (8 * cores).div_ceil(REFERENCE_GPU_CORES).next_power_of_two().max(8)
     }
 
     /// The plan for a launch: forced, else tuned, else the heuristic.
@@ -412,9 +441,9 @@ impl Kernels {
         self.table.get(&PlanKey::of(p, q8)).copied().unwrap_or_else(|| self.heuristic(m, n, k, q8))
     }
 
-    /// Largest number of K splits a plan of this `Kernels` can ask for (heuristic: 8).
+    /// Largest number of K splits a plan of this `Kernels` can ask for.
     pub fn max_splits(&self) -> usize {
-        self.table.values().map(|p| p.splits).chain(self.force.map(|p| p.splits)).fold(8, usize::max)
+        self.table.values().map(|p| p.splits).chain(self.force.map(|p| p.splits)).fold(Self::heuristic_split_cap(self.cores), usize::max)
     }
 
     /// The launch of `p`: parameters with the K split filled in, tile and loader flags.
@@ -542,6 +571,7 @@ impl Kernels {
         assert!(l <= MAX_ATTENTION_LEN && h > 0 && d % h == 0, "attention: {l} tokens, d {d}, {h} heads unsupported (<= {MAX_ATTENTION_LEN} tokens)");
         let smem = 3 * l * (hd + 1) * 4;
         assert!(smem <= THREADGROUP_MEMORY, "scalar attention: {l} tokens of head dim {hd} need {smem} bytes of threadgroup memory");
+        assert!(l * 32 <= self.attention.maxTotalThreadsPerThreadgroup(), "scalar attention: {l} tokens need {} threads per threadgroup", l * 32);
         rec.threadgroup_memory(smem, 0);
         rec.dispatch(&self.attention, &args, (b * h, 1, 1), (l * 32, 1, 1));
     }

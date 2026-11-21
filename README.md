@@ -142,8 +142,10 @@ Compare runtimes only in interleaved rounds: under sustained load the M4 Pro's G
 up to 10%.
 
 **Tune the Metal runtime for your Mac.** The built-in GEMM plan table is measured on an M4 Pro.
-Other Macs use a fitted rule. `gemm-tune` measures a table for your GPU, and `MB_PLAN_TABLE` loads
-it:
+Other Macs use a fitted rule scaled to their GPU core count. That adaptation to M2–M5 base, Pro,
+Max and Ultra chips is [untested](docs/user_guide.md#other-apple-silicon-macs-not-tested): all
+results here come from one M4 Pro. `gemm-tune` measures a table for your GPU, and `MB_PLAN_TABLE`
+loads it:
 
 ```sh
 cd model-rs
@@ -156,7 +158,7 @@ MB_PLAN_TABLE=$PWD/my_mac.txt cargo run --release --bin mbrs-bench -- --model so
 ```sh
 sandbox/setup.sh                                            # NVIDIA's reference model, fixtures (~5 GB)
 uv run --all-packages pytest                                # 210 Python tests
-(cd model-rs && cargo test --release -- --test-threads=1)   # 126 Rust tests
+(cd model-rs && cargo test --release -- --test-threads=1)   # 128 Rust tests
 ```
 
 The model suites also run without the sandbox, and skip only the parity tests against NVIDIA's code.
