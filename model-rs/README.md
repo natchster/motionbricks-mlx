@@ -9,7 +9,7 @@ golden parity tests against NVIDIA's PyTorch model as the Python port.
 | `motionbricks_rs::MotionBricks` | an op-for-op port on [mlx-rs](https://github.com/oxiglade/mlx-rs) 0.34 (MLX 0.32.2): the same graph, the same kernels, and the shared rig kernels (`../model/motionbricks_mlx/assets/rig_kernels.metal`); FP32, FP16, BF16 | the same (0.99–1.01× the time, compiled) |
 | **`motionbricks_rs::metal::model::MetalModel`** | **a model-specific Metal runtime** built from what MLX does generically: a static dispatch plan, its own fused kernels, and GEMM plans tuned per launch; FP32, FP16, BF16, INT8 | **1.96–2.06× at N=1**, 1.61–1.91× at N=2, 1.35–1.45× at N=4, 1.18–1.28× at N=8, 1.07–1.18× at N=16, 1.04–1.09× at N=32 |
 
-The repository README explains when to use which. The Metal runtime is tied to this model
+The [user guide](../docs/user_guide.md#3-the-rust-implementations-model-rs) explains when to use which. The Metal runtime is tied to this model
 implementation and to Apple-silicon GPUs, in exchange for the lowest latency.
 
 Both also run upstream's **Runtime API** (`motionbricks_rs::runtime`). It provides engines,

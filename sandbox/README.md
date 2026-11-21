@@ -70,7 +70,7 @@ Sources:
 
 The sandbox is only needed for NVIDIA's reference model, the golden fixtures, the parity tests and
 the cross-backend benchmarks. The Python and Rust models install and run without it (see the
-repository README's quick start).
+[user guide's installation paths](../docs/user_guide.md#1-install)).
 
 ```sh
 sandbox/setup.sh                 # ~1.6 GB checkpoints + 1.5 GB local ONNX export, all verified

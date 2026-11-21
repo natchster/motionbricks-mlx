@@ -18,7 +18,7 @@ be timed without it: `uv run --package motionbricks-mlx motionbricks-mlx bench -
 The Rust ports have their own interleaved Python-vs-Rust harness in
 [`model-rs/bench`](../../model-rs/bench). The Rust Metal runtime's single-request latency is
 4.0 ms in BF16 and 5.2 ms in FP32 (see the
-[repository README](../../README.md#part-2--the-rust-optimized-model-model-rs)).
+[user guide](../../docs/user_guide.md#5-benchmarks)).
 
 ## Results
 
