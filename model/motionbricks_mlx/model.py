@@ -75,20 +75,27 @@ class MotionBricks(nn.Module):
         self.core.pose.set_dtype(dtype)
         self.core.vqvae.set_dtype(dtype)
         self.core.compute_dtype = dtype
-        self._compiled = None
+        self._materialize()
         return self
+
+    def _materialize(self) -> None:
+        """Evaluate the (lazily cast / quantized / loaded) parameters now. Otherwise the first
+        `mx.compile` trace captures those lazy ops and every compiled call recomputes them: about
+        4 ms per call for the ~200M-parameter FP16/BF16 cast."""
+        mx.eval(self.parameters())
+        self._compiled = None
 
     def quantize(self, bits: int = 8, group_size: int = 64) -> "MotionBricks":
         """Experimental: affine-quantize the transformer projections (q/k/v/out + FFN) of the
-        root and pose networks. This is a *memory* option: 8-bit cuts the transformer weights
-        about 4x, but it is not faster. Batch-1 latency is dispatch-bound, and at larger batch
+        root and pose networks. 8-bit cuts the transformer weights about 4x. Batch 1 is bound
+        by streaming those weights, so it is also the fastest option there; at larger batches
         MLX's quantized GEMM is slower than FP32 (see model/benchmarks). Durations matched
         FP32 on all test requests at 8 bits; check agreement for your own inputs."""
         for transformer in (self.core.pose.transformer_model, self.core.root.shared_transformer_model,
                             self.core.root.root_token_transformer_model):
             nn.quantize(transformer, group_size=group_size, bits=bits)
         self.quantization = {"bits": bits, "group_size": group_size}
-        self._compiled = None
+        self._materialize()
         return self
 
     # -- forward ---------------------------------------------------------------------------

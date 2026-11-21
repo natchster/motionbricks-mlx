@@ -156,3 +156,32 @@ def test_low_precision_attention_is_finite(dtype):
     pad = mx.array(np.arange(8)[None] >= np.array([8, 3])[:, None])
     y = enc(mx.array(RNG.normal(size=(2, 8, 32))).astype(dtype), pad)
     assert y.dtype == dtype and np.isfinite(np.array(y.astype(mx.float32))).all()
+
+
+# --- custom Metal rig kernels vs the op-based reference --------------------------------------
+import pytest as _pytest  # noqa: E402
+
+from motionbricks_mlx import kernels as _kernels  # noqa: E402
+
+
+@_pytest.mark.skipif(not _kernels.available(), reason="needs the Metal GPU")
+def test_rig_kernels_match_ops():
+    from motionbricks_mlx.model import load_rig_arrays
+    from motionbricks_mlx.representation import Layout, GLOBAL_ROOT_KEYS, body_keys
+    from motionbricks_mlx.rig import G1Rig, SomaRetarget
+
+    rng = np.random.default_rng(3)
+    rig = G1Rig(load_rig_arrays("unitree_g1"), Layout.build(GLOBAL_ROOT_KEYS, body_keys(34)).indices)
+    qpos = rng.normal(0, 0.4, size=(3, 8, 36)).astype(np.float32)
+    qpos[..., 2] += 0.75
+    ctx, tgt = mx.array(qpos[:, :4]), mx.array(qpos[:, 4:])
+    for got, want in zip(rig.preprocess(ctx, tgt), rig.preprocess_ops(ctx, tgt)):
+        np.testing.assert_allclose(np.array(got), np.array(want), atol=2e-5, rtol=1e-5)
+    feats = rng.normal(0, 1, size=(2, 64, 414)).astype(np.float32)
+    for got, want in zip(rig.postprocess(mx.array(feats)), rig.postprocess_ops(mx.array(feats))):
+        np.testing.assert_allclose(np.array(got), np.array(want), atol=2e-5, rtol=1e-5)
+
+    soma = SomaRetarget(load_rig_arrays("soma"), 30)
+    six = mx.array(rng.normal(0, 1, size=(2, 64, 180)).astype(np.float32))
+    np.testing.assert_allclose(np.array(soma.capture_to_standard(six)),
+                               np.array(soma.apply_ops(six, soma.capture, soma.standard)), atol=2e-5, rtol=1e-5)

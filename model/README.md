@@ -41,7 +41,7 @@ frames = [out["pred_global_motions"][i, : 4 * n] for i, n in enumerate(out["pred
 
 mb.convert("unitree_g1", "checkpoints/MotionBricks/g1", "weights/g1.safetensors")   # one-file MLX weights
 g1 = mb.load("weights/g1.safetensors", dtype="float16")         # float32 | float16 | bfloat16
-g1.quantize(bits=8)                                             # experimental: ~4x smaller transformer weights (not faster)
+g1.quantize(bits=8)                                             # experimental: ~4x smaller transformer weights, fastest at N=1
 ```
 
 From the command line:
@@ -70,6 +70,13 @@ part of this repository.
 - **Strict, mechanical weight loading** (`weights.py`). Wrapper prefixes are remapped, leading
   underscores dropped (MLX treats `_attr` as private), PyTorch's packed `in_proj_weight` is split
   into an `nn.Linear`, and the load fails on any missing, unexpected or misshaped tensor.
+- **Parameters are evaluated before compiling.** Casting to FP16/BF16 and `quantize` are lazy in
+  MLX. If the first `mx.compile` trace captured them, every compiled call would recompute about
+  200 M casts (≈ 4 ms). `set_compute_dtype` and `quantize` therefore evaluate the parameters.
+- **The rig runs as custom Metal kernels** (`kernels.py`, source in `assets/rig_kernels.metal`).
+  G1 forward kinematics, joint-angle decoding and the SOMA T-pose retarget are hundreds of tiny
+  3×3 products as MLX ops, but one thread per pose as kernels. The op-based versions remain the CPU
+  fallback and the test oracle.
 - **Mixed precision mirrors upstream.** `float16`/`bfloat16` apply to the three networks only;
   normalization, root integration and rig geometry stay FP32, like upstream's mixed-FP16 ONNX.
 
@@ -99,15 +106,17 @@ Other tests cover:
 - weight-free unit tests of every block against NumPy derivations;
 - batch-row independence, `mx.compile` = eager, forced durations and allowed-duration masks;
 - converted-file round trips and multi-step MaskGIT decoding;
-- FP16, BF16 and INT8 durations against FP32.
+- FP16, BF16 and INT8 durations against FP32;
+- the custom rig kernels against the op-based reference implementation.
 
 ## Performance (Mac mini 2024, Apple M4 Pro: 14-core CPU, 20-core GPU, 64 GB)
 
 | | N=1 latency | N=32 throughput |
 |---|---|---|
-| SOMA, MLX FP32 / BF16 | 10.4 / 12.2 ms | 644 / 711 req/s |
-| G1, MLX FP32 / BF16 | 11.2 / 12.8 ms | 671 / 705 req/s |
+| SOMA, MLX FP32 / BF16 / INT8 | 10.5 / 8.1 / 7.9 ms | 750 / 848 / 730 req/s |
+| G1, MLX FP32 / BF16 / INT8 | 10.5 / 8.3 / 8.0 ms | 749 / 848 / 693 req/s |
 
-That is 3× faster than NVIDIA's PyTorch model on MPS at batch 1, and 4–6× the throughput of
-ONNX Runtime at batch 32. Full tables, the comparison with an RTX 4090 + TensorRT, and a profile
-of where the time goes: [benchmarks/README.md](benchmarks/README.md).
+That is 3–4.5× faster than NVIDIA's PyTorch model on MPS at batch 1, and 4.9–5.7× the throughput
+of ONNX Runtime at batch 32. Full tables, the comparison with an RTX 4090 + TensorRT, and a profile
+of where the time goes: [benchmarks/README.md](benchmarks/README.md). For the lowest single-request
+latency (7.1 ms), see the Rust Metal runtime in [`model-rs`](../model-rs/README.md).

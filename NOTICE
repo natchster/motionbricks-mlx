@@ -17,6 +17,13 @@ upstream PyTorch sources (tools/onnx/models/**) and modified: re-implemented in
 MLX with a channels-last tensor layout, unified SOMA/G1 code paths, and added
 compilation, reduced-precision and quantization options.
 
+model-rs/ is a Rust port of model/motionbricks_mlx (files carrying the header "Rust
+port of motionbricks_mlx"): an op-for-op port on mlx-rs, and a model-specific Metal
+runtime (custom Metal kernels plus MLX's precompiled kernels, loaded at run time from
+the locally built MLX library; MLX is MIT-licensed and not redistributed here).
+model/motionbricks_mlx/assets/rig_kernels.metal holds Metal transcriptions of the
+upstream rig geometry, shared by both ports.
+
 MotionBricks paper: T. Wang et al., "MotionBricks: Scalable Real-Time Motions with
 Modular Latent Generative Model and Smart Primitives", ACM TOG 45(4), 2026.
 
@@ -48,3 +55,5 @@ Not included, and not covered by this repository's license
 * Upstream robot assets: their respective licenses (e.g. Unitree, BSD-3-Clause).
 * Optional CuMetal toolchain (github.com/Lulzx/cuda-metal, Apache-2.0), built
   locally by sandbox/native/install_cumetal.sh from a pinned source release.
+* Rust dependencies fetched by Cargo (mlx-rs/mlx-sys: MIT OR Apache-2.0, which build
+  MLX and mlx-c, MIT; objc2 crates: MIT), not vendored.

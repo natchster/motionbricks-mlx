@@ -1,0 +1,43 @@
+[package]
+name = "motionbricks-rs"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Rust port of motionbricks_mlx (NVIDIA MotionBricks on MLX) using mlx-rs"
+publish = false
+
+[dependencies]
+mlx-rs = "0.34"
+# Same pinned version mlx-rs uses, so Cargo links one MLX build. Needed for the raw slice op.
+mlx-sys = { version = "=0.7.0", default-features = false }
+half = "2"
+anyhow = "1"
+libc = "0.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# Custom Metal runtime (src/metal): direct bindings, no MLX in the hot path.
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "mbrs-bench"
+path = "src/bin/bench.rs"
+
+[[bin]]
+name = "proto-transformer"
+path = "src/bin/proto_transformer.rs"
+
+[[bin]]
+name = "gemm-sweep"
+path = "src/bin/gemm_sweep.rs"
+
+[[bin]]
+name = "metal-debug"
+path = "src/bin/metal_debug.rs"
+
+[[bin]]
+name = "metal-stages"
+path = "src/bin/metal_stages.rs"

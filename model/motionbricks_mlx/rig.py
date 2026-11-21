@@ -14,6 +14,8 @@ import math
 import mlx.core as mx
 import numpy as np
 
+from . import kernels
+
 
 def cross(a, b):
     ax, ay, az = a[..., 0], a[..., 1], a[..., 2]
@@ -102,6 +104,15 @@ class G1Rig:
         self.parent_indices = mx.array(np.asarray(self.model_parents[1:], dtype=np.int32))
         self.identity = mx.eye(3)
         self.num_joints = len(self.model_parents)
+        # Packed constants for the custom Metal kernels (layout documented in kernels.HEADER).
+        q2t_mapped = np.asarray(arrays["rot_offsets_q2t"], np.float32)[np.asarray(arrays["mujoco_indices_to_motion_indices"])]
+        self.rf = mx.array(np.concatenate([np.asarray(arrays[k], np.float32).ravel() for k in (
+            "mujoco_to_motion_matrix", "mujoco_joint_axis_values_mujoco_space")] + [q2t_mapped.ravel()] + [
+            np.asarray(arrays[k], np.float32).ravel() for k in (
+                "capture_neutral_joints_mujoco", "neutral_joints", "rot_offsets_f2q", "mujoco_joint_axis_values_motion_space")]))
+        self.ri = mx.array(np.concatenate([np.asarray(arrays[k]).astype(np.int32).ravel() for k in (
+            "mujoco_joint_including_root_parent_list", "joint_parents", "motion_indices_to_mujoco_indices",
+            "mujoco_indices_to_motion_indices")]))
 
     def fk(self, qpos):
         """``qpos (..., 36)`` with a WXYZ root quaternion -> joint positions ``(..., 34, 3)``
@@ -149,6 +160,12 @@ class G1Rig:
 
     def preprocess(self, context_qpos, target_qpos):
         """Placed G1 poses -> ``(global_root (B,8,5), local_root (B,8,4), local_poses (B,8,303))``."""
+        if kernels.available():
+            return tuple(kernels.g1_preprocess(context_qpos, target_qpos, self.rf, self.ri))
+        return self.preprocess_ops(context_qpos, target_qpos)
+
+    def preprocess_ops(self, context_qpos, target_qpos):
+        """Op-based reference of :meth:`preprocess` (CPU fallback, test oracle)."""
         poses = mx.concatenate([context_qpos, target_qpos], axis=1)
         poses = mx.concatenate([poses[..., :3], poses[..., 6:7], poses[..., 3:6], poses[..., 7:]], axis=-1)  # XYZW -> WXYZ
         p, r = self.fk(poses)
@@ -170,6 +187,13 @@ class G1Rig:
         return global_root, mx.concatenate(windows, axis=1), local_poses
 
     def postprocess(self, pred_global):
+        """Global features -> ``(pred_qpos (B,T,36), foot contacts (B,T,4))``."""
+        if kernels.available():
+            return tuple(kernels.g1_postprocess(pred_global, self.rf, self.ri))
+        return self.postprocess_ops(pred_global)
+
+    def postprocess_ops(self, pred_global):
+        """Op-based reference of :meth:`postprocess` (CPU fallback, test oracle)."""
         root_p, root_r, hinges = self.decode(pred_global)
         q = matrix_quat(root_r)
         quat_xyzw = mx.concatenate([q[..., 1:4], q[..., 0:1]], axis=-1)
@@ -185,6 +209,12 @@ class SomaRetarget:
         self.num_joints = num_joints
 
     def _apply(self, six_flat, offset_from, offset_to):
+        if kernels.available():
+            return kernels.soma_retarget(six_flat, offset_from, offset_to, self.num_joints)
+        return self.apply_ops(six_flat, offset_from, offset_to)
+
+    def apply_ops(self, six_flat, offset_from, offset_to):
+        """Op-based reference of the retarget (CPU fallback, test oracle)."""
         shape = six_flat.shape
         m = cont6d_to_matrix(six_flat.reshape(*shape[:-1], self.num_joints, 6))
         m = (m @ offset_from) @ offset_to.swapaxes(-1, -2)
