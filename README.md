@@ -66,9 +66,10 @@ Runtime 1.32.0.
 
 **Correctness.** Both models were checked on five request families each. Every sub-network
 matches NVIDIA's PyTorch FP32 to ≤ 1.2e-5 relative error. Every predicted pose token's argmax and
-every chosen motion duration is identical. 69 model tests and 14 sandbox tests pass. The 3 tests
-for the optional CuMetal layer (raw CUDA C++ on Metal) skip unless that toolchain is built with
-`sandbox/native/install_cumetal.sh`, which needs full Xcode.
+every chosen motion duration is identical. All 86 tests pass: 69 model tests and 17 sandbox
+tests. The sandbox tests include 3 that compile raw CUDA C++ with the optional CuMetal toolchain
+and run it on the M4 Pro GPU. Those 3 skip on machines where CuMetal isn't built
+(`sandbox/native/install_cumetal.sh`, which needs full Xcode).
 
 **Speed.** Median time per batched generation on that Mac mini, with requests per second in
 parentheses:

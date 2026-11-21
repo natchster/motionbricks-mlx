@@ -88,11 +88,19 @@ uv run --all-packages cudashim-doctor
 Optional raw-CUDA layer. It needs full Xcode, not just the Command Line Tools:
 
 ```sh
-xcodebuild -downloadComponent MetalToolchain
+# 1. Install Xcode from the App Store, then accept its license once (or open Xcode and click Agree):
+sudo /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -license accept
+# 2. Build dependencies, then CuMetal into sandbox/native/toolchains/:
 brew install cmake llvm lz4 zstd
 sandbox/native/install_cumetal.sh && source sandbox/native/env.sh
 cumetalc sandbox/native/samples/vector_add.cu -o /tmp/va && CUMETAL_TRACE_GPU=1 /tmp/va
 ```
+
+`xcode-select` can stay pointed at the Command Line Tools. The installer, `env.sh` and the
+tests aim `xcrun` at `/Applications/Xcode.app` through `DEVELOPER_DIR`, per process only. The
+installer also downloads Xcode's Metal toolchain component
+(`xcodebuild -downloadComponent MetalToolchain`) if it is missing. Tested with Xcode 27.2
+(27B52), Metal Toolchain 27B47, Homebrew LLVM 23.1.6 and CuMetal 0.8.0.
 
 ## Usage
 
@@ -120,7 +128,7 @@ NumPy arrays or Warp CPU arrays.
 | `test_reference_on_mps.py` | **NVIDIA's PyTorch MotionBricks, moved with `.cuda()`**, runs on the Apple GPU and matches the CPU golden outputs. |
 | `test_tensorrt_shim.py` | **NVIDIA's own `build_serialized_engine` + `inspect_engine_tensors`** produce a plan from the G1 graph. A named-tensor `execute_async_v3` launch matches the PyTorch golden outputs. |
 | `test_warp_kernels.py` | **NVIDIA's Warp CUDA kernels** (condition masks, token padding) compile and run unchanged on the CPU, and `wp.set_device("cuda:0")` code runs under the alias. |
-| `test_native_cuda.py` | Covers vector add, shared-memory + warp-shuffle reduction and cuBLAS SGEMM through CuMetal on the Apple GPU. Skips if CuMetal isn't installed. |
+| `test_native_cuda.py` | **Raw CUDA C++ compiled by CuMetal runs on the Apple GPU.** Three programs: a grid-stride vector add, a shared-memory + warp-shuffle reduction with `atomicAdd`, and a cuBLAS SGEMM followed by a custom bias + ReLU kernel. Each must match a host reference, and every custom kernel must report `device=apple_gpu` in CuMetal's GPU trace. cuBLAS runs as an MPS matrix multiply, which doesn't trace, hence the extra kernel. Skips if CuMetal isn't installed. |
 
 ## Limits (honest list)
 
