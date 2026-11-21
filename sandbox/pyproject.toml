@@ -1,0 +1,30 @@
+[project]
+name = "motionbricks-cuda-sandbox"
+version = "0.1.0"
+description = "CUDA-emulation sandbox for Apple silicon: torch.cuda->MPS, TensorRT->ONNX Runtime, Warp->CPU, plus the upstream PyTorch reference oracle"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.6",
+    "numpy>=1.26",
+    "onnx>=1.17",
+    "onnxruntime>=1.20",
+    "safetensors>=0.4",
+    "warp-lang>=1.8",
+    "huggingface_hub>=0.30",
+    "motionbricks-mlx",
+]
+
+[tool.uv.sources]
+motionbricks-mlx = { workspace = true }
+
+[project.scripts]
+cudashim-doctor = "cudashim.doctor:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cudashim"]

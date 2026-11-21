@@ -1,0 +1,16 @@
+# Virtual uv workspace: `model/` (the MLX port) and `sandbox/` (CUDA-emulation
+# sandbox + PyTorch/ONNX reference oracle). One lockfile, one .venv.
+[tool.uv.workspace]
+members = ["model", "sandbox"]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-benchmark>=4"]
+
+[tool.pytest.ini_options]
+testpaths = ["model/tests", "sandbox/tests"]
+markers = [
+    "weights: needs the Hugging Face checkpoints (run sandbox/setup.sh)",
+    "reference: needs the upstream PyTorch reference (torch + sandbox/upstream)",
+    "slow: long-running",
+]
+addopts = "-ra"

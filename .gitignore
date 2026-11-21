@@ -1,0 +1,25 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.benchmarks/
+*.egg-info/
+build/
+dist/
+
+# Large / licensed third-party material fetched by sandbox/setup.sh (never committed)
+checkpoints/
+sandbox/upstream/
+sandbox/assets/
+sandbox/native/build/
+sandbox/native/toolchains/
+
+# Generated reference fixtures and benchmark results
+sandbox/golden/
+model/benchmarks/results/*.json
+!model/benchmarks/results/.gitkeep
+!model/benchmarks/results/2026-11-20-Apple-M4-Pro.json
+
+# OS
+.DS_Store

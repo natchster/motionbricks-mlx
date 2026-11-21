@@ -1,0 +1,50 @@
+motionbricks-mlx
+Copyright 2026 The motionbricks-mlx Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+-------------------------------------------------------------------------------
+Upstream work
+-------------------------------------------------------------------------------
+model/motionbricks_mlx/ is a port to Apple MLX of MotionBricks
+(https://github.com/NVlabs/motionbricks, v0.2.0, commit 54fc563):
+
+    Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    Licensed under the Apache License, Version 2.0.
+
+Files carrying the header "MLX port of MotionBricks" were translated from the
+upstream PyTorch sources (tools/onnx/models/**) and modified: re-implemented in
+MLX with a channels-last tensor layout, unified SOMA/G1 code paths, and added
+compilation, reduced-precision and quantization options.
+
+MotionBricks paper: T. Wang et al., "MotionBricks: Scalable Real-Time Motions with
+Modular Latent Generative Model and Smart Primitives", ACM TOG 45(4), 2026.
+
+-------------------------------------------------------------------------------
+Third-party code inherited through upstream
+-------------------------------------------------------------------------------
+* T2M-GPT (residual 1D convolution blocks and encoder), Copyright 2023 tencent,
+  Apache License 2.0 - licenses/T2M-GPT-LICENSE.txt
+* MotionGPT, Copyright (c) 2023 OpenMotionLab, MIT License
+  - licenses/MotionGPT-LICENSE.txt
+* vector-quantize-pytorch (multi-head codebook lookup), Copyright (c) 2020 Phil Wang,
+  MIT License - licenses/vector-quantize-pytorch-LICENSE.txt
+
+-------------------------------------------------------------------------------
+Bundled assets
+-------------------------------------------------------------------------------
+model/motionbricks_mlx/assets/g1_model_rig.npz and soma_model_rig.npz are copied
+unchanged from upstream tools/onnx/assets/. NVIDIA's contributions to these rig
+assets are licensed under the Apache License, Version 2.0 (upstream LICENSE,
+section "NVIDIA RIG ASSETS").
+
+-------------------------------------------------------------------------------
+Not included, and not covered by this repository's license
+-------------------------------------------------------------------------------
+* MotionBricks model weights (huggingface.co/nvidia/MotionBricks) and the upstream
+  ONNX models: NVIDIA Open Model Agreement. Users download them; this repository
+  does not redistribute weights, converted weights, or ONNX files.
+* Upstream sample motion clips: NVIDIA Sample Data Evaluation License.
+* Upstream robot assets: their respective licenses (e.g. Unitree, BSD-3-Clause).
+* Optional CuMetal toolchain (github.com/Lulzx/cuda-metal, Apache-2.0), built
+  locally by sandbox/native/install_cumetal.sh from a pinned source release.
