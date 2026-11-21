@@ -14,7 +14,6 @@ space, drop the boundary frames, and correct the endpoints.
 
 from __future__ import annotations
 
-import math
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -195,9 +194,11 @@ class MotionBricksEngine:
         output.num_frames = valid_frame_count(token_count)
         return output
 
-    def _frame_count(self, prediction, frames_in_prediction: int) -> int:
+    @staticmethod
+    def _frame_counts(prediction, frames_in_prediction: int) -> tuple[int, int]:
+        """Raw predicted frames (clamped to the prediction) and the valid frames left after the boundaries."""
         raw = min(max(int(prediction["pred_num_tokens"][0]) * MODEL_POSES_PER_TOKEN, 0), frames_in_prediction)
-        return max(0, raw - 2 * MODEL_BOUNDARY_FRAMES)
+        return raw, max(0, raw - 2 * MODEL_BOUNDARY_FRAMES)
 
     # Steps supplied by each rig (public, so they can be checked one at a time).
     def _prepare_generation(self, context, target, output) -> None:
@@ -225,14 +226,14 @@ def _heading_from_hip_positions(right, left) -> np.ndarray:
     across = np.stack([right[..., 0] - left[..., 0], np.zeros_like(right[..., 0]), right[..., 2] - left[..., 2]], -1)
     length = np.sqrt((across * across).sum(-1, keepdims=True))
     across = across / np.where(length > 1.0e-6, length, 1)
-    forward = np.cross(np.array([0.0, 1.0, 0.0], F), across)
+    forward = T.cross(np.array([0.0, 1.0, 0.0], F), across)
     return np.where(length[..., 0] > 1.0e-6, np.arctan2(forward[..., 0], forward[..., 2]), 0.0).astype(F)
 
 
 def _rotation_from_6d(x_raw, y_raw) -> np.ndarray:
     x_axis = T.normalize(x_raw)
-    z_axis = T.normalize(np.cross(x_axis, y_raw))
-    y_axis = np.cross(z_axis, x_axis)
+    z_axis = T.normalize(T.cross(x_axis, y_raw))
+    y_axis = T.cross(z_axis, x_axis)
     return T.quat_from_matrix(T.matrix_from_cols(x_axis, y_axis, z_axis))
 
 
@@ -288,20 +289,26 @@ class MotionBricksSOMAEngine(MotionBricksEngine):
                 pose_to_model[pose_joint] = model_joint
         self._model_to_pose = np.asarray(model_to_pose, np.int32)
         self._pose_to_model = pose_to_model
+        # Decoding: skeleton joints (below the root) driven by the model, with the model indices of
+        # each and of its parent, and the joints that keep their reference transforms.
+        joints = np.arange(1, skeleton.num_joints)
+        self._decoded_joints = joints[pose_to_model[1:] >= 0]
+        self._decoded_model_joints = pose_to_model[self._decoded_joints]
+        self._decoded_parent_model_joints = pose_to_model[skeleton.parent_indices[self._decoded_joints]]
+        self._reference_joints = joints[pose_to_model[1:] < 0]
         self._right_leg = skeleton.joint_index(SOMA_HEADING_JOINTS[0])
         self._left_leg = skeleton.joint_index(SOMA_HEADING_JOINTS[1])
         self._pose_skeleton = skeleton
 
     def encode_inputs(self, context: PoseToken, target: PoseToken, config: MotionBricksInferenceConfig) -> dict[str, np.ndarray]:
         sk = self._pose_skeleton
-        world = np.concatenate([
-            T.compute_world_poses(context.poses, sk.parent_indices, self._runtime_to_model),
-            T.compute_world_poses(target.poses, sk.parent_indices, self._runtime_to_model),
-        ])  # [8, J, 7] in SOMA model space
+        # [8, J, 7] in SOMA model space
+        world = sk.compute_world_transforms(np.concatenate([context.poses, target.poses]), self._runtime_to_model)
         last = MODEL_POSES_PER_TOKEN - 1
         hips = world[last, 0, :3]
         current = _heading_from_hip_positions(world[last, self._right_leg, :3], world[last, self._left_leg, :3])
-        desired = math.atan2(config.heading_alignment[0], config.heading_alignment[1])
+        heading = np.asarray(config.heading_alignment, F)
+        desired = np.arctan2(heading[0], heading[1])  # float32, like upstream's kernel
         self.alignment = T.transform([hips[0], 0.0, hips[2]], T.quat_from_axis_angle([0.0, 1.0, 0.0], F(current - desired)))
         align = self.alignment
 
@@ -337,7 +344,7 @@ class MotionBricksSOMAEngine(MotionBricksEngine):
     def decode_prediction(self, prediction: dict[str, np.ndarray], output: AnimationBuffer) -> int:
         sk = self._pose_skeleton
         pred = np.asarray(prediction["pred_global_motions"], F)[0]  # [64, 366]
-        count = self._frame_count(prediction, pred.shape[0])
+        _, count = self._frame_counts(prediction, pred.shape[0])
         self.generated_frame_count = count
         jm = len(self.joint_names)
         raw = pred[MODEL_BOUNDARY_FRAMES: MODEL_BOUNDARY_FRAMES + count]
@@ -349,14 +356,10 @@ class MotionBricksSOMAEngine(MotionBricksEngine):
         hips = T.transform_mul(self.alignment, T.transform(raw[:, :3], rotations[:, 0]))
         output.poses[:count, 0] = T.transform_mul(self._model_to_runtime, hips)
         ref = sk.reference_local_transforms
-        for joint in range(1, sk.num_joints):
-            model_joint = self._pose_to_model[joint]
-            if model_joint < 0:
-                output.poses[:count, joint] = ref[joint]
-                continue
-            parent_model = self._pose_to_model[sk.parent_indices[joint]]
-            local = T.quat_mul(T.quat_inverse(rotations[:, parent_model]), rotations[:, model_joint])
-            output.poses[:count, joint] = T.transform(np.broadcast_to(ref[joint, :3], (count, 3)), T.quat_normalize(local))
+        joints = self._decoded_joints
+        local = T.quat_mul(T.quat_inverse(rotations[:, self._decoded_parent_model_joints]), rotations[:, self._decoded_model_joints])
+        output.poses[:count, joints] = T.transform(np.broadcast_to(ref[joints, :3], (count, len(joints), 3)), T.quat_normalize(local))
+        output.poses[:count, self._reference_joints] = ref[self._reference_joints]
         return count
 
     def correct_endpoints(self, context: PoseToken, target: PoseToken, output: AnimationBuffer) -> None:
@@ -412,9 +415,10 @@ class MotionBricksUnitreeG1Engine(MotionBricksEngine):
     def encode_inputs(self, context: DOFToken, target: DOFToken, config: MotionBricksInferenceConfig) -> dict[str, np.ndarray]:
         root = T.transform_mul(self._runtime_to_model, read_root(context.poses[MODEL_POSES_PER_TOKEN - 1]))
         forward = T.transform_vector(root, np.array([1.0, 0.0, 0.0], F))
-        current = math.atan2(float(forward[1]), float(forward[0]))
-        desired = math.atan2(config.heading_alignment[1], config.heading_alignment[0])
-        self.alignment = T.transform([root[0], root[1], 0.0], T.quat_from_axis_angle([0.0, 0.0, 1.0], F(current - desired)))
+        heading = np.asarray(config.heading_alignment, F)
+        # float32 angles, like upstream's kernel
+        current, desired = np.arctan2(forward[1], forward[0]), np.arctan2(heading[1], heading[0])
+        self.alignment = T.transform([root[0], root[1], 0.0], T.quat_from_axis_angle([0.0, 0.0, 1.0], current - desired))
         align = self.alignment
         inputs = {}
         for token, name in ((context, "context_qpos"), (target, "target_qpos")):
@@ -430,8 +434,7 @@ class MotionBricksUnitreeG1Engine(MotionBricksEngine):
     def decode_prediction(self, prediction: dict[str, np.ndarray], output: DOFAnimationBuffer) -> int:
         pred = np.asarray(prediction["pred_qpos"], F)[0]  # [64, 36]
         contacts = np.asarray(prediction["pred_foot_contacts"], F)[0]
-        raw_count = min(max(int(prediction["pred_num_tokens"][0]) * MODEL_POSES_PER_TOKEN, 0), pred.shape[0])
-        count = max(0, raw_count - 2 * MODEL_BOUNDARY_FRAMES)
+        raw_count, count = self._frame_counts(prediction, pred.shape[0])
         self.generated_frame_count = count
         if count == 0:
             return 0

@@ -11,36 +11,33 @@
 //! previous one (`pipelined`, via `async_eval`).
 //!
 //!     cargo run --release --bin mbrs-bench -- --model soma --batches 1 8 16 32 --json out.json
+//!
+//! Options: `--model soma|unitree_g1`, `--checkpoints DIR` (default: `$MOTIONBRICKS_CHECKPOINTS`
+//! or `checkpoints/MotionBricks`), `--dtype float32|float16|bfloat16|int8`, `--batches N...`,
+//! `--iters N`, `--warmup N`, `--stream N`, `--json PATH`, `--runtime both|mlx|metal`.
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use common::{Argv, median, percentile};
 use mlx_rs::Array;
 use mlx_rs::transforms::{async_eval, eval};
+use motionbricks_rs::config::{Precision, checkpoint_dir, get_spec};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::wait;
 use motionbricks_rs::npy::load_npz;
 use motionbricks_rs::ops::{to_vec_f32, to_vec_i32};
-use motionbricks_rs::{MotionBricks, compiled, parse_dtype};
+use motionbricks_rs::{MotionBricks, compiled};
 
 fn thread_cpu() -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
     ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
-}
-
-fn median(v: &mut [f64]) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { 0.5 * (v[n / 2 - 1] + v[n / 2]) }
-}
-
-fn percentile(v: &mut [f64], p: f64) -> f64 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    v[((v.len() - 1) as f64 * p).round() as usize]
 }
 
 fn copy_out(model: &MotionBricks, outputs: &[Array]) -> Result<usize> {
@@ -60,7 +57,8 @@ struct Args {
     warmup: usize,
     stream: usize,
     json: Option<PathBuf>,
-    contiguous: bool,
+    /// Which runtimes to load and time: "both" (default), "mlx" or "metal".
+    runtime: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -73,35 +71,31 @@ fn parse_args() -> Result<Args> {
         warmup: 5,
         stream: 200,
         json: None,
-        contiguous: false,
+        runtime: "both".into(),
     };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut k = 0;
-    while k < argv.len() {
-        let next = |k: usize| argv.get(k + 1).cloned().ok_or_else(|| anyhow::anyhow!("{} needs a value", argv[k]));
-        match argv[k].as_str() {
-            "--model" => a.model = next(k)?,
-            "--checkpoints" => a.checkpoints = Some(next(k)?.into()),
-            "--dtype" => a.dtype = next(k)?,
-            "--iters" => a.iters = next(k)?.parse()?,
-            "--warmup" => a.warmup = next(k)?.parse()?,
-            "--stream" => a.stream = next(k)?.parse()?,
-            "--json" => a.json = Some(next(k)?.into()),
-            "--contiguous-weights" => {
-                a.contiguous = true;
-                k -= 1;
-            }
-            "--batches" => {
-                a.batches.clear();
-                while k + 1 < argv.len() && !argv[k + 1].starts_with("--") {
-                    a.batches.push(argv[k + 1].parse()?);
-                    k += 1;
-                }
-                k -= 1;
-            }
-            other => anyhow::bail!("unknown argument {other}"),
+    let mut argv = Argv::from_env();
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--model" => a.model = argv.value(&flag)?,
+            "--checkpoints" => a.checkpoints = Some(argv.value(&flag)?.into()),
+            "--dtype" => a.dtype = argv.value(&flag)?,
+            "--iters" => a.iters = argv.parsed(&flag)?,
+            "--warmup" => a.warmup = argv.parsed(&flag)?,
+            "--stream" => a.stream = argv.parsed(&flag)?,
+            "--json" => a.json = Some(argv.value(&flag)?.into()),
+            "--batches" => a.batches = argv.values(&flag)?,
+            "--runtime" => a.runtime = argv.value(&flag)?,
+            other => bail!("unknown argument {other}"),
         }
-        k += 2;
+    }
+    // Normalized names: "g1" -> "unitree_g1", "bf16" -> "bfloat16" (request files and report keys).
+    a.model = get_spec(&a.model)?.name.to_string();
+    a.dtype = a.dtype.parse::<Precision>()?.name().to_string();
+    if a.iters == 0 {
+        bail!("--iters must be at least 1");
+    }
+    if !["both", "mlx", "metal"].contains(&a.runtime.as_str()) {
+        bail!("--runtime must be both, mlx or metal, not {:?}", a.runtime);
     }
     Ok(a)
 }
@@ -109,21 +103,29 @@ fn parse_args() -> Result<Args> {
 fn main() -> Result<()> {
     let args = parse_args()?;
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let folder = if args.model == "soma" { "soma" } else { "g1" };
-    let ckpt = args.checkpoints.clone().unwrap_or_else(|| here.join("../checkpoints/MotionBricks").join(folder));
+    let ckpt = args.checkpoints.clone().unwrap_or_else(|| checkpoint_dir(&args.model));
+    let precision: Precision = args.dtype.parse()?;
     let load_start = Instant::now();
-    // The mlx-rs port has no INT8 mode; its rows are skipped for --dtype int8.
-    let mlx_dtype = if args.dtype == "int8" { "float32" } else { args.dtype.as_str() };
-    let model = Rc::new(MotionBricks::from_checkpoints_with(&args.model, &ckpt, parse_dtype(mlx_dtype)?, args.contiguous)?);
-    let run_mlx = args.dtype != "int8";
+    // The mlx-rs port's rows are skipped for --dtype int8 (only the Metal runtime is timed at
+    // INT8); the float32 model is still loaded then, as in earlier versions of this benchmark.
+    let mlx_precision = if precision.is_quantized() { Precision::Float32 } else { precision };
+    let model = match args.runtime.as_str() {
+        "metal" => None,
+        _ => Some(Rc::new(MotionBricks::load(&args.model, &ckpt, mlx_precision)?)),
+    };
+    let run_mlx = model.is_some() && !precision.is_quantized();
     let load_s = load_start.elapsed().as_secs_f64();
-    let mut forward = compiled(model.clone());
-    let metal = Some(MetalModel::from_checkpoints_with(&args.model, &ckpt, 64, &args.dtype)?);
+    let mut forward = model.clone().map(compiled);
+    let metal = match args.runtime.as_str() {
+        "mlx" => None,
+        _ => Some(MetalModel::from_checkpoints_with(&args.model, &ckpt, 64, args.dtype.as_str())?),
+    };
 
     let mut report = BTreeMap::new();
     for &batch in &args.batches {
         let request = load_npz(here.join("bench/requests").join(format!("{}_N{batch}.npz", args.model)))?;
         for mode in ["compiled", "eager"].into_iter().filter(|_| run_mlx) {
+            let (Some(model), Some(forward)) = (&model, forward.as_mut()) else { break };
             let keys = ["prepare", "graph", "eval_wall", "eval_cpu", "to_host", "total", "core"];
             let mut samples: BTreeMap<&str, Vec<f64>> = keys.iter().map(|k| (*k, Vec::new())).collect();
             let mut first_ms = 0.0;
@@ -137,7 +139,7 @@ fn main() -> Result<()> {
                 eval(outputs.iter())?;
                 let c1 = thread_cpu();
                 let t3 = Instant::now();
-                copy_out(&model, &outputs)?;
+                copy_out(model, &outputs)?;
                 let t4 = Instant::now();
                 if it == 0 {
                     first_ms = (t4 - t0).as_secs_f64() * 1e3;
@@ -215,17 +217,19 @@ fn main() -> Result<()> {
     }
 
     // A stream of single requests: back to back, or pipelined (encode i+1 while the GPU runs i).
-    if args.stream > 0 && run_mlx {
+    if args.stream > 0 && (run_mlx || args.runtime == "metal") {
         let request = load_npz(here.join("bench/requests").join(format!("{}_N1.npz", args.model)))?;
-        let inputs = model.prepare(&request)?;
-        for _ in 0..args.warmup {
-            eval(forward(&inputs)?.iter())?;
+        let mut row = BTreeMap::new();
+        if let (true, Some(model), Some(forward)) = (run_mlx, &model, forward.as_mut()) {
+            let inputs = model.prepare(&request)?;
+            for _ in 0..args.warmup {
+                eval(forward(&inputs)?.iter())?;
         }
         let t = Instant::now();
         for _ in 0..args.stream {
             let out = forward(&inputs)?;
             eval(out.iter())?;
-            copy_out(&model, &out)?;
+            copy_out(model, &out)?;
         }
         let sequential = args.stream as f64 / t.elapsed().as_secs_f64();
         let t = Instant::now();
@@ -234,18 +238,18 @@ fn main() -> Result<()> {
             let out = forward(&inputs)?;
             async_eval(out.iter())?;
             if let Some(prev) = pending.take() {
-                copy_out(&model, &prev)?; // waits for the previous request only
+                copy_out(model, &prev)?; // waits for the previous request only
             }
             pending = Some(out);
         }
         if let Some(prev) = pending {
-            copy_out(&model, &prev)?;
+            copy_out(model, &prev)?;
         }
         let pipelined = args.stream as f64 / t.elapsed().as_secs_f64();
         println!("rust {:<10} {:<8} stream of N=1 requests: sequential {sequential:6.1} req/s, pipelined {pipelined:6.1} req/s", args.model, args.dtype);
-        let mut row = BTreeMap::new();
         row.insert("sequential_req_s".to_string(), sequential);
         row.insert("pipelined_req_s".to_string(), pipelined);
+        }
         if let Some(mm) = &metal {
             for _ in 0..args.warmup {
                 mm.run(&request)?;
@@ -276,4 +280,20 @@ fn main() -> Result<()> {
         std::fs::write(path, s)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::common::{median, percentile};
+
+    #[test]
+    fn statistics() {
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert!(median(&mut []).is_nan());
+        assert_eq!(median(&mut [1.0, f64::NAN, 0.0]), 1.0, "NaN sorts last instead of panicking");
+        assert_eq!(percentile(&mut [5.0, 1.0, 3.0], 0.0), 1.0);
+        assert_eq!(percentile(&mut [5.0, 1.0, 3.0], 1.0), 5.0);
+        assert!(percentile(&mut [], 0.5).is_nan());
+    }
 }

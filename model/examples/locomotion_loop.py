@@ -84,7 +84,7 @@ def run(model: str, dtype: str = "float32") -> list[np.ndarray]:
             direction = steering(t)
             position = root_positions(current_pose.reshape(1, -1))[0] * np.array([1.0, 1.0, 0.0], np.float32)
             turned = generated_direction is not None and math.degrees(
-                math.acos(min(1.0, float(direction @ generated_direction)))) > TURN_THRESHOLD
+                math.acos(min(max(float(direction @ generated_direction), -1.0), 1.0))) > TURN_THRESHOLD
             if generated_direction is None or turned or player.time_to_transition <= delta_time:
                 ground_position = position + direction * DESIRED_SPEED[model] * LEAD_SECONDS
                 start = time.perf_counter()

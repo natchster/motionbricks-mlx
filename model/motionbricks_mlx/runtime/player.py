@@ -18,11 +18,20 @@ from .tokens import MotionRecorder
 
 
 class _GeneratedMotionPlayer:
-    def __init__(self, engine, context, target, output, motion_history: MotionRecorder) -> None:
+    """Shared player logic.
+
+    ``output`` holds the motion being played. Each generation writes into a second buffer, and the
+    two swap only when it succeeds, so a failed ``generate()`` keeps the previous motion, playback
+    time and transition point (upstream's player reuses one buffer and loses them). Read
+    ``player.output`` again after each generation instead of keeping a reference to it.
+    """
+
+    def __init__(self, engine, context, target, output, motion_history: MotionRecorder, scratch_output) -> None:
         self.engine = engine
         self.context = context
         self.target = target
         self.output = output
+        self._scratch_output = scratch_output
         self.motion_history = motion_history
         self.playback_time = 0.0
         # The current target's transition point, in frames before the end of its motion.
@@ -51,10 +60,17 @@ class _GeneratedMotionPlayer:
         cfg = config if config is not None else MotionBricksInferenceConfig()
         if inference_params.allowed_token_counts is not None:
             cfg = replace(cfg, allowed_token_counts=inference_params.allowed_token_counts)
-        self.target.update_from_poses(np.asarray(target_poses)[: inference_params.num_poses_to_use])
-        self.transition_early_by_frames = inference_params.transition_early_by_frames
+        poses = np.asarray(target_poses)
+        if poses.ndim != self.target.poses.ndim:
+            raise ValueError(f"target_poses must be a sequence of poses {('n', *self.target.poses.shape[1:])}, "
+                             f"got shape {poses.shape}; pass one pose as pose[None].")
+        self.target.update_from_poses(poses[: inference_params.num_poses_to_use])
         self.refresh_context()
-        self.engine.generate_animation(self.context, self.target, self.output, config=cfg)
+        scratch = self._scratch_output
+        self.engine.generate_animation(self.context, self.target, scratch, config=cfg)
+        # Success: play the new motion; the old buffer becomes the next scratch.
+        self.output, self._scratch_output = scratch, self.output
+        self.transition_early_by_frames = inference_params.transition_early_by_frames
         self.playback_time = 0.0
         self._generated_root_positions = self.output.root_transforms()[:, :3]
 
@@ -90,7 +106,8 @@ class GeneratedMotionPlayer(_GeneratedMotionPlayer):
 
     def __init__(self, engine, skeleton, *, history_capacity: int = 32) -> None:
         super().__init__(engine, engine.create_input(skeleton), engine.create_input(skeleton), engine.create_output(skeleton),
-                         MotionRecorder(skeleton.reference_local_transforms, capacity=history_capacity))
+                         MotionRecorder(skeleton.reference_local_transforms, capacity=history_capacity),
+                         engine.create_output(skeleton))
 
 
 class GeneratedDOFMotionPlayer(_GeneratedMotionPlayer):
@@ -98,4 +115,4 @@ class GeneratedDOFMotionPlayer(_GeneratedMotionPlayer):
 
     def __init__(self, engine, reference_joint_q, *, history_capacity: int = 32) -> None:
         super().__init__(engine, engine.create_input(), engine.create_input(), engine.create_output(),
-                         MotionRecorder(reference_joint_q, capacity=history_capacity))
+                         MotionRecorder(reference_joint_q, capacity=history_capacity), engine.create_output())

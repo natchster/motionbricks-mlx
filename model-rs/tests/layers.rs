@@ -125,7 +125,7 @@ fn quantizer_lookup_and_digits() {
     let _gpu = gpu_lock();
     let mut rng = Rand::new(3);
     let embed = rng.vec(3 * 4 * 2, 1.0); // (heads 3, entries 4, width 2)
-    let idx: Vec<i32> = (0..2 * 5 * 3).map(|k| ((k * 7 + 3) % 4) as i32).collect();
+    let idx: Vec<i32> = (0..2 * 5 * 3).map(|k| (k * 7 + 3) % 4).collect();
     let got = vals(&dequantize(&arr(&embed, &[3, 4, 2]), &Array::from_slice(&idx, &[2, 5, 3])).unwrap());
     let want: Vec<f32> = (0..2 * 5).flat_map(|r| (0..3).flat_map(|h| { let e = idx[r * 3 + h] as usize; embed[(h * 4 + e) * 2..(h * 4 + e) * 2 + 2].to_vec() }).collect::<Vec<_>>()).collect();
     assert_eq!(got, want);
@@ -240,4 +240,13 @@ fn rig_kernels_match_ops() {
     let six = arr(&normal(2 * 64 * 180, 1.0), &[2, 64, 180]);
     let (cap, std) = soma.offsets();
     close(&soma.capture_to_standard(&six).unwrap(), &soma.apply_ops(&six, cap, std).unwrap(), "soma retarget");
+
+    // The kernels index fixed row widths: other shapes are refused before the launch.
+    let wide = arr(&normal(3 * 4 * 37, 0.4), &[3, 4, 37]);
+    assert!(rig.preprocess(&wide, &tgt).is_err(), "qpos rows of 37");
+    assert!(rig.preprocess(&ctx, &arr(&normal(2 * 4 * 36, 0.4), &[2, 4, 36])).is_err(), "batch mismatch");
+    assert!(rig.postprocess(&arr(&normal(64 * 414, 1.0), &[64, 414])).is_err(), "features need (B, T, 414)");
+    assert!(rig.postprocess(&arr(&normal(2 * 413, 1.0), &[1, 2, 413])).is_err(), "features need 414 columns");
+    assert!(soma.capture_to_standard(&arr(&normal(2 * 179, 1.0), &[2, 179])).is_err(), "rotations need 30 * 6 columns");
+    assert!(soma.capture_to_standard(&Array::from_f32(1.0)).is_err(), "0-d rotations");
 }

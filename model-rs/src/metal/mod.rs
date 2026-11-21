@@ -10,6 +10,7 @@
 
 pub mod model;
 pub mod transformer;
+mod weights;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,9 +23,9 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType, MTLFunctionConstantValues, MTLLibrary,
-    MTLResourceOptions, MTLSize,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType, MTLDevice, MTLDispatchType, MTLFunctionConstantValues,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 pub const KERNELS: &str = concat!(include_str!("kernels.metal"), "\n", include_str!("model.metal"));
@@ -34,7 +35,7 @@ pub type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 pub type CommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
 pub type Encoder = Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>;
 
-/// Element type of the network tensors (`T` in the kernels).
+/// Element type of the network tensors (`T` in the kernels). INT8 mode computes in [`Precision::F32`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Precision {
     F32,
@@ -42,14 +43,21 @@ pub enum Precision {
     BF16,
 }
 
+impl From<crate::config::Precision> for Precision {
+    fn from(p: crate::config::Precision) -> Self {
+        use crate::config::Precision as P;
+        match p {
+            P::Float32 | P::Int8 => Precision::F32,
+            P::Float16 => Precision::F16,
+            P::BFloat16 => Precision::BF16,
+        }
+    }
+}
+
 impl Precision {
+    /// Element type for a precision name (`int8` computes in float32).
     pub fn parse(name: &str) -> Result<Self> {
-        Ok(match name {
-            "float32" | "fp32" | "int8" => Precision::F32,
-            "float16" | "fp16" => Precision::F16,
-            "bfloat16" | "bf16" => Precision::BF16,
-            other => bail!("unsupported precision {other}"),
-        })
+        Ok(name.parse::<crate::config::Precision>()?.into())
     }
     pub fn size(self) -> usize {
         if self == Precision::F32 { 4 } else { 2 }
@@ -78,51 +86,136 @@ impl Precision {
     }
     pub fn decode(self, bytes: &[u8]) -> Vec<f32> {
         match self {
-            Precision::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect(),
-            Precision::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes(c.try_into().unwrap()).to_f32()).collect(),
-            Precision::BF16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32()).collect(),
+            Precision::F32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+            Precision::F16 => bytes.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
+            Precision::BF16 => bytes.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
         }
     }
 }
 
-/// A shared-storage (unified memory) buffer of `len` elements of `elem` bytes.
+/// What a buffer holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Elem {
+    /// float32 (inputs, masks, rig, outputs).
+    F32,
+    /// int32 (durations, tokens, rig indices).
+    I32,
+    /// Raw 32-bit words (packed INT8 weights).
+    U32,
+    /// The network element type `T`.
+    T(Precision),
+}
+
+impl Elem {
+    pub fn size(self) -> usize {
+        match self {
+            Elem::T(p) => p.size(),
+            _ => 4,
+        }
+    }
+}
+
+/// A shared-storage (unified memory) buffer of `len` elements. The GPU writes it behind Rust's
+/// back, so the host only copies in and out (no references into the contents are handed out);
+/// read results after [`wait`]ing for the work that writes them.
 pub struct Buf {
-    pub raw: Retained<ProtocolObject<dyn MTLBuffer>>,
-    pub len: usize,
-    pub elem: usize,
-    /// Element type for T-typed buffers (None: float32 / uint32 / raw).
-    pub prec: Option<Precision>,
+    raw: Retained<ProtocolObject<dyn MTLBuffer>>,
+    len: usize,
+    /// Bytes per element (`kind.size()`, kept for the per-dispatch offset computation).
+    elem: usize,
+    kind: Elem,
 }
 
 impl Buf {
-    /// The contents as f32 (float32 buffers only).
-    pub fn as_slice(&self) -> &[f32] {
-        assert_eq!(self.elem, 4);
-        unsafe { std::slice::from_raw_parts(self.raw.contents().as_ptr() as *const f32, self.len) }
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        self.len
     }
-    #[allow(clippy::mut_from_ref)]
-    pub fn as_mut_slice(&self) -> &mut [f32] {
-        assert_eq!(self.elem, 4);
-        unsafe { std::slice::from_raw_parts_mut(self.raw.contents().as_ptr() as *mut f32, self.len) }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
-    pub fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.raw.contents().as_ptr() as *const u8, self.len * self.elem) }
+    pub fn kind(&self) -> Elem {
+        self.kind
     }
-    pub fn bytes_mut(&self) -> *mut u8 {
+    /// The Metal buffer.
+    pub fn raw(&self) -> &ProtocolObject<dyn MTLBuffer> {
+        &self.raw
+    }
+    fn ptr(&self) -> *mut u8 {
         self.raw.contents().as_ptr() as *mut u8
     }
-    /// First `n` elements converted to f32 (any precision).
+    /// Copy `bytes` to byte offset `at` (bounds-checked).
+    fn write_bytes(&self, at: usize, bytes: &[u8]) {
+        assert!(at + bytes.len() <= self.len * self.elem, "write past buffer end ({} + {} > {} bytes)", at, bytes.len(), self.len * self.elem);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr().add(at), bytes.len()) };
+    }
+    /// Copy of the first `n` elements' bytes (bounds-checked).
+    fn read_bytes(&self, n: usize) -> Vec<u8> {
+        assert!(n <= self.len, "read past buffer end ({n} > {} elements)", self.len);
+        let mut out = vec![0u8; n * self.elem];
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr(), out.as_mut_ptr(), out.len()) };
+        out
+    }
+    /// Copy of the first `n` 4-byte elements (bounds-checked; one allocation, one copy).
+    fn read_words<W: Copy>(&self, n: usize) -> Vec<W> {
+        assert!(n <= self.len, "read past buffer end ({n} > {} elements)", self.len);
+        assert_eq!(std::mem::size_of::<W>(), self.elem);
+        let mut out = Vec::<W>::with_capacity(n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.ptr() as *const W, out.as_mut_ptr(), n);
+            out.set_len(n);
+        }
+        out
+    }
+    /// First `n` elements converted to f32 (float32 or `T` buffers).
     pub fn to_f32(&self, n: usize) -> Vec<f32> {
-        match self.prec {
-            Some(p) => p.decode(&self.bytes()[..n * self.elem]),
-            None => self.as_slice()[..n].to_vec(),
+        match self.kind {
+            Elem::F32 => self.read_words(n),
+            Elem::T(p) => p.decode(&self.read_bytes(n)),
+            k => panic!("to_f32 on a {k:?} buffer"),
         }
     }
-    /// Write f32 values (converted to the buffer's precision) at the start.
+    /// First `n` elements of an int32 buffer.
+    pub fn to_i32(&self, n: usize) -> Vec<i32> {
+        assert_eq!(self.kind, Elem::I32, "to_i32 on a {:?} buffer", self.kind);
+        self.read_words(n)
+    }
+    /// Write f32 values (converted to the buffer's element type) at the start.
     pub fn write_f32(&self, data: &[f32]) {
-        let bytes = self.prec.unwrap_or(Precision::F32).encode(data);
-        assert!(bytes.len() <= self.len * self.elem, "write past buffer end");
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.bytes_mut(), bytes.len()) };
+        self.write_f32_at(0, data);
+    }
+    /// Write f32 values (converted to the buffer's element type) from element `offset`.
+    pub fn write_f32_at(&self, offset: usize, data: &[f32]) {
+        let p = match self.kind {
+            Elem::F32 => Precision::F32,
+            Elem::T(p) => p,
+            k => panic!("write_f32 on a {k:?} buffer"),
+        };
+        if p == Precision::F32 {
+            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
+            self.write_bytes(offset * 4, bytes);
+        } else {
+            self.write_bytes(offset * self.elem, &p.encode(data));
+        }
+    }
+    /// Write f32 values produced by `values` from element `offset` of a float32 buffer, without an
+    /// intermediate vector. `count` is the number of values (checked against the buffer first).
+    pub fn fill_f32(&self, offset: usize, count: usize, values: impl Iterator<Item = f32>) {
+        assert_eq!(self.kind, Elem::F32, "fill_f32 on a {:?} buffer", self.kind);
+        assert!(offset + count <= self.len, "write past buffer end ({offset} + {count} > {} elements)", self.len);
+        let dst = unsafe { (self.ptr() as *mut f32).add(offset) };
+        let mut written = 0;
+        for v in values.take(count) {
+            unsafe { dst.add(written).write(v) };
+            written += 1;
+        }
+        assert_eq!(written, count, "fill_f32: iterator ended early");
+    }
+    /// Write int32 values at the start of an int32 buffer.
+    pub fn write_i32(&self, data: &[i32]) {
+        assert_eq!(self.kind, Elem::I32, "write_i32 on a {:?} buffer", self.kind);
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
+        self.write_bytes(0, bytes);
     }
 }
 
@@ -184,23 +277,30 @@ impl Gpu {
         self.specialized(name, &[])
     }
 
-    fn raw(&self, bytes: usize) -> Retained<ProtocolObject<dyn MTLBuffer>> {
-        self.device.newBufferWithLength_options(bytes.max(16) as _, MTLResourceOptions::StorageModeShared).expect("buffer allocation")
+    fn alloc(&self, len: usize, kind: Elem) -> Buf {
+        let bytes = (len * kind.size()).max(16);
+        let raw = self.device.newBufferWithLength_options(bytes as _, MTLResourceOptions::StorageModeShared).unwrap_or_else(|| panic!("allocating a {bytes}-byte Metal buffer"));
+        Buf { raw, len, elem: kind.size(), kind }
     }
 
     /// A float32 buffer of `len` elements.
     pub fn buffer(&self, len: usize) -> Buf {
-        Buf { raw: self.raw(len * 4), len, elem: 4, prec: None }
+        self.alloc(len, Elem::F32)
+    }
+
+    /// An int32 buffer of `len` elements.
+    pub fn buffer_i32(&self, len: usize) -> Buf {
+        self.alloc(len, Elem::I32)
     }
 
     /// A buffer of `len` network elements (`T`).
     pub fn buffer_t(&self, len: usize) -> Buf {
-        Buf { raw: self.raw(len * self.prec.size()), len, elem: self.prec.size(), prec: Some(self.prec) }
+        self.alloc(len, Elem::T(self.prec))
     }
 
     pub fn upload(&self, data: &[f32]) -> Buf {
         let b = self.buffer(data.len());
-        b.as_mut_slice().copy_from_slice(data);
+        b.write_f32(data);
         b
     }
 
@@ -211,10 +311,17 @@ impl Gpu {
         b
     }
 
-    /// A raw 32-bit buffer (ints, packed INT8 weights).
+    pub fn upload_i32(&self, data: &[i32]) -> Buf {
+        let b = self.buffer_i32(data.len());
+        b.write_i32(data);
+        b
+    }
+
+    /// A raw 32-bit buffer (packed INT8 weights).
     pub fn upload_u32(&self, data: &[u32]) -> Buf {
-        let b = Buf { raw: self.raw(data.len() * 4), len: data.len(), elem: 4, prec: None };
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, b.bytes_mut(), data.len() * 4) };
+        let b = self.alloc(data.len(), Elem::U32);
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
+        b.write_bytes(0, bytes);
         b
     }
 
@@ -236,8 +343,27 @@ pub struct Recorder {
     flush_at: Vec<usize>,
 }
 
-/// The command buffers of one recording, in commit order.
+/// The command buffers of one recording, in commit order. [`wait`] for them before reading
+/// results or writing inputs again.
+#[must_use = "wait for the submitted work before reading its results or reusing its buffers"]
 pub struct Submitted(Vec<CommandBuffer>);
+
+impl Submitted {
+    /// Wait for the recording to finish; its GPU time in ms (first start to last end), or the
+    /// error of a command buffer that did not complete (GPU fault, timeout, out of memory).
+    pub fn wait(&self) -> Result<f64> {
+        let last = self.0.last().expect("command buffer");
+        last.waitUntilCompleted();
+        for (i, cb) in self.0.iter().enumerate() {
+            let status = cb.status();
+            if status != MTLCommandBufferStatus::Completed {
+                let why = cb.error().map(|e| e.localizedDescription().to_string()).unwrap_or_else(|| "no error reported".into());
+                bail!("Metal command buffer {i} of {} did not complete ({status:?}): {why}", self.0.len());
+            }
+        }
+        Ok((last.GPUEndTime() - self.0[0].GPUStartTime()) * 1e3)
+    }
+}
 
 pub enum Arg<'a> {
     /// Buffer and *element* offset.
@@ -245,7 +371,17 @@ pub enum Arg<'a> {
     Bytes(&'a [u8]),
 }
 
-pub fn as_bytes<T>(v: &T) -> &[u8] {
+/// Plain-old-data kernel parameters: `Copy`, no padding, no pointers, so every byte is initialized.
+///
+/// # Safety
+/// Implement only for types whose every byte is initialized (no padding) and that hold no references.
+pub(crate) unsafe trait Pod: Copy + 'static {}
+unsafe impl Pod for i32 {}
+unsafe impl Pod for u32 {}
+unsafe impl Pod for f32 {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
+pub(crate) fn as_bytes<T: Pod>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
@@ -303,33 +439,29 @@ impl Recorder {
         }
     }
 
-    /// `dispatchThreads` (non-uniform grid), for kernels without bounds checks.
-    pub fn dispatch_threads(&mut self, pso: &Pipeline, args: &[Arg], grid: (usize, usize, usize), threads: (usize, usize, usize)) {
-        self.bind(pso, args);
-        let g = MTLSize { width: grid.0 as _, height: grid.1 as _, depth: grid.2 as _ };
-        let t = MTLSize { width: threads.0 as _, height: threads.1 as _, depth: threads.2 as _ };
-        self.enc.dispatchThreads_threadsPerThreadgroup(g, t);
-        self.dispatches += 1;
-        self.auto_flush();
-    }
-
     /// Dynamic threadgroup memory for the next dispatch (`[[threadgroup(index)]]`).
     pub fn threadgroup_memory(&mut self, bytes: usize, index: usize) {
         unsafe { self.enc.setThreadgroupMemoryLength_atIndex(bytes.div_ceil(16) * 16, index) };
     }
 
     /// End encoding and commit; returns the submitted command buffers (call `wait`).
+    #[must_use = "wait for the submitted work before reading its results or reusing its buffers"]
     pub fn commit(mut self) -> Submitted {
         self.enc.endEncoding();
         self.cb.commit();
         self.sent.push(self.cb);
         Submitted(self.sent)
     }
+
+    /// End encoding and drop the recording without running it (nothing was flushed yet).
+    pub fn discard(self) {
+        assert!(self.sent.is_empty(), "discard after a flush: part of the recording already ran");
+        self.enc.endEncoding();
+    }
 }
 
 /// Wait for the recording to finish; returns its GPU time in ms (first start to last end).
+/// Panics if a command buffer failed; [`Submitted::wait`] returns the error instead.
 pub fn wait(s: &Submitted) -> f64 {
-    let last = s.0.last().expect("command buffer");
-    last.waitUntilCompleted();
-    (last.GPUEndTime() - s.0[0].GPUStartTime()) * 1e3
+    s.wait().unwrap_or_else(|e| panic!("{e:#}"))
 }

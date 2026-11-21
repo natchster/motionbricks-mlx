@@ -1,7 +1,7 @@
 """Write the benchmark requests (motionbricks_mlx.examples, seed 0 like model/benchmarks/bench.py)
 to .npz files, so the Python and Rust harnesses time byte-identical inputs.
 
-    uv run --all-packages python model-rs/bench/make_requests.py
+    uv run --package motionbricks-mlx python model-rs/bench/make_requests.py
 """
 
 from pathlib import Path

@@ -8,29 +8,48 @@
 //! rig/glue kernels from `model.metal`, the generalized `gemm_mma` (implicit dilated convs with
 //! upsampling, concatenated inputs, masked/predicated/blended epilogues, INT8 weights),
 //! fused attention and add+LayerNorm. Network tensors use one element type (FP32, FP16 or BF16);
-//! INT8 mode quantizes the transformer projections like the Python port. All buffers are allocated once.
+//! INT8 mode quantizes the transformer projections like the Python port. All buffers are allocated
+//! and every GEMM pipeline the model can use is compiled at load time.
 //! The release configuration (one MaskGIT step) makes the pose network's token embedding a
 //! constant, which is computed at load time.
 
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
-use mlx_rs::Array;
+use anyhow::{Context, Result, anyhow, bail, ensure};
 
-use super::transformer::{ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, Scratch, Transformer, Weight, upload};
-use super::{Arg, Buf, Gpu, Pipeline, Precision, Recorder, as_bytes, wait};
-use crate::config::{FinalRootMode, Kind, ModelSpec, get_spec};
-use crate::npy::{Npy, load_npz_bytes};
-use crate::ops::to_vec_f32;
+use super::transformer::{ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, PARTIAL_MAX, Scratch, Transformer};
+use super::weights::{Conv, Decoder, FcBlock, Lin, Loader, Rig, rig, token_const};
+use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, Recorder, as_bytes};
+use crate::config::{self, FinalRootMode, Kind, ModelSpec, get_spec};
+use crate::npy::{Npy, NpyData};
 use crate::representation::MotionRepresentation;
 use crate::weights::read_checkpoints;
 
 /// Dispatch counts after which a generation's recording is committed (see `MetalModel::recorder`).
 pub const FLUSH_AT: [usize; 3] = [8, 40, 120];
+/// Largest `max_batch` (the kernels index buffers with 32-bit integers).
+pub const MAX_BATCH: usize = 16384;
 
-const G1_RIG: &[u8] = include_bytes!("../../../model/motionbricks_mlx/assets/g1_model_rig.npz");
-const SOMA_RIG: &[u8] = include_bytes!("../../../model/motionbricks_mlx/assets/soma_model_rig.npz");
+/// Root network embedding width.
+const E: usize = 512;
+/// Root input embedding: local pose (256) | local root (64) | global root (64).
+const X0: [usize; 3] = [256, 64, 64];
+const X0_W: usize = 384;
+/// Pose network width, its local-pose embedding per frame and its length embedding width.
+const POSE_E: usize = 1024;
+const POSE_FRAME: usize = 160;
+const LEN_W: usize = 128;
+/// Decoder channels.
+const DEC_W: usize = 512;
+/// Transformer scratch: tokens per sequence, width and FFN width it holds.
+const TF_LEN: usize = 25;
+const TF_D: usize = 1024;
+const TF_FFN: usize = 2048;
+
+/// The output of one call: main output (`pred_global_motions` or `pred_qpos`), durations, and
+/// G1 foot contacts.
+pub type Outputs = (Vec<f32>, Vec<i32>, Option<Vec<f32>>);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -47,86 +66,8 @@ pub struct Dims {
     pub forced: i32,
 }
 
-struct Lin {
-    w: Weight,
-    b: Buf,
-    n: usize,
-    k: usize,
-}
-
-struct Conv {
-    w: Weight,
-    b: Buf,
-    n: usize,
-    cin: usize,
-    taps: usize,
-    dil: usize,
-}
-
-struct FcBlock {
-    layers: Vec<Lin>,
-    proj: Lin,
-}
-
-struct Level {
-    target: Lin,
-    ext: Lin,
-    res: Vec<(Conv, Conv)>,
-    up: Conv,
-}
-
-struct Decoder {
-    conv0: Conv,
-    levels: Vec<Level>,
-    post: Conv,
-    out: Conv,
-}
-
-struct Loader<'a> {
-    gpu: &'a Gpu,
-    t: &'a HashMap<String, Array>,
-}
-
-impl Loader<'_> {
-    fn buf(&self, name: &str) -> Result<Buf> {
-        upload(self.gpu, self.t, name)
-    }
-    fn vec(&self, name: &str) -> Result<Vec<f32>> {
-        Ok(to_vec_f32(self.t.get(name).ok_or_else(|| anyhow!("missing weight {name}"))?)?)
-    }
-    fn shape(&self, name: &str) -> Vec<usize> {
-        self.t[name].shape().iter().map(|&d| d as usize).collect()
-    }
-    fn lin(&self, p: &str) -> Result<Lin> {
-        let s = self.shape(&format!("{p}.weight"));
-        Ok(Lin { w: Weight::Dense(self.buf(&format!("{p}.weight"))?), b: self.buf(&format!("{p}.bias"))?, n: s[0], k: s[1] })
-    }
-    fn conv(&self, p: &str, dil: usize) -> Result<Conv> {
-        let s = self.shape(&format!("{p}.weight")); // (out, k, in), already channels-last
-        Ok(Conv { w: Weight::Dense(self.buf(&format!("{p}.weight"))?), b: self.buf(&format!("{p}.bias"))?, n: s[0], taps: s[1], cin: s[2], dil })
-    }
-    fn fc(&self, p: &str) -> Result<FcBlock> {
-        Ok(FcBlock { layers: vec![self.lin(&format!("{p}.fc_layers.0"))?, self.lin(&format!("{p}.fc_layers.1"))?], proj: self.lin(&format!("{p}.forward_projection"))? })
-    }
-    fn decoder(&self, p: &str) -> Result<Decoder> {
-        let mut levels = Vec::new();
-        for i in 0..2 {
-            let res = (0..4)
-                .map(|j| {
-                    let dil = 3usize.pow(3 - j as u32);
-                    Ok((self.conv(&format!("{p}.model.{}.0.model.{j}.conv1", 2 + i), dil)?, self.conv(&format!("{p}.model.{}.0.model.{j}.conv2", 2 + i), 1)?))
-                })
-                .collect::<Result<_>>()?;
-            levels.push(Level {
-                target: self.lin(&format!("{p}.target_cond_blocks.{}", 2 * i))?,
-                ext: self.lin(&format!("{p}.external_cond_blocks.{}", 2 * i))?,
-                res,
-                up: self.conv(&format!("{p}.model.{}.2", 2 + i), 1)?,
-            });
-        }
-        Ok(Decoder { conv0: self.conv(&format!("{p}.model.0"), 1)?, levels, post: self.conv(&format!("{p}.model.4"), 1)?, out: self.conv(&format!("{p}.model.6"), 1)? })
-    }
-}
+// SAFETY: all fields are i32 (no padding, no pointers).
+unsafe impl Pod for Dims {}
 
 /// Every intermediate of one generation, sized for `max_batch`.
 pub struct Bufs {
@@ -140,7 +81,10 @@ pub struct Bufs {
     pub hl: Buf,
     pub hp: Buf,
     pub allowed: Buf,
+    /// Forced durations (int32).
     pub nt_in: Buf,
+    /// SOMA: `lp_in` retargeted to the standard T-pose (the inputs stay untouched).
+    lp_rt: Buf,
     // normalized inputs
     pub gn: Buf,
     pub ln: Buf,
@@ -160,6 +104,7 @@ pub struct Bufs {
     log1: Buf,
     pub x2: Buf,
     pub pad2: Buf,
+    /// Chosen durations (int32).
     pub nt: Buf,
     pub m16: Buf,
     pub m32: Buf,
@@ -167,9 +112,9 @@ pub struct Bufs {
     pub ppad: Buf,
     pub logits: Buf,
     dec_in: Buf,
-    dframe: Buf,
-    droot: Buf,
-    dhas: Buf,
+    pub dframe: Buf,
+    pub droot: Buf,
+    pub dhas: Buf,
     pub pr: Buf,
     // decoder scratch
     h: Buf,
@@ -185,6 +130,7 @@ pub struct Bufs {
     pe: Buf,
     px: Buf,
     pub plog: Buf,
+    /// Pose tokens (int32).
     pub tokens: Buf,
     pub lat: Buf,
     // outputs
@@ -194,6 +140,94 @@ pub struct Bufs {
     pub contacts: Buf,
     tf: Scratch,
 }
+
+/// The glue and rig kernels of `model.metal`.
+struct Glue {
+    prep: Pipeline,
+    soma_retarget: Pipeline,
+    g1_preprocess: Pipeline,
+    root_assemble: Pipeline,
+    root_second_input: Pipeline,
+    root_dense_cond: Pipeline,
+    copy_rows: Pipeline,
+    root_to_pose: Pipeline,
+    argmax_dequant: Pipeline,
+    finish_root: Pipeline,
+    body_out: Pipeline,
+    g1_postprocess: Pipeline,
+}
+
+impl Glue {
+    fn new(gpu: &Gpu) -> Result<Self> {
+        Ok(Glue {
+            prep: gpu.pipeline("prep")?,
+            soma_retarget: gpu.pipeline("soma_retarget")?,
+            g1_preprocess: gpu.pipeline("g1_preprocess")?,
+            root_assemble: gpu.pipeline("root_assemble")?,
+            root_second_input: gpu.pipeline("root_second_input")?,
+            root_dense_cond: gpu.pipeline("root_dense_cond")?,
+            copy_rows: gpu.pipeline("copy_rows")?,
+            root_to_pose: gpu.pipeline("root_to_pose")?,
+            argmax_dequant: gpu.pipeline("argmax_dequant")?,
+            finish_root: gpu.pipeline("finish_root")?,
+            body_out: gpu.pipeline("body_out")?,
+            g1_postprocess: gpu.pipeline("g1_postprocess")?,
+        })
+    }
+}
+
+/// Most ONNX inputs of a model (SOMA has 7).
+const MAX_INPUTS: usize = 8;
+
+/// Input buffer of an ONNX input.
+#[derive(Clone, Copy)]
+enum Slot {
+    Ctx,
+    Tgt,
+    GrIn,
+    LrIn,
+    LpIn,
+    Hg,
+    Hl,
+    Hp,
+    Allowed,
+}
+
+/// One ONNX input: its buffer, whether it is a mask (`!= 0` -> 0/1) and its shape after the batch axis.
+#[derive(Clone, Copy)]
+struct Input {
+    name: &'static str,
+    slot: Slot,
+    mask: bool,
+    row: [i32; 2],
+    row_dims: usize,
+}
+
+/// Options of a [`MetalModel::conv`] launch (input mask/ReLU, activation, output mask, 2x
+/// upsampling, in-place residual).
+#[derive(Clone, Copy, Default)]
+struct ConvOpts<'a> {
+    amask: Option<&'a Buf>,
+    a_relu: bool,
+    act: i32,
+    ymask: Option<&'a Buf>,
+    up: bool,
+    res: Option<&'a Buf>,
+}
+
+/// Retarget launch parameters (`RetargetParams` in model.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RetargetParams {
+    rows: i32,
+    ld: i32,
+    col0: i32,
+    joints: i32,
+    copy_pos: i32,
+}
+
+// SAFETY: all fields are i32 (no padding, no pointers).
+unsafe impl Pod for RetargetParams {}
 
 pub struct MetalModel {
     pub gpu: Gpu,
@@ -228,7 +262,6 @@ pub struct MetalModel {
     p_root: Lin,
     p_local_pose: Lin,
     len_emb: Buf,
-    pub len_emb_host: Vec<f32>,
     p_input: Lin,
     pose_pos: Buf,
     pose_tf: Transformer,
@@ -236,131 +269,70 @@ pub struct MetalModel {
     token_const: Buf,
     // VQ-VAE
     codebook: Buf,
-    pub codebook_host: Vec<f32>,
     vq_dec: Decoder,
     // rig and statistics
-    rig_f: Buf,
-    rig_i: Buf,
-    soma_capture: Buf,
-    soma_standard: Buf,
+    rig: Rig,
     stats: Buf,
     body_stats: Buf,
     pub b: Bufs,
-    pso: HashMap<&'static str, Pipeline>,
-}
-
-fn cpu_linear(x: &[f32], w: &[f32], b: &[f32], n: usize, k: usize) -> Vec<f32> {
-    (0..n).map(|j| b[j] + (0..k).map(|i| x[i] * w[j * k + i]).sum::<f32>()).collect()
-}
-
-fn leaky(v: Vec<f32>) -> Vec<f32> {
-    v.into_iter().map(|x| (x * 0.01).max(x)).collect()
-}
-
-impl Bufs {
-    pub fn dframe_debug(&self) -> Vec<f32> { self.dframe.to_f32(self.dframe.len) }
-    pub fn droot_debug(&self) -> Vec<f32> { self.droot.to_f32(self.droot.len) }
-    pub fn dhas_debug(&self) -> Vec<f32> { self.dhas.as_slice().to_vec() }
+    glue: Glue,
+    inputs: Vec<Input>,
 }
 
 impl MetalModel {
     /// FP32 model.
     pub fn from_checkpoints(name: &str, dir: impl AsRef<Path>, max_batch: usize) -> Result<Self> {
-        Self::from_checkpoints_with(name, dir, max_batch, "float32")
+        Self::from_checkpoints_with(name, dir, max_batch, config::Precision::Float32)
     }
 
-    /// `precision`: "float32", "float16", "bfloat16", or "int8" (FP32 activations with INT8
-    /// transformer projections, as `motionbricks_mlx.MotionBricks.quantize(8)`).
-    pub fn from_checkpoints_with(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: &str) -> Result<Self> {
+    /// `precision`: a [`config::Precision`] or its name: "float32", "float16", "bfloat16", or
+    /// "int8" (FP32 activations with INT8 transformer projections, as
+    /// `motionbricks_mlx.MotionBricks.quantize(8)`).
+    pub fn from_checkpoints_with<P>(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: P) -> Result<Self>
+    where
+        P: TryInto<config::Precision>,
+        P::Error: Into<anyhow::Error>,
+    {
+        let precision = precision.try_into().map_err(Into::into)?;
         let spec = get_spec(name)?;
         let loaded = read_checkpoints(dir, &spec)?;
         Self::from_loaded(spec, loaded, max_batch, precision)
     }
 
     /// From one converted file (`motionbricks_rs::convert` or `motionbricks_mlx.convert`).
-    pub fn from_converted(path: impl AsRef<Path>, max_batch: usize, precision: &str) -> Result<Self> {
+    pub fn from_converted<P>(path: impl AsRef<Path>, max_batch: usize, precision: P) -> Result<Self>
+    where
+        P: TryInto<config::Precision>,
+        P::Error: Into<anyhow::Error>,
+    {
+        let precision = precision.try_into().map_err(Into::into)?;
         let (name, loaded) = crate::weights::read_converted(path)?;
         Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision)
     }
 
-    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: &str) -> Result<Self> {
-        let prec = Precision::parse(precision)?;
-        let int8 = precision == "int8";
+    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: config::Precision) -> Result<Self> {
+        ensure!((1..=MAX_BATCH).contains(&max_batch), "max_batch must be in 1..={MAX_BATCH}, got {max_batch}");
+        let prec = Precision::from(precision);
+        let int8 = precision.is_quantized();
         let rep = MotionRepresentation::new(spec.num_joints, &loaded.mean, &loaded.std)?;
         let gpu = Gpu::with_precision(prec)?;
-        let k = Kernels::new(&gpu)?;
+        // Split-K partials are sized after the warm-up, from the launches the model makes.
+        let k = Kernels::with_partial_len(&gpu, 0)?;
         let l = Loader { gpu: &gpu, t: &loaded.tensors };
-        let j = spec.num_joints as usize;
-        let pd = 1 + (j - 1) * 3 + j * 6;
+        let pd = 1 + spec.local_poses_dim() as usize;
         let ld = rep.local.dim as usize;
         let gd = rep.global.dim as usize;
         let vq = spec.vq;
         let (heads, codes, cw) = (vq.num_heads as usize, vq.codes_per_head as usize, (vq.code_dim / vq.num_heads) as usize);
-
-        // Constant token embedding of the release config (every token masked at the single step):
-        // FCBlock(pose_token_emb[h * (codes + 1) + mask_id] for each head), split into 4 frames.
-        let emb = l.vec("pose.pose_token_emb.weight")?;
-        let tok: Vec<f32> = (0..heads).flat_map(|h| emb[(h * (codes + 1) + codes) * cw..(h * (codes + 1) + codes + 1) * cw].to_vec()).collect();
-        let fc = |p: &str| -> Result<(Vec<f32>, Vec<f32>, usize, usize)> {
-            let s = l.shape(&format!("{p}.weight"));
-            Ok((l.vec(&format!("{p}.weight"))?, l.vec(&format!("{p}.bias"))?, s[0], s[1]))
-        };
-        let (w0, b0, n0, k0) = fc("pose.proj_pose_token_emb.fc_layers.0")?;
-        let (w1, b1, n1, k1) = fc("pose.proj_pose_token_emb.fc_layers.1")?;
-        let (w2, b2, n2, k2) = fc("pose.proj_pose_token_emb.forward_projection")?;
-        // Mirror the network's precision: weights and every intermediate rounded to T.
-        let rt = |v: Vec<f32>| prec.decode(&prec.encode(&v));
-        let leaky_t = |v: Vec<f32>| v.into_iter().map(|x| prec.decode(&prec.encode(&[x * 0.01]))[0].max(x)).collect::<Vec<f32>>();
-        let (w0, b0, w1, b1, w2, b2) = (rt(w0), rt(b0), rt(w1), rt(b1), rt(w2), rt(b2));
-        let h0 = leaky_t(rt(cpu_linear(&rt(tok), &w0, &b0, n0, k0)));
-        let h1 = leaky_t(rt(cpu_linear(&h0, &w1, &b1, n1, k1)));
-        let token_const = rt(cpu_linear(&h1, &w2, &b2, n2, k2)); // 640 = 4 frames x 160
-        let _ = leaky;
-
-        // Rig.
-        let (rig_f, rig_i, soma_capture, soma_standard) = match spec.kind {
-            Kind::UnitreeG1 => {
-                let a = load_npz_bytes(G1_RIG)?;
-                let mapping = a["mujoco_indices_to_motion_indices"].to_i32();
-                let q2t = a["rot_offsets_q2t"].to_f32();
-                let q2t_mapped: Vec<f32> = mapping.iter().flat_map(|&m| q2t[m as usize * 9..m as usize * 9 + 9].to_vec()).collect();
-                let f: Vec<f32> = [
-                    a["mujoco_to_motion_matrix"].to_f32(),
-                    a["mujoco_joint_axis_values_mujoco_space"].to_f32(),
-                    q2t_mapped,
-                    a["capture_neutral_joints_mujoco"].to_f32(),
-                    a["neutral_joints"].to_f32(),
-                    a["rot_offsets_f2q"].to_f32(),
-                    a["mujoco_joint_axis_values_motion_space"].to_f32(),
-                ]
-                .concat();
-                let i: Vec<i32> = [
-                    a["mujoco_joint_including_root_parent_list"].to_i32(),
-                    a["joint_parents"].to_i32(),
-                    a["motion_indices_to_mujoco_indices"].to_i32(),
-                    mapping,
-                ]
-                .concat();
-                let ib = gpu.buffer(i.len());
-                ib.as_mut_slice().copy_from_slice(&i.iter().map(|&v| f32::from_bits(v as u32)).collect::<Vec<_>>());
-                (gpu.upload(&f), ib, gpu.buffer(4), gpu.buffer(4))
-            }
-            Kind::Soma => {
-                let a = load_npz_bytes(SOMA_RIG)?;
-                (gpu.buffer(4), gpu.buffer(4), gpu.upload(&a["capture_offsets"].to_f32()), gpu.upload(&a["standard_offsets"].to_f32()))
-            }
-        };
+        let token_const = token_const(&l, prec, heads, codes, cw)?;
+        let rig = rig(&gpu, &spec)?;
         let [g, lr, lp, lb] = rep.stats_f32()?;
         let stats = gpu.upload(&[g.0, g.1, lr.0, lr.1, lp.0, lp.1].concat());
         let body_stats = gpu.upload(&[lb.0, lb.1].concat());
-
-        let pos_table = |name: &str, n: usize| -> Result<Buf> {
-            let v = l.vec(name)?; // (seq, 1, dim)
-            Ok(gpu.upload_t(&v[..n * (v.len() / l.shape(name)[0])]))
-        };
         let sp = spec.root;
         let pp = spec.pose;
-        let model = MetalModel {
+        let inputs = Self::input_layout(&spec)?;
+        let mut model = MetalModel {
             proj_local_pose: l.lin("root.proj_local_pose")?,
             proj_local_root: l.lin("root.proj_local_root_value")?,
             proj_global_root: l.lin("root.proj_global_root_value")?,
@@ -372,7 +344,7 @@ impl MetalModel {
             fc_end: l.fc("root.proj_end_input")?,
             input_pos: l.buf("root.input_position_emb.weight")?,
             query_emb: l.buf("root.proj_input_num_tokens.weight")?,
-            root_pos: pos_table("root.position_emb.embed", 16)?,
+            root_pos: l.pos_table("root.position_emb.embed", 16)?,
             logit_head: l.lin("root.proj_num_token_output_logit")?,
             middle_emb: l.buf("root.middle_token_emb.weight")?,
             shared: Transformer::load(&gpu, &loaded.tensors, "root.shared_transformer_model", sp.n_layers_shared, sp.n_head as usize, int8)?,
@@ -381,29 +353,19 @@ impl MetalModel {
             p_root: l.lin("pose.proj_local_root_values")?,
             p_local_pose: l.lin("pose.proj_local_pose")?,
             len_emb: l.buf("pose.proj_num_valid_positions.weight")?,
-            len_emb_host: l.vec("pose.proj_num_valid_positions.weight")?,
             p_input: l.lin("pose.proj_input.0")?,
-            pose_pos: pos_table("pose.position_emb.embed", 16)?,
+            pose_pos: l.pos_table("pose.position_emb.embed", 16)?,
             pose_tf: Transformer::load(&gpu, &loaded.tensors, "pose.transformer_model", pp.n_layers, pp.n_head as usize, int8)?,
             p_logits: l.lin("pose.proj_pose_output_logit")?,
             token_const: gpu.upload_t(&token_const),
             codebook: l.buf("vqvae.quantizer.vq.codebook.embed")?,
-            codebook_host: l.vec("vqvae.quantizer.vq.codebook.embed")?,
             vq_dec: l.decoder("vqvae.decoder")?,
-            rig_f,
-            rig_i,
-            soma_capture,
-            soma_standard,
+            rig,
             stats,
             body_stats,
-            b: Self::alloc(&gpu, max_batch, pd, ld, gd, heads, codes, cw),
-            pso: [
-                "prep", "soma_retarget", "g1_preprocess", "root_assemble", "root_second_input", "root_dense_cond", "copy_rows",
-                "root_to_pose", "argmax_dequant", "finish_root", "body_out", "g1_postprocess",
-            ]
-            .into_iter()
-            .map(|n| Ok((n, gpu.pipeline(n)?)))
-            .collect::<Result<_>>()?,
+            b: Self::alloc(&gpu, max_batch, pd, ld, gd, heads, codes, cw, spec.kind == Kind::Soma),
+            glue: Glue::new(&gpu)?,
+            inputs,
             k,
             spec,
             max_batch,
@@ -414,12 +376,96 @@ impl MetalModel {
             gd,
             gpu,
         };
+        model.validate().with_context(|| format!("{} checkpoint does not match the Metal runtime's layout", model.spec.name))?;
+        model.warm_up()?;
         Ok(model)
     }
 
+    /// Check every weight and table against the buffer layout and kernels (shapes the encoders
+    /// and `model.metal` assume), so a mismatching checkpoint fails here instead of reading or
+    /// writing out of bounds on the GPU.
+    fn validate(&self) -> Result<()> {
+        let lin = |name: &str, l: &Lin, n: usize, k: usize| -> Result<()> {
+            ensure!(l.n == n && l.k == k, "{name}: {}x{} weight, expected {n}x{k}", l.n, l.k);
+            Ok(())
+        };
+        let len = |name: &str, b: &Buf, want: usize| -> Result<()> {
+            ensure!(b.len() == want, "{name}: {} values, expected {want}", b.len());
+            Ok(())
+        };
+        let at_least = |name: &str, b: &Buf, want: usize| -> Result<()> {
+            ensure!(b.len() >= want, "{name}: {} values, need {want}", b.len());
+            Ok(())
+        };
+        let (pd, ld, gd) = (self.pd, self.ld, self.gd);
+        let vq = self.spec.vq;
+        let (heads, codes, cw) = (vq.num_heads as usize, vq.codes_per_head as usize, (vq.code_dim / vq.num_heads) as usize);
+        let choices = config::NUM_TOKEN_CHOICES as usize;
+        ensure!(ld > 4 && gd == ld + 1, "layouts: local {ld}, global {gd} (expected global = local + 1)");
+        // Root network: inputs -> x0 (B*8, 384), FC blocks -> (B*8, 512).
+        lin("root.proj_local_pose", &self.proj_local_pose, X0[0], pd)?;
+        lin("root.proj_local_root_value", &self.proj_local_root, X0[1], 4)?;
+        lin("root.proj_global_root_value", &self.proj_global_root, X0[2], 5)?;
+        len("root.no_local_pose_emb", &self.no_local_pose, X0[0])?;
+        len("root.no_local_root_emb", &self.no_local_root, X0[1])?;
+        len("root.no_global_root_emb", &self.no_global_root, X0[2])?;
+        len("root.conv_no_frame_emb", &self.no_frame, E)?;
+        for (name, f) in [("root.proj_start_input", &self.fc_start), ("root.proj_end_input", &self.fc_end)] {
+            let [a, b] = [&f.layers[0], &f.layers[1]];
+            ensure!(a.k == X0_W && b.k == a.n && f.proj.k == b.n, "{name}: layer shapes do not chain from {X0_W}");
+            ensure!(a.n <= E && b.n <= E && f.proj.n == E, "{name}: layers wider than {E} or projection not {E}");
+        }
+        at_least("root.input_position_emb.weight", &self.input_pos, 8 * E)?;
+        at_least("root.proj_input_num_tokens.weight", &self.query_emb, (config::MASKED_NUM_TOKENS - config::MIN_TOKENS + 1) as usize * E)?;
+        len("root.position_emb.embed", &self.root_pos, 16 * E)?;
+        lin("root.proj_num_token_output_logit", &self.logit_head, 12, E)?;
+        at_least("root.middle_token_emb.weight", &self.middle_emb, choices * E)?;
+        // Transformers: scratch holds TF_LEN tokens of width TF_D and FFN TF_FFN; attention kernels.
+        for (name, t, d, l) in [("root.shared_transformer_model", &self.shared, E, 9), ("root.root_token_transformer_model", &self.root_token, E, 25), ("pose.transformer_model", &self.pose_tf, POSE_E, 16)] {
+            ensure!(t.d == d && t.ffn <= TF_FFN && l <= TF_LEN, "{name}: width {} / FFN {} (expected width {d}, FFN <= {TF_FFN})", t.d, t.ffn);
+            ensure!(Kernels::attention_supported(l, t.d / t.heads), "{name}: no attention kernel for {l} tokens of head dim {}", t.d / t.heads);
+        }
+        self.root_dec.check("root.conv_output", E, 5, E, 5, DEC_W)?;
+        // Pose network.
+        lin("pose.proj_local_root_values", &self.p_root, 256, 16)?;
+        lin("pose.proj_local_pose", &self.p_local_pose, POSE_FRAME, pd)?;
+        len("pose token embedding", &self.token_const, 4 * POSE_FRAME)?;
+        at_least("pose.proj_num_valid_positions.weight", &self.len_emb, choices * LEN_W)?;
+        lin("pose.proj_input.0", &self.p_input, POSE_E, 4 * POSE_FRAME + 256 + LEN_W)?;
+        len("pose.position_emb.embed", &self.pose_pos, 16 * POSE_E)?;
+        lin("pose.proj_pose_output_logit", &self.p_logits, heads * codes, POSE_E)?;
+        len("vqvae.quantizer.vq.codebook.embed", &self.codebook, heads * codes * cw)?;
+        self.vq_dec.check("vqvae.decoder", heads * cw, pd, 2, ld, DEC_W)?;
+        // Statistics (prep / root_to_pose / finish_root / body_out).
+        len("statistics", &self.stats, 18 + 2 * pd)?;
+        len("body statistics", &self.body_stats, 2 * (ld - 4))?;
+        ensure!(self.b.tf.fits(self.max_batch * TF_LEN, TF_D, TF_FFN), "transformer scratch too small");
+        Ok(())
+    }
+
+    /// Compile every GEMM pipeline variant the plans can pick for batch 1..=max_batch (by
+    /// recording each batch's generation and discarding it unrun), then size the split-K partial
+    /// buffer: `max_splits * max(M * N)` over those launches, capped at [`PARTIAL_MAX`]. Every
+    /// plan therefore resolves exactly as with a `PARTIAL_MAX` buffer.
+    fn warm_up(&mut self) -> Result<()> {
+        self.k.begin_warm_up();
+        *self.k.log.borrow_mut() = Some(Vec::new());
+        for b in 1..=self.max_batch {
+            let mut rec = Recorder::new(&self.gpu);
+            self.encode(&mut rec, &self.dims(b, false));
+            rec.discard();
+        }
+        let log = self.k.log.borrow_mut().take().unwrap_or_default();
+        self.k.end_warm_up().context("compiling GEMM pipelines")?;
+        let max_mn = log.iter().map(|(p, _)| p.m as usize * p.n as usize).max().unwrap_or(0);
+        self.k.set_partial_len(PARTIAL_MAX.min(self.k.max_splits() * max_mn));
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn alloc(gpu: &Gpu, b: usize, pd: usize, ld: usize, gd: usize, heads: usize, codes: usize, cw: usize) -> Bufs {
+    fn alloc(gpu: &Gpu, b: usize, pd: usize, ld: usize, gd: usize, heads: usize, codes: usize, cw: usize, soma: bool) -> Bufs {
         let f = |n: usize| gpu.buffer(n); // float32 (inputs, masks, rig, outputs)
+        let i = |n: usize| gpu.buffer_i32(n); // int32 (durations, tokens)
         let t = |n: usize| gpu.buffer_t(n); // network element type
         Bufs {
             ctx: f(b * 4 * 36),
@@ -431,7 +477,8 @@ impl MetalModel {
             hl: f(b * 8),
             hp: f(b * 8),
             allowed: f(b * 11),
-            nt_in: f(b),
+            nt_in: i(b),
+            lp_rt: f(if soma { b * 8 * (pd - 1) } else { 0 }),
             gn: f(b * 8 * 5),
             ln: f(b * 8 * 4),
             pn: f(b * 8 * pd),
@@ -439,92 +486,123 @@ impl MetalModel {
             ln_t: t(b * 8 * 4),
             pn_t: t(b * 8 * pd),
             info: f(b * 4),
-            x0: t(b * 8 * 384),
-            fa: t(b * 8 * 512),
-            fb: t(b * 8 * 512),
-            s: t(b * 8 * 512),
-            e: t(b * 8 * 512),
-            fe: t(b * 8 * 512),
-            x1: t(b * 9 * 512),
+            x0: t(b * 8 * X0_W),
+            fa: t(b * 8 * E),
+            fb: t(b * 8 * E),
+            s: t(b * 8 * E),
+            e: t(b * 8 * E),
+            fe: t(b * 8 * E),
+            x1: t(b * 9 * E),
             log1: t(b * 9 * 12),
-            x2: t(b * 25 * 512),
+            x2: t(b * 25 * E),
             pad2: f(b * 25),
-            nt: f(b),
+            nt: i(b),
             m16: f(b * 16),
             m32: f(b * 32),
             m64: f(b * 64),
             ppad: f(b * 16),
             logits: f(b * 12),
-            dec_in: t(b * 16 * 512),
-            dframe: t(b * 64 * 512),
+            dec_in: t(b * 16 * E),
+            dframe: t(b * 64 * E),
             droot: t(b * 64 * 5),
             dhas: f(b * 64),
             pr: t(b * 64 * 5),
-            h: t(b * 64 * 512),
-            h2: t(b * 64 * 512),
-            t1: t(b * 64 * 512),
+            h: t(b * 64 * DEC_W),
+            h2: t(b * 64 * DEC_W),
+            t1: t(b * 64 * DEC_W),
             ext: t(b * 64 * 2),
             rcond: t(b * 64 * 4),
             pcond: t(b * 64 * pd),
             hpc: f(b * 64),
-            le: t(b * 16 * 128),
+            le: t(b * 16 * LEN_W),
             re: t(b * 16 * 256),
-            pe: t(b * 64 * 160),
-            px: t(b * 16 * 1024),
+            pe: t(b * 64 * POSE_FRAME),
+            px: t(b * 16 * POSE_E),
             plog: t(b * 16 * heads * codes),
-            tokens: f(b * 16 * heads),
+            tokens: i(b * 16 * heads),
             lat: t(b * 16 * heads * cw),
             recon: t(b * 64 * ld),
             out: f(b * 64 * gd),
             qpos: f(b * 64 * 36),
             contacts: f(b * 64 * 4),
-            tf: Scratch::new(gpu, b * 25, 1024, 2048),
+            tf: Scratch::new(gpu, b * TF_LEN, TF_D, TF_FFN),
         }
     }
 
+    /// The ONNX inputs of `spec` ([`ModelSpec::input_names`], masks per [`config::is_mask_input`])
+    /// with their buffers and shapes.
+    fn input_layout(spec: &ModelSpec) -> Result<Vec<Input>> {
+        let frames = config::CONTEXT_AND_TARGET;
+        ensure!(spec.input_names().len() <= MAX_INPUTS, "{} inputs", spec.input_names().len());
+        spec.input_names()
+            .iter()
+            .map(|&name| {
+                let (slot, row, row_dims) = match name {
+                    "context_qpos" => (Slot::Ctx, [4, config::G1_QPOS_DIM], 2),
+                    "target_qpos" => (Slot::Tgt, [4, config::G1_QPOS_DIM], 2),
+                    "global_root_values" => (Slot::GrIn, [frames, 5], 2),
+                    "local_root_values" => (Slot::LrIn, [frames, 4], 2),
+                    "local_poses" => (Slot::LpIn, [frames, spec.local_poses_dim()], 2),
+                    "has_global_root_values" => (Slot::Hg, [frames, 0], 1),
+                    "has_local_root_values" => (Slot::Hl, [frames, 0], 1),
+                    "has_local_poses" => (Slot::Hp, [frames, 0], 1),
+                    "allowed_pred_num_tokens" => (Slot::Allowed, [config::NUM_TOKEN_CHOICES, 0], 1),
+                    other => bail!("the Metal runtime has no buffer for input {other}"),
+                };
+                Ok(Input { name, slot, mask: config::is_mask_input(name), row, row_dims })
+            })
+            .collect()
+    }
+
+    /// Kernel dimensions of a generation of `b` requests (1..=max_batch; panics otherwise, since
+    /// the buffers hold `max_batch` requests).
     pub fn dims(&self, b: usize, forced: bool) -> Dims {
+        assert!((1..=self.max_batch).contains(&b), "batch {b} outside 1..={}", self.max_batch);
         let vq = self.spec.vq;
         Dims {
             b: b as i32,
             pd: self.pd as i32,
             ld: self.ld as i32,
             gd: self.gd as i32,
-            e: 512,
+            e: E as i32,
             h: vq.num_heads,
             codes: vq.codes_per_head,
             cw: vq.code_dim / vq.num_heads,
-            len_w: 128,
+            len_w: LEN_W as i32,
             forced: forced as i32,
         }
     }
 
-    fn launch(&self, rec: &mut Recorder, kernel: &str, args: &[Arg], threads: usize) {
-        rec.dispatch(&self.pso[kernel], args, (threads.div_ceil(256), 1, 1), (256, 1, 1));
+    fn launch(&self, rec: &mut Recorder, pso: &Pipeline, args: &[Arg], threads: usize) {
+        rec.dispatch(pso, args, (threads.div_ceil(256), 1, 1), (256, 1, 1));
     }
 
     // -- stages ----------------------------------------------------------------------------------
 
     /// Rig preprocessing (G1 forward kinematics / SOMA capture->standard) and normalization.
+    /// Leaves the input buffers unchanged, so a generation can be encoded again.
     pub fn encode_input(&self, rec: &mut Recorder, d: &Dims) {
         let (b, n) = (&self.b, d.b as usize);
-        match self.spec.kind {
+        let lp = match self.spec.kind {
             Kind::UnitreeG1 => {
-                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig_f, 0), Arg::Buf(&self.rig_i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(as_bytes(d))];
-                rec.dispatch(&self.pso["g1_preprocess"], &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
+                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(as_bytes(d))];
+                rec.dispatch(&self.glue.g1_preprocess, &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
+                &b.lp_in
             }
             Kind::Soma => {
                 let j = self.spec.num_joints;
-                let p = [(n * 8) as i32, (self.pd - 1) as i32, (j - 1) * 3, j];
-                let args = [Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.soma_capture, 0), Arg::Buf(&self.soma_standard, 0), Arg::Bytes(as_bytes(&p))];
-                self.launch(rec, "soma_retarget", &args, n * 8 * j as usize);
+                let p = RetargetParams { rows: (n * 8) as i32, ld: (self.pd - 1) as i32, col0: (j - 1) * 3, joints: j, copy_pos: 1 };
+                let args = [Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Bytes(as_bytes(&p)), Arg::Buf(&b.lp_rt, 0)];
+                self.launch(rec, &self.glue.soma_retarget, &args, n * 8 * j as usize);
+                &b.lp_rt
             }
-        }
+        };
         let args = [
-            Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0),
+            Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(lp, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0),
             Arg::Buf(&b.ln, 0), Arg::Buf(&b.pn, 0), Arg::Buf(&b.info, 0), Arg::Bytes(as_bytes(d)), Arg::Buf(&b.gn_t, 0),
             Arg::Buf(&b.ln_t, 0), Arg::Buf(&b.pn_t, 0),
         ];
-        self.launch(rec, "prep", &args, n * 8);
+        self.launch(rec, &self.glue.prep, &args, n * 8);
     }
 
     fn fcblock(&self, rec: &mut Recorder, f: &FcBlock, x: &Buf, rows: usize, out: &Buf) {
@@ -552,51 +630,41 @@ impl MetalModel {
         self.k.run(rec, &g);
     }
 
+    /// Conv1d over `n_batch` sequences of `t` frames (at the output resolution).
     #[allow(clippy::too_many_arguments)]
-    fn conv(&self, rec: &mut Recorder, c: &Conv, x: &Buf, t: usize, n_batch: usize, y: &Buf, amask: Option<&Buf>, a_relu: bool, act: i32, ymask: Option<&Buf>, up: bool, res: Option<&Buf>) {
+    fn conv(&self, rec: &mut Recorder, c: &Conv, x: &Buf, t: usize, n_batch: usize, y: &Buf, o: ConvOpts) {
         let rows = n_batch * t;
         let mut p = GemmParams::new(rows, c.n, c.taps * c.cin);
         p.lda = c.cin as i32;
-        p.act = act;
-        p.a_relu = a_relu as i32;
-        p.has_mask = amask.is_some() as i32;
-        p.y_mask = ymask.is_some() as i32;
+        p.act = o.act;
+        p.a_relu = o.a_relu as i32;
+        p.has_mask = o.amask.is_some() as i32;
+        p.y_mask = o.ymask.is_some() as i32;
         if c.taps > 1 {
             p.conv_taps = c.taps as i32;
             p.conv_t = t as i32;
             p.conv_cin = c.cin as i32;
             p.conv_dil = c.dil as i32;
-            p.conv_up = if up { 2 } else { 1 };
+            p.conv_up = if o.up { 2 } else { 1 };
         }
-        if res.is_some() {
+        if o.res.is_some() {
             p.has_res = 1;
             p.ldr = c.n as i32;
         }
         let mut g = GemmCall::new(x, &c.w, &c.b, y, p);
-        g.amask = amask;
-        g.ymask = ymask;
-        g.res = res.map(|r| (r, 0));
+        g.amask = o.amask;
+        g.ymask = o.ymask;
+        g.res = o.res.map(|r| (r, 0));
         self.k.run(rec, &g);
     }
 
     /// `DoubleCondDecoder` (layers.py) for `n` sequences: x (n*16, cin) -> out (n*64, cout).
     #[allow(clippy::too_many_arguments)]
     fn decoder(&self, rec: &mut Recorder, dec: &Decoder, n: usize, x: &Buf, ext: &Buf, ext_dim: usize, tgt: &Buf, has_tgt: &Buf, out: &Buf) {
-        self.decoder_limited(rec, dec, n, x, ext, ext_dim, tgt, has_tgt, out, usize::MAX);
-    }
-
-    /// Debug: encode only the first `limit` decoder steps (0: conv0 only; 1: + level-0 target; 2: + ext; ...).
-    #[allow(clippy::too_many_arguments)]
-    fn decoder_limited(&self, rec: &mut Recorder, dec: &Decoder, n: usize, x: &Buf, ext: &Buf, ext_dim: usize, tgt: &Buf, has_tgt: &Buf, out: &Buf, limit: usize) {
         let b = &self.b;
         let masks = [&b.m16, &b.m32, &b.m64];
-        let mut step = 0usize;
-        #[allow(unused_assignments)]
-        let _ = step;
-        macro_rules! budget { () => { if step >= limit { return; } #[allow(unused_assignments)] { step += 1; } } }
-        self.conv(rec, &dec.conv0, x, 16, n, &b.h, Some(&b.m16), false, ACT_RELU, None, false, None);
+        self.conv(rec, &dec.conv0, x, 16, n, &b.h, ConvOpts { amask: Some(&b.m16), act: ACT_RELU, ..Default::default() });
         for (i, lvl) in dec.levels.iter().enumerate() {
-            budget!();
             let fpp = 4 >> i;
             let p_len = 16 << i;
             // Overwrite the frames that carry a target pose (predicated rows of h viewed as frames).
@@ -606,12 +674,11 @@ impl MetalModel {
             let mut g = GemmCall::new(tgt, &lvl.target.w, &lvl.target.b, &b.h, p);
             g.ymask = Some(has_tgt);
             self.k.run(rec, &g);
-            budget!();
             // h = relu(Linear([h, external.reshape(n, P, -1)]))
             let mut p = GemmParams::new(n * p_len, lvl.ext.n, lvl.ext.k);
             p.act = ACT_RELU;
-            p.lda = 512;
-            p.k1 = 512;
+            p.lda = DEC_W as i32;
+            p.k1 = DEC_W as i32;
             p.k2 = (fpp * ext_dim) as i32;
             p.lda2 = (fpp * ext_dim) as i32;
             let mut g = GemmCall::new(&b.h, &lvl.ext.w, &lvl.ext.b, &b.h2, p);
@@ -619,68 +686,57 @@ impl MetalModel {
             self.k.run(rec, &g);
             let m = masks[i];
             for (c1, c2) in &lvl.res {
-                budget!();
-                self.conv(rec, c1, &b.h2, p_len, n, &b.t1, Some(m), true, 0, None, false, None);
-                self.conv(rec, c2, &b.t1, p_len, n, &b.h2, Some(m), true, 0, Some(m), false, Some(&b.h2));
+                self.conv(rec, c1, &b.h2, p_len, n, &b.t1, ConvOpts { amask: Some(m), a_relu: true, ..Default::default() });
+                self.conv(rec, c2, &b.t1, p_len, n, &b.h2, ConvOpts { amask: Some(m), a_relu: true, ymask: Some(m), res: Some(&b.h2), ..Default::default() });
             }
-            budget!();
-            self.conv(rec, &lvl.up, &b.h2, p_len * 2, n, &b.h, Some(masks[i + 1]), false, 0, None, true, None);
+            self.conv(rec, &lvl.up, &b.h2, p_len * 2, n, &b.h, ConvOpts { amask: Some(masks[i + 1]), up: true, ..Default::default() });
         }
-        budget!();
-        self.conv(rec, &dec.post, &b.h, 64, n, &b.h2, Some(&b.m64), false, ACT_RELU, Some(&b.m64), false, None);
-        budget!();
-        self.conv(rec, &dec.out, &b.h2, 64, n, out, None, false, 0, Some(&b.m64), false, None);
+        self.conv(rec, &dec.post, &b.h, 64, n, &b.h2, ConvOpts { amask: Some(&b.m64), act: ACT_RELU, ymask: Some(&b.m64), ..Default::default() });
+        self.conv(rec, &dec.out, &b.h2, 64, n, out, ConvOpts { ymask: Some(&b.m64), ..Default::default() });
     }
 
     /// Root network from gn/ln/pn + masks: durations (nt, token masks, logits) and the root path pr.
     pub fn encode_root(&self, rec: &mut Recorder, d: &Dims) {
         self.encode_root_a(rec, d);
-        self.encode_root_b(rec, d, usize::MAX, true);
+        self.encode_root_b(rec, d);
     }
 
     /// First half of the root network: duration head, second-transformer input, dense conditions.
     pub fn encode_root_a(&self, rec: &mut Recorder, d: &Dims) {
         let (b, n) = (&self.b, d.b as usize);
         let rows = n * 8;
-        self.blend_linear(rec, &self.proj_local_pose, &b.pn_t, rows, &b.x0, 0, 384, &b.hp, &self.no_local_pose, 1);
-        self.blend_linear(rec, &self.proj_local_root, &b.ln_t, rows, &b.x0, 256, 384, &b.hl, &self.no_local_root, 1);
-        self.blend_linear(rec, &self.proj_global_root, &b.gn_t, rows, &b.x0, 320, 384, &b.hg, &self.no_global_root, 1);
+        self.blend_linear(rec, &self.proj_local_pose, &b.pn_t, rows, &b.x0, 0, X0_W, &b.hp, &self.no_local_pose, 1);
+        self.blend_linear(rec, &self.proj_local_root, &b.ln_t, rows, &b.x0, X0[0], X0_W, &b.hl, &self.no_local_root, 1);
+        self.blend_linear(rec, &self.proj_global_root, &b.gn_t, rows, &b.x0, X0[0] + X0[1], X0_W, &b.hg, &self.no_global_root, 1);
         self.fcblock(rec, &self.fc_start, &b.x0, rows, &b.s);
         self.fcblock(rec, &self.fc_end, &b.x0, rows, &b.e);
         let args = [Arg::Buf(&b.s, 0), Arg::Buf(&b.e, 0), Arg::Buf(&self.input_pos, 0), Arg::Buf(&self.query_emb, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.x1, 0), Arg::Buf(&b.fe, 0), Arg::Bytes(as_bytes(d))];
-        self.launch(rec, "root_assemble", &args, n * 9 * 512);
+        self.launch(rec, &self.glue.root_assemble, &args, n * 9 * E);
         self.shared.encode(&self.k, rec, &b.x1, None, n, 9, &b.tf);
-        self.k.run(rec, &GemmCall::new(&b.x1, &self.logit_head.w, &self.logit_head.b, &b.log1, GemmParams::new(n * 9, 12, 512)));
+        self.k.run(rec, &GemmCall::new(&b.x1, &self.logit_head.w, &self.logit_head.b, &b.log1, GemmParams::new(n * 9, 12, E)));
         let args = [
             Arg::Buf(&b.log1, 0), Arg::Buf(&b.allowed, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.fe, 0), Arg::Buf(&self.middle_emb, 0),
             Arg::Buf(&self.root_pos, 0), Arg::Buf(&b.x2, 0), Arg::Buf(&b.pad2, 0), Arg::Buf(&b.nt, 0), Arg::Buf(&b.m16, 0),
             Arg::Buf(&b.logits, 0), Arg::Bytes(as_bytes(d)), Arg::Buf(&b.m32, 0), Arg::Buf(&b.m64, 0), Arg::Buf(&b.ppad, 0),
             Arg::Buf(&self.input_pos, 0),
         ];
-        self.launch(rec, "root_second_input", &args, n * 25 * 512);
+        self.launch(rec, &self.glue.root_second_input, &args, n * 25 * E);
         let args = [
             Arg::Buf(&b.fe, 0), Arg::Buf(&b.gn, 0), Arg::Buf(&b.hg, 0), Arg::Buf(&b.hl, 0), Arg::Buf(&b.hp, 0),
             Arg::Buf(&self.no_frame, 0), Arg::Buf(&b.nt, 0), Arg::Buf(&b.dframe, 0), Arg::Buf(&b.droot, 0), Arg::Buf(&b.dhas, 0),
             Arg::Bytes(as_bytes(d)),
         ];
-        self.launch(rec, "root_dense_cond", &args, n * 64 * 512);
+        self.launch(rec, &self.glue.root_dense_cond, &args, n * 64 * E);
     }
 
-    /// Second half of the root network (debug entry: `transformer` false skips it, `limit` caps the decoder).
-    pub fn encode_root_b(&self, rec: &mut Recorder, d: &Dims, limit: usize, transformer: bool) {
+    /// Second half of the root network: root-token transformer and the root path decoder.
+    pub fn encode_root_b(&self, rec: &mut Recorder, d: &Dims) {
         let (b, n) = (&self.b, d.b as usize);
-        if transformer {
-            self.root_token.encode(&self.k, rec, &b.x2, Some(&b.pad2), n, 25, &b.tf);
-        }
-        let (p, w) = ([n as i32, 25, 16, 9], 512i32);
+        self.root_token.encode(&self.k, rec, &b.x2, Some(&b.pad2), n, 25, &b.tf);
+        let (p, w) = ([n as i32, 25, 16, 9], E as i32);
         let args = [Arg::Buf(&b.x2, 0), Arg::Buf(&b.dec_in, 0), Arg::Bytes(as_bytes(&p)), Arg::Bytes(as_bytes(&w))];
-        self.launch(rec, "copy_rows", &args, n * 16 * 512);
-        self.decoder_limited(rec, &self.root_dec, n, &b.dec_in, &b.dframe, 512, &b.droot, &b.dhas, &b.pr, limit);
-    }
-
-    /// Debug access to decoder scratch buffers (h, h2, t1).
-    pub fn scratch(&self) -> [&Buf; 3] {
-        [&self.b.h, &self.b.h2, &self.b.t1]
+        self.launch(rec, &self.glue.copy_rows, &args, n * 16 * E);
+        self.decoder(rec, &self.root_dec, n, &b.dec_in, &b.dframe, E, &b.droot, &b.dhas, &b.pr);
     }
 
     /// Root path -> pose conditions (global_root_to_local, last-frame patch, dense pose conditions).
@@ -691,23 +747,23 @@ impl MetalModel {
             Arg::Buf(&b.pn, 0), Arg::Buf(&b.hp, 0), Arg::Buf(&self.len_emb, 0), Arg::Buf(&b.ext, 0), Arg::Buf(&b.rcond, 0),
             Arg::Buf(&b.pcond, 0), Arg::Buf(&b.hpc, 0), Arg::Buf(&b.le, 0), Arg::Bytes(as_bytes(d)),
         ];
-        self.launch(rec, "root_to_pose", &args, n * 64);
+        self.launch(rec, &self.glue.root_to_pose, &args, n * 64);
     }
 
     /// Pose network (single MaskGIT step) from rcond/pcond/hpc/le/ppad: logits, tokens, latents.
     pub fn encode_pose(&self, rec: &mut Recorder, d: &Dims) {
         let (b, n) = (&self.b, d.b as usize);
         self.k.run(rec, &GemmCall::new(&b.rcond, &self.p_root.w, &self.p_root.b, &b.re, GemmParams::new(n * 16, 256, 16)));
-        self.blend_linear(rec, &self.p_local_pose, &b.pcond, n * 64, &b.pe, 0, 160, &b.hpc, &self.token_const, 4);
-        let mut p = GemmParams::new(n * 16, 1024, 1024);
+        self.blend_linear(rec, &self.p_local_pose, &b.pcond, n * 64, &b.pe, 0, POSE_FRAME, &b.hpc, &self.token_const, 4);
+        let mut p = GemmParams::new(n * 16, POSE_E, POSE_E);
         p.act = ACT_RELU;
-        p.lda = 640;
-        p.k1 = 640;
+        p.lda = (4 * POSE_FRAME) as i32;
+        p.k1 = (4 * POSE_FRAME) as i32;
         p.k2 = 256;
         p.lda2 = 256;
-        p.lda3 = 128;
+        p.lda3 = LEN_W as i32;
         p.has_res = 1;
-        p.ldr = 1024;
+        p.ldr = POSE_E as i32;
         p.r_mod = 16;
         let mut g = GemmCall::new(&b.pe, &self.p_input.w, &self.p_input.b, &b.px, p);
         g.a2 = Some(&b.re);
@@ -716,9 +772,9 @@ impl MetalModel {
         self.k.run(rec, &g);
         self.pose_tf.encode(&self.k, rec, &b.px, Some(&b.ppad), n, 16, &b.tf);
         let nl = self.p_logits.n;
-        self.k.run(rec, &GemmCall::new(&b.px, &self.p_logits.w, &self.p_logits.b, &b.plog, GemmParams::new(n * 16, nl, 1024)));
+        self.k.run(rec, &GemmCall::new(&b.px, &self.p_logits.w, &self.p_logits.b, &b.plog, GemmParams::new(n * 16, nl, POSE_E)));
         let args = [Arg::Buf(&b.plog, 0), Arg::Buf(&self.codebook, 0), Arg::Buf(&b.tokens, 0), Arg::Buf(&b.lat, 0), Arg::Bytes(as_bytes(d))];
-        self.launch(rec, "argmax_dequant", &args, n * 16 * self.spec.vq.num_heads as usize);
+        self.launch(rec, &self.glue.argmax_dequant, &args, n * 16 * self.spec.vq.num_heads as usize);
     }
 
     /// VQ-VAE decoder from lat/ext/pcond/hpc + token masks -> recon (normalized local features).
@@ -735,19 +791,20 @@ impl MetalModel {
             Arg::Buf(&b.recon, 0), Arg::Buf(&b.pr, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0), Arg::Buf(&b.hg, 0),
             Arg::Buf(&b.nt, 0), Arg::Buf(&b.info, 0), Arg::Buf(&b.out, 0), Arg::Bytes(as_bytes(d)), Arg::Bytes(as_bytes(&mode)),
         ];
-        rec.dispatch(&self.pso["finish_root"], &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
+        rec.dispatch(&self.glue.finish_root, &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
         let args = [Arg::Buf(&b.recon, 0), Arg::Buf(&self.body_stats, 0), Arg::Buf(&b.out, 0), Arg::Bytes(as_bytes(d))];
-        self.launch(rec, "body_out", &args, n * 64 * (self.ld - 4));
+        self.launch(rec, &self.glue.body_out, &args, n * 64 * (self.ld - 4));
         match self.spec.kind {
             Kind::Soma => {
+                // In place on the output rows.
                 let j = self.spec.num_joints;
-                let p = [(n * 64) as i32, self.gd as i32, 5 + (j - 1) * 3, j];
-                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.soma_standard, 0), Arg::Buf(&self.soma_capture, 0), Arg::Bytes(as_bytes(&p))];
-                self.launch(rec, "soma_retarget", &args, n * 64 * j as usize);
+                let p = RetargetParams { rows: (n * 64) as i32, ld: self.gd as i32, col0: 5 + (j - 1) * 3, joints: j, copy_pos: 0 };
+                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Bytes(as_bytes(&p)), Arg::Buf(&b.out, 0)];
+                self.launch(rec, &self.glue.soma_retarget, &args, n * 64 * j as usize);
             }
             Kind::UnitreeG1 => {
-                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig_f, 0), Arg::Buf(&self.rig_i, 0), Arg::Buf(&b.qpos, 0), Arg::Buf(&b.contacts, 0), Arg::Bytes(as_bytes(d))];
-                self.launch(rec, "g1_postprocess", &args, n * 64);
+                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.qpos, 0), Arg::Buf(&b.contacts, 0), Arg::Bytes(as_bytes(d))];
+                self.launch(rec, &self.glue.g1_postprocess, &args, n * 64);
             }
         }
     }
@@ -765,50 +822,70 @@ impl MetalModel {
     // -- host I/O ---------------------------------------------------------------------------------
 
     pub fn input_names(&self) -> &'static [&'static str] {
-        match self.spec.kind {
-            Kind::UnitreeG1 => &crate::model::G1_INPUTS,
-            Kind::Soma => &crate::model::SOMA_INPUTS,
+        self.spec.input_names()
+    }
+
+    /// The pose network's length embedding as loaded (`T` values).
+    pub fn len_emb(&self) -> &Buf {
+        &self.len_emb
+    }
+
+    /// The VQ codebook as loaded (`T` values).
+    pub fn codebook(&self) -> &Buf {
+        &self.codebook
+    }
+
+    fn slot(&self, s: Slot) -> &Buf {
+        let b = &self.b;
+        match s {
+            Slot::Ctx => &b.ctx,
+            Slot::Tgt => &b.tgt,
+            Slot::GrIn => &b.gr_in,
+            Slot::LrIn => &b.lr_in,
+            Slot::LpIn => &b.lp_in,
+            Slot::Hg => &b.hg,
+            Slot::Hl => &b.hl,
+            Slot::Hp => &b.hp,
+            Slot::Allowed => &b.allowed,
         }
     }
 
-    /// Copy ONNX-named inputs into the input buffers; returns the batch size.
+    /// Copy ONNX-named inputs into the input buffers; returns the batch size. Every input must
+    /// have the ONNX shape with the same batch size (1..=max_batch); masks become `!= 0`.
     pub fn upload_inputs(&self, inputs: &HashMap<String, Npy>) -> Result<usize> {
-        let get = |k: &str| inputs.get(k).ok_or_else(|| anyhow!("missing input {k}"));
-        let n = get("has_global_root_values")?.shape[0] as usize;
-        if n > self.max_batch {
-            bail!("batch {n} exceeds max_batch {}", self.max_batch);
-        }
-        let b = &self.b;
-        let copy = |dst: &Buf, src: Vec<f32>| dst.as_mut_slice()[..src.len()].copy_from_slice(&src);
-        let mask = |v: &Npy| v.to_f32().into_iter().map(|x| (x != 0.0) as i32 as f32).collect::<Vec<_>>();
-        match self.spec.kind {
-            Kind::UnitreeG1 => {
-                copy(&b.ctx, get("context_qpos")?.to_f32());
-                copy(&b.tgt, get("target_qpos")?.to_f32());
+        let mut found: [Option<&Npy>; MAX_INPUTS] = [None; MAX_INPUTS];
+        let mut batch = None;
+        for (slot, input) in found.iter_mut().zip(&self.inputs) {
+            let v = inputs.get(input.name).ok_or_else(|| anyhow!("missing input {}", input.name))?;
+            let rows = v.shape.first().copied().unwrap_or(-1);
+            let n = *batch.get_or_insert(rows);
+            let row = &input.row[..input.row_dims];
+            if v.shape.len() != 1 + row.len() || rows != n || v.shape[1..] != *row {
+                bail!("input {} has shape {:?}, expected [{n}, {}]", input.name, v.shape, row.iter().map(i32::to_string).collect::<Vec<_>>().join(", "));
             }
-            Kind::Soma => {
-                copy(&b.gr_in, get("global_root_values")?.to_f32());
-                copy(&b.lr_in, get("local_root_values")?.to_f32());
-                copy(&b.lp_in, get("local_poses")?.to_f32());
-            }
+            v.check().with_context(|| format!("input {}", input.name))?;
+            *slot = Some(v);
         }
-        copy(&b.hg, mask(get("has_global_root_values")?));
-        copy(&b.hl, mask(get("has_local_root_values")?));
-        copy(&b.hp, mask(get("has_local_poses")?));
-        copy(&b.allowed, mask(get("allowed_pred_num_tokens")?));
+        let n = batch.unwrap_or(0).max(0) as usize;
+        if n == 0 || n > self.max_batch {
+            bail!("batch {n} outside 1..={} (max_batch)", self.max_batch);
+        }
+        for (v, input) in found.iter().zip(&self.inputs) {
+            write_input(self.slot(input.slot), v.expect("checked above"), input.mask);
+        }
         Ok(n)
     }
 
     pub fn num_tokens(&self, n: usize) -> Vec<i32> {
-        self.b.nt.as_slice()[..n].iter().map(|v| v.to_bits() as i32).collect()
+        self.b.nt.to_i32(n)
     }
 
     /// Main output (`pred_global_motions` or `pred_qpos`), durations, and G1 foot contacts.
-    pub fn outputs(&self, n: usize) -> (Vec<f32>, Vec<i32>, Option<Vec<f32>>) {
+    pub fn outputs(&self, n: usize) -> Outputs {
         let b = &self.b;
         match self.spec.kind {
-            Kind::Soma => (b.out.as_slice()[..n * 64 * self.gd].to_vec(), self.num_tokens(n), None),
-            Kind::UnitreeG1 => (b.qpos.as_slice()[..n * 64 * 36].to_vec(), self.num_tokens(n), Some(b.contacts.as_slice()[..n * 64 * 4].to_vec())),
+            Kind::Soma => (b.out.to_f32(n * 64 * self.gd), self.num_tokens(n), None),
+            Kind::UnitreeG1 => (b.qpos.to_f32(n * 64 * 36), self.num_tokens(n), Some(b.contacts.to_f32(n * 64 * 4))),
         }
     }
 
@@ -819,25 +896,44 @@ impl MetalModel {
     }
 
     /// ONNX-Runtime-style call: upload, record (committing in chunks), wait, read back.
-    pub fn run(&self, inputs: &HashMap<String, Npy>) -> Result<(Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
+    pub fn run(&self, inputs: &HashMap<String, Npy>) -> Result<Outputs> {
         self.run_with_durations(inputs, None)
     }
 
     /// Like [`Self::run`]; `durations` (6..=16 tokens per request) replaces the durations the root
     /// network would choose (Python: `core.predict(..., num_tokens=...)`).
-    pub fn run_with_durations(&self, inputs: &HashMap<String, Npy>, durations: Option<&[i32]>) -> Result<(Vec<f32>, Vec<i32>, Option<Vec<f32>>)> {
+    pub fn run_with_durations(&self, inputs: &HashMap<String, Npy>, durations: Option<&[i32]>) -> Result<Outputs> {
         let n = self.upload_inputs(inputs)?;
         if let Some(t) = durations {
-            if t.len() != n || t.iter().any(|&v| !(6..=16).contains(&v)) {
-                bail!("durations must be {n} values in 6..=16, got {t:?}");
+            if t.len() != n || t.iter().any(|v| !(config::MIN_TOKENS..=config::MAX_TOKENS).contains(v)) {
+                bail!("durations must be {n} values in {}..={}, got {t:?}", config::MIN_TOKENS, config::MAX_TOKENS);
             }
-            let bits: Vec<f32> = t.iter().map(|&v| f32::from_bits(v as u32)).collect();
-            self.b.nt_in.as_mut_slice()[..n].copy_from_slice(&bits);
+            self.b.nt_in.write_i32(t);
         }
         let d = self.dims(n, durations.is_some());
         let mut rec = self.recorder();
         self.encode(&mut rec, &d);
-        wait(&rec.commit());
+        rec.commit().wait()?;
         Ok(self.outputs(n))
+    }
+}
+
+/// Write an input array into a float32 buffer: its values, or for a mask `!= 0` (in the array's
+/// own dtype, like [`Npy::to_bool`]) as 0/1. No intermediate vector.
+fn write_input(dst: &Buf, v: &Npy, mask: bool) {
+    let flag = |b: bool| b as i32 as f32;
+    let n = v.data.len();
+    match &v.data {
+        NpyData::F32(d) if mask => dst.fill_f32(0, n, d.iter().map(|&x| flag(x != 0.0))),
+        NpyData::F32(d) => dst.write_f32(d),
+        NpyData::F64(d) if mask => dst.fill_f32(0, n, d.iter().map(|&x| flag(x != 0.0))),
+        NpyData::F64(d) => dst.fill_f32(0, n, d.iter().map(|&x| x as f32)),
+        NpyData::I32(d) if mask => dst.fill_f32(0, n, d.iter().map(|&x| flag(x != 0))),
+        NpyData::I32(d) => dst.fill_f32(0, n, d.iter().map(|&x| x as f32)),
+        NpyData::I64(d) if mask => dst.fill_f32(0, n, d.iter().map(|&x| flag(x != 0))),
+        NpyData::I64(d) => dst.fill_f32(0, n, d.iter().map(|&x| x as f32)),
+        NpyData::U8(d) if mask => dst.fill_f32(0, n, d.iter().map(|&x| flag(x != 0))),
+        NpyData::U8(d) => dst.fill_f32(0, n, d.iter().map(|&x| x as f32)),
+        NpyData::Bool(d) => dst.fill_f32(0, n, d.iter().map(|&x| flag(x))),
     }
 }

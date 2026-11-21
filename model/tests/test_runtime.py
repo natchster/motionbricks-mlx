@@ -150,6 +150,258 @@ def test_player_timing_and_overrides():
     assert player.time_to_transition == 0.0
 
 
+class _FlakyEngine(_FakeEngine):
+    """Writes the call number into each frame's root X, and raises while ``fail`` is set."""
+
+    fail = False
+
+    def generate_animation(self, context, target, output, config=None):
+        if self.fail:
+            output.num_frames = 0  # like the real engines, which clear the output first
+            raise RuntimeError("generation failed")
+        super().generate_animation(context, target, output, config)
+        output.poses[: self.frames, 0] = self.calls
+
+
+def test_player_keeps_its_motion_when_generation_fails():
+    engine = _FlakyEngine(31)
+    reference = np.zeros(36, np.float32)
+    reference[6] = 1.0
+    player = rt.GeneratedDOFMotionPlayer(engine, reference)
+    player.seed_history_from_pose(reference)
+    player.generate(np.tile(reference, (4, 1)), rt.TargetPoseInferenceParams(transition_early_by_frames=5, num_poses_to_use=4))
+    pose, contacts = np.zeros(36, np.float32), np.zeros(4, np.float32)
+    player.sample(0.25, pose, contacts)
+    before = (player.output, player.playback_time, player.time_to_transition, player.current_root_position().copy())
+    engine.fail = True
+    with pytest.raises(RuntimeError):
+        player.generate(np.tile(reference, (4, 1)), rt.TargetPoseInferenceParams(transition_early_by_frames=12, num_poses_to_use=4))
+    assert player.output is before[0] and player.output.num_frames == 31 and player.transition_early_by_frames == 5
+    assert player.playback_time == before[1] and player.time_to_transition == before[2]
+    assert np.array_equal(player.current_root_position(), before[3])
+    player.sample(0.1, pose, contacts)  # still plays the first motion
+    assert pose[0] == 1.0
+    engine.fail = False
+    player.generate(np.tile(reference, (4, 1)), rt.TargetPoseInferenceParams(transition_early_by_frames=12, num_poses_to_use=4))
+    assert player.output is not before[0] and player.transition_early_by_frames == 12 and player.playback_time == 0.0
+    player.sample(0.0, pose, contacts)
+    assert pose[0] == 2.0  # the motion of the second successful generation
+
+
+def _quat_from_matrix_per_matrix(m):
+    """The previous per-matrix port of ``wp.quat_from_matrix``: the reference for the vectorized one."""
+    f = np.float32
+    shape, m = m.shape[:-2], np.asarray(m, f).reshape(-1, 3, 3)
+    out = np.empty((m.shape[0], 4), f)
+    for i, r in enumerate(m):
+        tr = r[0, 0] + r[1, 1] + r[2, 2]
+        if tr >= 0:
+            h = np.sqrt(tr + f(1))
+            w, h = f(0.5) * h, f(0.5) / h
+            x, y, z = (r[2, 1] - r[1, 2]) * h, (r[0, 2] - r[2, 0]) * h, (r[1, 0] - r[0, 1]) * h
+        else:
+            k = 0
+            if r[1, 1] > r[0, 0]:
+                k = 1
+            if r[2, 2] > r[k, k]:
+                k = 2
+            if k == 0:
+                h = np.sqrt((r[0, 0] - (r[1, 1] + r[2, 2])) + f(1))
+                x, h = f(0.5) * h, f(0.5) / h
+                y, z, w = (r[0, 1] + r[1, 0]) * h, (r[2, 0] + r[0, 2]) * h, (r[2, 1] - r[1, 2]) * h
+            elif k == 1:
+                h = np.sqrt((r[1, 1] - (r[2, 2] + r[0, 0])) + f(1))
+                y, h = f(0.5) * h, f(0.5) / h
+                z, x, w = (r[1, 2] + r[2, 1]) * h, (r[0, 1] + r[1, 0]) * h, (r[0, 2] - r[2, 0]) * h
+            else:
+                h = np.sqrt((r[2, 2] - (r[0, 0] + r[1, 1])) + f(1))
+                z, h = f(0.5) * h, f(0.5) / h
+                x, y, w = (r[2, 0] + r[0, 2]) * h, (r[1, 2] + r[2, 1]) * h, (r[1, 0] - r[0, 1]) * h
+        out[i] = (x, y, z, w)
+    return T.quat_normalize(out).reshape((*shape, 4))
+
+
+def test_quat_from_matrix_takes_warps_branches_bitwise():
+    q = random_quat(2000)
+    sweeps = [T.quat_from_axis_angle(axis, np.linspace(-np.pi, np.pi, 301, dtype=np.float32)) for axis in np.eye(3, dtype=np.float32)]
+    for quats in (q, *sweeps):  # every branch: trace >= 0, and the X, Y and Z diagonal cases
+        m = np.stack([T.quat_rotate(quats, e) for e in np.eye(3, dtype=np.float32)], -1)
+        assert np.array_equal(T.quat_from_matrix(m), _quat_from_matrix_per_matrix(m))
+    noisy = RNG.normal(size=(7, 5, 3, 3)).astype(np.float32)  # not rotations; zero matrices too
+    noisy[0] = 0.0
+    assert np.array_equal(T.quat_from_matrix(noisy), _quat_from_matrix_per_matrix(noisy))
+
+
+def test_cross_matches_numpy_bitwise():
+    for shape_a, shape_b in (((3,), (3,)), ((40, 3), (40, 3)), ((4, 9, 3), (3,)), ((1, 3), (6, 3))):
+        a, b = RNG.normal(size=shape_a).astype(np.float32), RNG.normal(size=shape_b).astype(np.float32)
+        assert np.array_equal(T.cross(a, b), np.cross(a, b))
+
+
+def random_hierarchy(num_joints):
+    return np.array([-1] + [int(RNG.integers(0, j)) for j in range(1, num_joints)], np.int32)
+
+
+def test_world_poses_by_depth_match_joint_by_joint():
+    parents = random_hierarchy(50)
+    local = T.transform(RNG.normal(size=(3, 50, 3)), random_quat(150).reshape(3, 50, 4))
+    root = T.transform([0.5, -2.0, 1.0], random_quat(1)[0])
+    for poses in (local, local[0]):
+        want = np.empty_like(poses)
+        want[..., 0, :] = T.transform_mul(root, poses[..., 0, :])
+        for j in range(1, 50):
+            want[..., j, :] = T.transform_mul(want[..., parents[j], :], poses[..., j, :])
+        assert np.array_equal(T.compute_world_poses(poses, parents, root), want)
+        skeleton = rt.Skeleton([f"j{j}" for j in range(50)], parents, local[0])
+        assert np.array_equal(skeleton.compute_world_transforms(poses, root), want)
+
+
+def test_skeleton_rejects_hierarchies_out_of_order():
+    reference = np.tile(T.IDENTITY, (3, 1))
+    for parents, joint in (([-1, 2, 0], "Joint 1"), ([-1, -1, 0], "Joint 1"), ([-1, 0, 2], "Joint 2"), ([0, 0, 1], "Joint 0")):
+        with pytest.raises(ValueError, match=joint):
+            rt.Skeleton(["a", "b", "c"], parents, reference)
+    skeleton = rt.Skeleton(["a", "b", "c"], [-1, 0, 1], reference)
+    with pytest.raises(ValueError):
+        skeleton.parent_indices[1] = 2  # engines cache mappings built from it
+
+
+def _loop_frame_by_frame(buffer):
+    """The previous per-frame ``make_loopable``: the reference for the vectorized one."""
+    p, last = buffer.poses, buffer.num_frames - 1
+    if isinstance(buffer, rt.AnimationBuffer):
+        root_delta = T.compute_root_endpoint_delta(p[last, 0], p[0, 0])
+        deltas = T.compute_delta_transform(p[last, 1:], p[0, 1:])
+        for frame in range(buffer.num_frames):
+            w = np.float32(frame / last)
+            p[frame, 0] = T.apply_root_endpoint_correction(p[frame, 0], T.IDENTITY, root_delta, w)
+            p[frame, 1:] = T.apply_delta_transform(p[frame, 1:], deltas, np.full(len(deltas), w, np.float32))
+        return
+    from motionbricks_mlx.runtime.animation import read_root, write_root
+
+    root_delta = T.compute_root_endpoint_delta(read_root(p[last]), read_root(p[0]))
+    angle_deltas = p[0, 7:] - p[last, 7:]
+    for frame in range(buffer.num_frames):
+        w = np.float32(frame / last)
+        write_root(T.apply_root_endpoint_correction(read_root(p[frame]), T.IDENTITY, root_delta, w), p[frame])
+        p[frame, 7:] += angle_deltas * w
+
+
+def test_make_loopable_matches_frame_by_frame():
+    skeleton = rt.Skeleton([f"j{j}" for j in range(6)], random_hierarchy(6), np.tile(T.IDENTITY, (6, 1)))
+    soma = T.transform(RNG.normal(size=(45, 6, 3)), random_quat(270).reshape(45, 6, 4))
+    dof = np.concatenate([RNG.normal(size=(45, 3)), random_quat(45), RNG.normal(size=(45, 29))], -1)
+    for make in (lambda: rt.AnimationBuffer(skeleton, 30.0, soma.copy(), num_frames=40),
+                 lambda: rt.DOFAnimationBuffer(rt.UNITREE_G1_JOINT_NAMES, 30.0, dof.copy(), num_frames=40)):
+        got, want = make(), make()
+        got.make_loopable()
+        _loop_frame_by_frame(want)
+        assert np.array_equal(got.poses, want.poses)  # frames past num_frames stay untouched too
+
+
+def test_tokens_from_recorder_match_per_sample_blending():
+    from motionbricks_mlx.runtime.animation import read_root, write_root
+
+    dts = np.array([1 / 45, 1 / 50, 1 / 61, 1 / 30, 1 / 75, 1 / 40, 1 / 60], np.float32)
+    soma = rt.MotionRecorder(T.transform(RNG.normal(size=(5, 3)), random_quat(5)), capacity=8)
+    dof = rt.MotionRecorder(np.concatenate([RNG.normal(size=3), random_quat(1)[0], RNG.normal(size=29)]), capacity=8)
+    for dt in dts:
+        soma.record(float(dt), T.transform(RNG.normal(size=(5, 3)), random_quat(5)))
+        dof.record(float(dt), np.concatenate([RNG.normal(size=3), random_quat(1)[0], RNG.normal(size=29)]))
+    lower, upper, blends = rt.history_sample_indices(soma.delta_times, 4, 30.0)
+    pose_token, dof_token = rt.PoseToken(5), rt.DOFToken(29)
+    pose_token.update_from_recorder(soma)
+    dof_token.update_from_recorder(dof)
+    for k in range(4):
+        h = soma.poses
+        assert np.array_equal(pose_token.poses[k], T.blend_transform(h[lower[k]], h[upper[k]], np.full(5, blends[k], np.float32)))
+        a, b, w = dof.poses[lower[k]], dof.poses[upper[k]], np.float32(blends[k])
+        want = (a + (b - a) * w).astype(np.float32)
+        write_root(T.blend_transform(read_root(a), read_root(b), w), want)
+        assert np.array_equal(dof_token.poses[k], want)
+
+
+def test_sampling_at_exact_frame_times():
+    poses = np.zeros((31, 36), np.float32)
+    poses[:, 6] = 1.0
+    poses[:, 10] = np.arange(31)
+    buffer = rt.DOFAnimationBuffer(rt.UNITREE_G1_JOINT_NAMES, 30.0, poses, foot_contacts=np.zeros((31, 4), np.float32))
+    for k in range(31):
+        assert buffer.sample(k / 30.0)[10] == pytest.approx(k, abs=1e-5)
+    assert rt.frame_index_from_time(buffer.duration, 30.0, 31) == (30, 30, 0.0)
+    assert buffer.sample(buffer.duration)[10] == 30.0 and buffer.sample(buffer.duration + 1e-9)[10] == 30.0
+    assert rt.frame_index_from_time(0.0, 30.0, 0) == (0, 0, 0.0)
+
+
+def test_settings_are_validated():
+    for bad in ({"transition_early_by_frames": -1, "num_poses_to_use": 4}, {"transition_early_by_frames": 0, "num_poses_to_use": 0},
+                {"transition_early_by_frames": 0, "num_poses_to_use": 5}, {"transition_early_by_frames": 2.5, "num_poses_to_use": 4},
+                {"transition_early_by_frames": 0, "num_poses_to_use": 4, "ik_pin_mask": 16},
+                {"transition_early_by_frames": 0, "num_poses_to_use": 4, "allowed_token_counts": (8.0,)}):
+        with pytest.raises(ValueError):
+            rt.TargetPoseInferenceParams(**bad)
+    params = rt.TargetPoseInferenceParams(np.int64(3), np.int32(2), ik_pin_mask=5, allowed_token_counts=[np.int64(9)])
+    assert params.transition_early_by_frames == 3 and type(params.num_poses_to_use) is int
+    assert params.ik_pin_mask == rt.IKPin.LEFT_HAND | rt.IKPin.LEFT_FOOT and params.allowed_token_counts == (9,)
+    with pytest.raises(ValueError, match="integers"):
+        rt.MotionBricksInferenceConfig(allowed_token_counts=(8.0,))
+    assert rt.MotionBricksInferenceConfig(allowed_token_counts=[np.int64(7)]).allowed_token_counts == (7,)
+
+
+def test_shapes_are_checked_at_the_api_boundary():
+    buffer = rt.DOFAnimationBuffer(rt.UNITREE_G1_JOINT_NAMES, 30.0, np.tile(T.IDENTITY.tolist() + [0.0] * 29, (3, 1)),
+                                   foot_contacts=np.eye(3, 4, dtype=np.float32))
+    with pytest.raises(ValueError, match="foot contacts"):
+        buffer.sample_foot_contacts(0.0, np.zeros((2, 4), np.float32))
+    with pytest.raises(ValueError, match="coordinates"):
+        buffer.sample(0.0, np.zeros(35, np.float32))
+    pose = np.tile(T.IDENTITY, (30, 1))
+    with pytest.raises(ValueError, match="pose\\[None\\]"):
+        rt.place_target_poses([1.0, 2.0, 0.0], [0.0, 1.0, 0.0], pose)
+    with pytest.raises(ValueError, match="shape of the poses"):
+        rt.place_target_poses([1.0, 2.0, 0.0], [0.0, 1.0, 0.0], pose[None], np.zeros((2, 30, 7), np.float32))
+    placed = rt.place_target_dof([1.0, 2.0, 0.0], [0.0, 1.0, 0.0], buffer.poses[0])  # one pose of coordinates works
+    assert placed.shape == (36,) and placed[0] == pytest.approx(1.0)
+    reference = np.zeros(36, np.float32)
+    reference[6] = 1.0
+    player = rt.GeneratedDOFMotionPlayer(_FakeEngine(31), reference)
+    with pytest.raises(ValueError, match="pose\\[None\\]"):
+        player.generate(reference, rt.TargetPoseInferenceParams(0, 1))
+
+
+def test_public_namespace_and_constants():
+    namespace = {}
+    exec("import io\nfrom motionbricks_mlx.runtime import *", namespace)
+    assert namespace["io"].__name__ == "io" and "engine" not in namespace and "transforms" in namespace
+    assert all(hasattr(rt, name) for name in rt.__all__) and len(set(rt.__all__)) == len(rt.__all__)
+    for constant in (T.IDENTITY, T.IDENTITY_QUAT):
+        with pytest.raises(ValueError):
+            constant[0] = 1.0
+
+
+def test_csv_round_trip(tmp_path):
+    poses = np.concatenate([RNG.normal(size=(12, 3)), random_quat(12), RNG.uniform(-3, 3, size=(12, 29))], -1)
+    buffer = rt.DOFAnimationBuffer(rt.UNITREE_G1_JOINT_NAMES, 30.0, poses, num_frames=10)
+    rt.save_csv(tmp_path / "motion.csv", buffer)
+    loaded = rt.load_csv(tmp_path / "motion.csv", sample_rate=30.0)  # the file does not store the rate
+    assert loaded.num_frames == 10 and loaded.joint_names == buffer.joint_names
+    same_dof(loaded.poses, buffer.poses[:10], 1e-5)
+
+
+@pytest.mark.parametrize("rate", [0.0, -30.0, float("nan"), float("inf")])
+def test_sample_rate_must_be_positive_and_finite(rate, tmp_path):
+    poses = np.concatenate([np.zeros((2, 3)), np.tile([0, 0, 0, 1.0], (2, 1)), np.zeros((2, 29))], -1)
+    with pytest.raises(ValueError, match="sample_rate"):
+        rt.DOFAnimationBuffer(rt.UNITREE_G1_JOINT_NAMES, rate, poses)
+    bvh = tmp_path / "bad.bvh"
+    frame_time = "0" if rate == 0.0 else str(rate)
+    bvh.write_text("HIERARCHY\nROOT Hips\n{\n  OFFSET 0 0 0\n  CHANNELS 6 Xposition Yposition Zposition Zrotation Yrotation Xrotation\n"
+                   "  End Site\n  {\n    OFFSET 0 1 0\n  }\n}\nMOTION\nFrames: 1\n"
+                   f"Frame Time: {frame_time}\n0 0 0 0 0 0\n")
+    with pytest.raises(ValueError, match="frame time"):
+        rt.load_bvh(bvh)
+
+
 # --- teacher-forced parity with upstream's runtime ----------------------------------------------
 
 
@@ -294,6 +546,94 @@ def test_ik_pins_match_upstream():
     pose = g["ik.current"].copy()
     corrector.apply(pose, 1.0)
     assert np.array_equal(pose, g["ik.current"])
+
+
+class _RecordedModel:
+    """A backend that returns upstream's recorded prediction (any ``run(inputs)`` backend works)."""
+
+    def __init__(self, g, label, num_tokens=None):
+        prefix = f"gen.{label}.out."
+        self.outputs = {k[len(prefix):]: v for k, v in g.items() if k.startswith(prefix)}
+        if num_tokens is not None:
+            self.outputs["pred_num_tokens"] = np.array([num_tokens], np.int32)
+        self.inputs = None
+
+    def run(self, inputs):
+        self.inputs = inputs
+        return self.outputs
+
+
+@pytest.mark.parametrize("label", SCENARIOS)
+def test_generate_animation_with_a_recorded_backend(model_name, label):
+    """The whole ``generate_animation()`` without weights: stages, frame count, settings and timer."""
+    g = golden(model_name)
+    backend = _RecordedModel(g, label)
+    engine = engine_for(model_name, g, label, backend)
+    context, target, output, config = tokens_for(model_name, g, label, engine)
+    assert engine.generate_animation(context, target, output, config=config) is output
+    count = int(g[f"gen.{label}.frame_count"])
+    assert output.num_frames == count and set(backend.inputs) == {k[len(f"gen.{label}.in."):] for k in g if k.startswith(f"gen.{label}.in.")}
+    (same_transforms if model_name == "soma" else same_dof)(output.poses[:count], g[f"gen.{label}.generated"], 2e-5)
+    np.testing.assert_allclose(output.foot_contacts[:count], g[f"gen.{label}.decoded_contacts"], atol=1e-6)
+    assert set(engine.timer.milliseconds) == {"encode", "inference", "decode", "post_process"}
+    assert (engine.timer.milliseconds["post_process"] == 0.0) == (not config.correct_generated_diff)
+    outside = min(set(range(6, 17)) - set(config.allowed_token_counts))
+    with pytest.raises(RuntimeError, match="outside the allowed set"):
+        engine_for(model_name, g, label, _RecordedModel(g, label, outside)).generate_animation(context, target, output, config=config)
+
+
+def test_soma_decode_matches_joint_by_joint():
+    g = golden("soma")
+    engine = engine_for("soma", g, "walk")
+    context, target, output, config = tokens_for("soma", g, "walk", engine)
+    engine._prepare_generation(context, target, output)
+    engine.encode_inputs(context, target, config)
+    count = engine.decode_prediction(_RecordedModel(g, "walk").outputs, output)
+    from motionbricks_mlx.runtime.engine import _rotation_from_6d
+
+    skeleton, jm = output.skeleton, len(rt.SOMA_JOINT_NAMES)
+    raw = g["gen.walk.out.pred_global_motions"][0, 3: 3 + count]
+    six = raw[:, 5 + (jm - 1) * 3: 5 + (jm - 1) * 3 + 6 * jm].reshape(count, jm, 6)
+    rotations = _rotation_from_6d(six[..., :3], six[..., 3:])
+    pose_to_model, ref = engine._pose_to_model, skeleton.reference_local_transforms
+    assert (pose_to_model < 0).sum() > 0  # the fixture skeleton has joints that keep their reference
+    for joint in range(1, skeleton.num_joints):
+        if pose_to_model[joint] < 0:
+            want = np.broadcast_to(ref[joint], (count, 7))
+        else:
+            parent = pose_to_model[skeleton.parent_indices[joint]]
+            local = T.quat_mul(T.quat_inverse(rotations[:, parent]), rotations[:, pose_to_model[joint]])
+            want = T.transform(np.broadcast_to(ref[joint, :3], (count, 3)), T.quat_normalize(local))
+        assert np.array_equal(output.poses[:count, joint], want), joint
+
+
+def test_soma_player_with_a_recorded_backend():
+    g = golden("soma")
+    engine = engine_for("soma", g, "walk", _RecordedModel(g, "walk"))
+    skeleton = soma_skeleton(g)
+    player = rt.GeneratedMotionPlayer(engine, skeleton)
+    player.seed_history_from_pose(g["gen.walk.context"][-1])
+    player.generate(g["gen.walk.target"], rt.TargetPoseInferenceParams(transition_early_by_frames=4, num_poses_to_use=4))
+    count = int(g["gen.walk.frame_count"])
+    assert player.output.num_frames == count and player.time_to_transition == pytest.approx((count - 1 - 4) / 30)
+    pose, contacts = np.zeros((skeleton.num_joints, 7), np.float32), np.zeros(4, np.float32)
+    for _ in range(5):
+        player.sample(1 / 60, pose, contacts)
+        player.record_pose(1 / 60, pose)
+    assert np.array_equal(pose, player.output.sample(player.playback_time)) and np.array_equal(player.motion_history.poses[-1], pose)
+    np.testing.assert_allclose(player.current_root_position(), pose[0, :3], atol=1e-6)
+
+
+def test_soma_engine_rejects_unusable_skeletons():
+    g = golden("soma")
+    names, parents, reference = joint_names(g), g["skeleton.parents"], g["skeleton.reference"]
+    engine = rt.MotionBricksSOMAEngine(None)
+    renamed = [n if n != "LeftShin" else "LeftKnee" for n in names]
+    with pytest.raises(ValueError, match="LeftShin"):
+        engine.create_output(rt.Skeleton(renamed, parents, reference))
+    rooted = rt.Skeleton(["Root", *names], [-1, *(p + 1 for p in parents)], np.concatenate([T.IDENTITY[None], reference]))
+    with pytest.raises(ValueError, match="index zero"):
+        engine.create_input(rooted)
 
 
 # --- end to end with the MLX model -------------------------------------------------------------

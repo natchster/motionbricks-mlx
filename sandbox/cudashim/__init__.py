@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sys
 
-__all__ = ["install_tensorrt", "enable_torch_cuda", "enable_all"]
+__all__ = ["enable_all", "enable_torch_cuda", "install_tensorrt"]
 
 
 def install_tensorrt(force: bool = False):

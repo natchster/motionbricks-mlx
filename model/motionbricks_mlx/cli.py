@@ -10,6 +10,7 @@ import mlx.core as mx
 import numpy as np
 
 from . import examples, hub
+from .config import canonical_name
 from .model import DTYPES, convert, load
 
 
@@ -21,6 +22,10 @@ def _load(args):
     if getattr(args, "quantize", None):
         model.quantize(bits=args.quantize)
     return model
+
+
+def _model_or_all(name: str) -> str:
+    return name if name == "all" else canonical_name(name)
 
 
 def cmd_download(args):
@@ -69,7 +74,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     def model_args(p, need_source=True):
-        p.add_argument("--model", choices=("soma", "unitree_g1"), default="soma")
+        p.add_argument("--model", type=canonical_name, choices=("soma", "unitree_g1"), default="soma",
+                       help="soma or unitree_g1 (alias g1)")
         p.add_argument("--dtype", choices=tuple(DTYPES), default="float32")
         if need_source:
             p.add_argument("--quantize", type=int, choices=(4, 8), help="experimental: quantize transformer weights")
@@ -78,7 +84,8 @@ def main(argv=None):
             src.add_argument("--weights", help="converted .safetensors from `motionbricks-mlx convert`")
 
     p = sub.add_parser("download", help=f"download and verify the checkpoints ({hub.REPO} @ {hub.REVISION[:7]})")
-    p.add_argument("--model", choices=("all", "soma", "unitree_g1"), default="all")
+    p.add_argument("--model", type=_model_or_all, choices=("all", "soma", "unitree_g1"), default="all",
+                   help="all, soma or unitree_g1 (alias g1)")
     p.add_argument("--dir", default="checkpoints/MotionBricks", help="destination (default: checkpoints/MotionBricks)")
     p.add_argument("--clips", action="store_true", help="also fetch the sample clips the Runtime API examples use (~5 MB)")
     p.add_argument("--only-clips", action="store_true", help="fetch only the sample clips")

@@ -32,6 +32,24 @@ GLOBAL_ROOT_DIM = 5  # x, y, z, cos(heading), sin(heading)
 LOCAL_ROOT_DIM = 4  # yaw rate, vx, vz, height
 
 
+def target_frame_masks(num_tokens: mx.array) -> list[mx.array]:
+    """For each target slot ``i`` (0..3), a bool ``(B, 64)`` mask of its frame: frame ``i`` of the
+    last token, ``num_tokens * 4 - 4 + i``."""
+    f = FRAMES_PER_TOKEN
+    frames = mx.arange(MAX_FRAMES)[None, :]
+    return [frames == (num_tokens * f - f + i)[:, None] for i in range(f)]
+
+
+def dense_conditions(values: mx.array, fill: mx.array, at: list[mx.array]) -> mx.array:
+    """64-frame condition track from the 8 slots of ``values`` ``(B, 8, ...)``: the 4 context slots
+    at frames 0..3, ``fill`` ``(B, 60, ...)`` elsewhere, and target slot ``i`` written where ``at[i]``."""
+    f = FRAMES_PER_TOKEN
+    dense = mx.concatenate([values[:, :f], fill], axis=1)
+    for i, mask in enumerate(at):
+        dense = mx.where(mask if values.ndim == 2 else mask[..., None], values[:, f + i][:, None], dense)
+    return dense
+
+
 def _blend(value, missing, has):
     """``value * has + missing * (1 - has)`` exactly as upstream (has is bool)."""
     h = has[..., None].astype(value.dtype)
@@ -113,15 +131,10 @@ class RootNetwork(nn.Module):
         has_frame = has_poses | has_global | has_local
         frame = mx.where(has_frame[..., None], frame_emb, self.conv_no_frame_emb)
         rest = MAX_FRAMES - f
-        dense_frame = mx.concatenate([frame[:, :f], mx.broadcast_to(self.conv_no_frame_emb, (batch, rest, frame.shape[-1]))], axis=1)
-        dense_root = mx.concatenate([global_root[:, :f], mx.zeros((batch, rest, GLOBAL_ROOT_DIM), dtype=global_root.dtype)], axis=1)
-        dense_has_root = mx.concatenate([has_global[:, :f], mx.zeros((batch, rest), dtype=mx.bool_)], axis=1)
-        frames = mx.arange(MAX_FRAMES)[None, :]
-        for i in range(f):
-            at = frames == (pred_num_tokens * f - f + i)[:, None]
-            dense_frame = mx.where(at[..., None], frame[:, f + i][:, None], dense_frame)
-            dense_root = mx.where(at[..., None], global_root[:, f + i][:, None], dense_root)
-            dense_has_root = mx.where(at, has_global[:, f + i][:, None], dense_has_root)
+        at = target_frame_masks(pred_num_tokens)
+        dense_frame = dense_conditions(frame, mx.broadcast_to(self.conv_no_frame_emb, (batch, rest, frame.shape[-1])), at)
+        dense_root = dense_conditions(global_root, mx.zeros((batch, rest, GLOBAL_ROOT_DIM), dtype=global_root.dtype), at)
+        dense_has_root = dense_conditions(has_global, mx.zeros((batch, rest), dtype=mx.bool_), at)
         pred_root = self.conv_output(
             second, external_cond=dense_frame, target_cond=dense_root, has_target_cond=dense_has_root, token_mask=token_mask
         )

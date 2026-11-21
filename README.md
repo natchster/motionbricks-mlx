@@ -155,8 +155,8 @@ MB_PLAN_TABLE=$PWD/my_mac.txt cargo run --release --bin mbrs-bench -- --model so
 
 ```sh
 sandbox/setup.sh                                            # NVIDIA's reference model, fixtures (~5 GB)
-uv run --all-packages pytest                                # 128 Python tests
-(cd model-rs && cargo test --release -- --test-threads=1)   # 88 Rust tests
+uv run --all-packages pytest                                # 210 Python tests
+(cd model-rs && cargo test --release -- --test-threads=1)   # 126 Rust tests
 ```
 
 The model suites also run without the sandbox, and skip only the parity tests against NVIDIA's code.

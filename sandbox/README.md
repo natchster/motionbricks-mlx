@@ -74,10 +74,12 @@ the cross-backend benchmarks. The Python and Rust models install and run without
 
 ```sh
 sandbox/setup.sh                 # ~1.6 GB checkpoints + 1.5 GB local ONNX export, all verified
+sandbox/setup.sh --force         # also re-export the ONNX graphs and regenerate every fixture
 uv run --all-packages cudashim-doctor
 ```
 
-`setup.sh` does the following:
+`setup.sh` is safe to rerun: verified downloads are skipped, and steps 5–7 run only when their
+outputs are missing (or with `--force`). It does the following:
 
 1. `uv sync --all-packages`, which installs Python 3.12, MLX, PyTorch (MPS), ONNX Runtime, Warp and
    SciPy (upstream's CSV clip loader uses it).
@@ -87,18 +89,32 @@ uv run --all-packages cudashim-doctor
 4. Downloads the checkpoints from `nvidia/MotionBricks` with the model package's own downloader
    (`motionbricks_mlx.hub`, the same one `motionbricks-mlx download` uses). It first checks that
    the package's checksum table matches upstream's `checksums.py`.
+
+   Every download in steps 3–4 goes through `motionbricks_mlx.hub.fetch`. It writes to a unique
+   `.part` file, hashes the data as it streams, and renames the file into place only when its
+   size and SHA-256 match. A stalled connection fails after 60 s instead of hanging. Errors name
+   the file and leave nothing half-written, so rerunning retries cleanly.
 5. Exports the ONNX graphs with **NVIDIA's own exporter**, including its `onnx.checker` and
    interface validation. This replaces the slow 760 MB LFS downloads.
-6. Records golden fixtures with the upstream PyTorch model.
+6. Records golden fixtures with the upstream PyTorch model on the CPU (FP32), with `meta.json`
+   recording the device and the torch/NumPy/upstream versions that produced them.
+   `make_golden.py --device mps` writes to `sandbox/golden-mps/` instead, so an MPS run never
+   replaces the CPU reference.
 7. Records the Runtime API fixtures (`sandbox/golden/runtime/{soma,unitree_g1}.npz`) with
    `scripts/make_runtime_golden.py`, which runs **upstream's own runtime code** on Warp's CPU backend:
    - the engines' encode, decode and endpoint-correction methods;
    - `MotionRecorder` and the target placement and speed helpers;
    - `TargetPoseIKCorrector` and the BVH/CSV loaders.
 
-   NVIDIA's PyTorch model stands in for TensorRT. The script first fetches the four sample clips
-   from Git LFS, checking each SHA-256. The tests of both ports (`model/tests/test_runtime.py`,
+   NVIDIA's PyTorch model stands in for TensorRT, on the CPU. Only `import tensorrt` is shimmed;
+   the `torch.cuda` remap stays off, so nothing can move the oracle to MPS. The script first
+   fetches the four sample clips listed in `model/motionbricks_mlx/assets/clips.sha256`, checking
+   each SHA-256. The tests of both ports (`model/tests/test_runtime.py`,
    `model-rs/tests/runtime.rs`) check every step against these fixtures.
+
+The fixture scripts take `--out DIR` to write elsewhere. Regenerating into a temporary directory
+and comparing every array with `np.array_equal` is how to check that a change to a generator
+keeps the fixtures bit-identical.
 
 Optional raw-CUDA layer. It needs full Xcode, not just the Command Line Tools:
 
@@ -127,23 +143,36 @@ import torch
 x = torch.randn(1024, 1024, device="cuda")      # lands on mps:0
 model = MyNet().cuda()                           # NVIDIA-style code, unchanged
 torch.cuda.synchronize(); torch.cuda.Event(enable_timing=True)
+with torch.autocast("cuda", dtype=torch.float16):  # also torch.amp / torch.cuda.amp.autocast
+    y = model(x)                                 # FP16 autocast on MPS
 
 import tensorrt as trt                           # Builder/OnnxParser/Runtime/execute_async_v3
 ```
 
 On Apple silicon, "device pointers" are host addresses (unified memory). The TensorRT shim
 therefore reads and writes the buffers whose `ptr` you pass to `set_tensor_address`, whether
-NumPy arrays or Warp CPU arrays.
+NumPy arrays or Warp CPU arrays. It runs on ONNX Runtime's CPU EP by default (exact FP32);
+`CUDASHIM_TRT_PROVIDER=coreml` selects the CoreML EP (GPU/ANE).
+
+Use `cudashim.install_tensorrt()` alone when only `import tensorrt` needs to work. That is what
+`make_runtime_golden.py` does, and it leaves `torch.cuda` untouched.
+
+Warp's `cudashim.warp_cpu.cuda_device_alias()` covers code that selects the device through
+`wp.set_device("cuda:0")` or `wp.get_device("cuda")`. An explicit `device="cuda"` argument to an
+allocation or launch still raises; such code needs `device="cpu"`.
 
 ## What is verified (`uv run --all-packages pytest sandbox/tests`)
 
+Set `MOTIONBRICKS_REQUIRE_FIXTURES=1` to turn every skip (missing upstream checkout, checkpoints,
+fixtures, MPS, CuMetal) into a failure, as in `model/tests`.
+
 | Test | Proves |
 |---|---|
-| `test_assets.py` | The model package's checkpoint manifest (`model/motionbricks_mlx/assets/checkpoints.sha256`), which the model-only download paths verify against, equals upstream's `checksums.py`. Its clip manifest (`clips.sha256`) equals the Git LFS pointers at the pinned commit. |
-| `test_torch_cuda_shim.py` | `device="cuda"`, `.cuda()`, `Module.cuda()`, events, autocast, sync. Results land on MPS and match CPU numerics. |
-| `test_reference_on_mps.py` | **NVIDIA's PyTorch MotionBricks, moved with `.cuda()`**, runs on the Apple GPU and matches the CPU golden outputs. |
-| `test_tensorrt_shim.py` | **NVIDIA's own `build_serialized_engine` + `inspect_engine_tensors`** produce a plan from the G1 graph. A named-tensor `execute_async_v3` launch matches the PyTorch golden outputs. |
-| `test_warp_kernels.py` | **NVIDIA's Warp CUDA kernels** (condition masks, token padding) compile and run unchanged on the CPU, and `wp.set_device("cuda:0")` code runs under the alias. |
+| `test_assets.py` | The model package's checkpoint manifest (`model/motionbricks_mlx/assets/checkpoints.sha256`), which the model-only download paths verify against, equals upstream's `checksums.py`. Its clip manifest (`clips.sha256`) equals the Git LFS pointers at the pinned commit. Offline, `fetch_assets.fetch_lfs` refuses a wrong digest and replaces a pointer with the verified file. The oracle rejects unknown model names, explains missing checkpoints and records fixture metadata. |
+| `test_torch_cuda_shim.py` | `device="cuda"`, `.cuda()`, `Module.cuda()`, events, sync. Autocast works through `torch.autocast("cuda")`, `torch.amp.autocast("cuda")` and the deprecated `torch.cuda.amp.autocast`. Results land on MPS and match CPU numerics. |
+| `test_reference_on_mps.py` | **NVIDIA's PyTorch MotionBricks, moved with `.cuda()`**, runs on the Apple GPU and matches the CPU golden outputs. `meta.json` must say those fixtures came from the CPU. |
+| `test_tensorrt_shim.py` | **NVIDIA's own `build_serialized_engine` + `inspect_engine_tensors`** produce a plan from the G1 graph. A named-tensor `execute_async_v3` launch matches the PyTorch golden outputs. A build creates one ONNX Runtime session, and an FP16 build warns that FP16 isn't emulated. Bad ONNX, bad plans, unknown names and null addresses are reported as TensorRT reports them. |
+| `test_warp_kernels.py` | **NVIDIA's Warp CUDA kernels** (condition masks, token padding) compile and run unchanged on the CPU, and `wp.set_device("cuda:0")` code runs under the alias. An explicit `device="cuda"` still raises, as documented. |
 | `test_native_cuda.py` | **Raw CUDA C++ compiled by CuMetal runs on the Apple GPU.** Three programs: a grid-stride vector add, a shared-memory + warp-shuffle reduction with `atomicAdd`, and a cuBLAS SGEMM followed by a custom bias + ReLU kernel. Each must match a host reference, and every custom kernel must report `device=apple_gpu` in CuMetal's GPU trace. cuBLAS runs as an MPS matrix multiply, which doesn't trace, hence the extra kernel. Skips if CuMetal isn't installed. |
 
 ## Limits (honest list)
@@ -152,7 +181,8 @@ NumPy arrays or Warp CPU arrays.
   itself is not runnable, because it asserts `wp.get_device().is_cuda` and captures CUDA graphs.
   Its builder and plan paths are, as tested above.
 - **The TensorRT shim is an API emulation, not an optimizer.** FP16 and TF32 flags are recorded
-  but don't change ONNX Runtime's math. For speed on Apple silicon, use the MLX port.
+  but don't change ONNX Runtime's math. An FP16 build logs a warning, because it runs in FP32 and
+  says nothing about FP16 accuracy. For speed on Apple silicon, use the MLX port.
 - **No FP64 on Apple GPUs.** CuMetal emulates FP64 in software, and MPS rejects float64 tensors.
 - CuMetal is research-grade: self-reported results and open bugs (e.g. `__shfl_xor_sync` with
   width < 32). Treat its output like any unverified compiler's.

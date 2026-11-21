@@ -24,9 +24,9 @@ fn main() -> Result<()> {
         [_, n, c, r, p] => (n, c, r, p.as_str()),
         _ => anyhow::bail!("usage: generate_metal <soma|unitree_g1> <checkpoint dir> <batch | request.npz> [float32|float16|bfloat16|int8]"),
     };
-    let model = MetalModel::from_checkpoints_with(name, checkpoints, 64, precision)?;
+    let model = MetalModel::from_checkpoints_with(name, checkpoints, 64, precision)?; // float32 | float16 | bfloat16 | int8
     let inputs = match request.parse::<usize>() {
-        Ok(batch) => motionbricks_rs::examples::request(name, batch, 0),
+        Ok(batch) => motionbricks_rs::examples::request(name, batch, 0)?,
         Err(_) => load_npz(request)?,
     };
     model.run(&inputs)?; // warm-up

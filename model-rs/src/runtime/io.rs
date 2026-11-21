@@ -6,7 +6,7 @@
 //! Clips (BVH for SOMA, CSV for the G1) and the rig-space conventions.
 
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
@@ -23,8 +23,39 @@ struct Hierarchy {
     channels: Vec<Vec<String>>,
 }
 
+/// What a BVH channel animates.
+#[derive(Clone, Copy)]
+enum Channel {
+    Position(usize),
+    Rotation(usize),
+    Other,
+}
+
+impl Channel {
+    /// Only position and rotation channels need an axis (`Xposition`, `Zrotation`, ...).
+    fn parse(name: &str) -> Result<Self> {
+        let c = name.to_lowercase();
+        let axis = || match c.as_bytes().first() {
+            Some(b'x') => Ok(0),
+            Some(b'y') => Ok(1),
+            Some(b'z') => Ok(2),
+            _ => bail!("unknown BVH channel {name:?}"),
+        };
+        Ok(if c.ends_with("position") {
+            Channel::Position(axis()?)
+        } else if c.ends_with("rotation") {
+            Channel::Rotation(axis()?)
+        } else {
+            Channel::Other
+        })
+    }
+}
+
 fn read_hierarchy<'a>(lines: &mut impl Iterator<Item = &'a str>, remove_namespace: bool) -> Result<Hierarchy> {
-    let (mut names, mut parents, mut offsets, mut channels): (Vec<String>, Vec<i32>, Vec<[f32; 3]>, Vec<Vec<String>>) = Default::default();
+    let mut names: Vec<String> = Vec::new();
+    let mut parents: Vec<i32> = Vec::new();
+    let mut offsets: Vec<[f32; 3]> = Vec::new();
+    let mut channels: Vec<Vec<String>> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
     let mut in_end_site = false;
     for line in lines.by_ref() {
@@ -34,7 +65,7 @@ fn read_hierarchy<'a>(lines: &mut impl Iterator<Item = &'a str>, remove_namespac
             "MOTION" => break,
             "ROOT" | "JOINT" => {
                 let name = tokens.get(1).context("joint without a name")?;
-                names.push(if remove_namespace { name.rsplit(':').next().unwrap().to_string() } else { name.to_string() });
+                names.push(if remove_namespace { name.rsplit(':').next().unwrap_or(name).to_string() } else { name.to_string() });
                 parents.push(stack.last().map_or(-1, |&p| p as i32));
                 stack.push(names.len() - 1);
                 offsets.push([0.0; 3]);
@@ -43,13 +74,15 @@ fn read_hierarchy<'a>(lines: &mut impl Iterator<Item = &'a str>, remove_namespac
             "End" if tokens.get(1) == Some(&"Site") => in_end_site = true,
             "OFFSET" if !in_end_site => {
                 let j = *stack.last().context("OFFSET outside a joint")?;
-                for k in 0..3 {
-                    offsets[j][k] = tokens[k + 1].parse()?;
+                let values = tokens.get(1..4).with_context(|| format!("BVH joint {:?}: OFFSET needs three values", names[j]))?;
+                for (k, v) in values.iter().enumerate() {
+                    offsets[j][k] = v.parse().with_context(|| format!("BVH joint {:?}: OFFSET value {v:?} is not a number", names[j]))?;
                 }
             }
             "CHANNELS" => {
                 let j = *stack.last().context("CHANNELS outside a joint")?;
-                let count: usize = tokens[1].parse()?;
+                let count = tokens.get(1).with_context(|| format!("BVH joint {:?}: CHANNELS needs a count", names[j]))?;
+                let count: usize = count.parse().with_context(|| format!("BVH joint {:?}: channel count {count:?} is not a number", names[j]))?;
                 if count != tokens.len() - 2 {
                     bail!("BVH joint {:?} declares {count} channels but lists {}", names[j], tokens.len() - 2);
                 }
@@ -80,10 +113,10 @@ fn without_root(s: &Skeleton) -> Result<Skeleton> {
     if s.num_joints() < 2 || s.joint_parent(1) != 0 || (1..s.num_joints()).any(|j| s.joint_parent(j) == -1) {
         bail!("remove_root needs a single root joint with a child at index 1");
     }
-    let parents = s.parent_indices[1..].iter().map(|&p| if p > 0 { p - 1 } else { -1 }).collect();
-    let mut reference = s.reference_local_transforms[1..].to_vec();
-    reference[0] = s.reference_local_transforms[0].mul(reference[0]);
-    Skeleton::new(s.joint_names[1..].to_vec(), parents, reference)
+    let parents = s.parent_indices()[1..].iter().map(|&p| if p > 0 { p - 1 } else { -1 }).collect();
+    let mut reference = s.reference_local_transforms()[1..].to_vec();
+    reference[0] = s.reference_local_transforms()[0] * reference[0];
+    Skeleton::new(s.joint_names()[1..].to_vec(), parents, reference)
 }
 
 /// The joint hierarchy and reference pose of a BVH file (offsets in cm become meters).
@@ -109,7 +142,7 @@ fn euler_to_quaternion(angles: &[f32], order: &[usize]) -> Quat {
 
 /// Load a BVH clip: positions cm -> m, rotation channels in degrees, in the order listed.
 /// `skeleton` remaps the clip by joint name (missing joints keep its reference pose).
-pub fn load_bvh(path: impl AsRef<Path>, skeleton: Option<Rc<Skeleton>>, remove_namespace: bool) -> Result<AnimationBuffer> {
+pub fn load_bvh(path: impl AsRef<Path>, skeleton: Option<Arc<Skeleton>>, remove_namespace: bool) -> Result<AnimationBuffer> {
     let path = path.as_ref();
     let text = read_bvh_text(path)?;
     let mut lines = text.lines();
@@ -118,9 +151,12 @@ pub fn load_bvh(path: impl AsRef<Path>, skeleton: Option<Rc<Skeleton>>, remove_n
     for line in lines.by_ref() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.as_slice() {
-            ["Frames:", n, ..] => frames = n.parse()?,
+            ["Frames:", n, ..] => frames = n.parse().with_context(|| format!("BVH frame count {n:?} is not a number"))?,
             ["Frame", "Time:", t, ..] => {
-                let dt: f64 = t.parse()?;
+                let dt: f64 = t.parse().with_context(|| format!("BVH frame time {t:?} is not a number"))?;
+                if !(dt > 0.0 && dt.is_finite()) {
+                    bail!("BVH frame time must be positive, got {dt}");
+                }
                 sample_rate = Some(((1.0 / dt) * 100.0).round() / 100.0);
                 break;
             }
@@ -128,27 +164,36 @@ pub fn load_bvh(path: impl AsRef<Path>, skeleton: Option<Rc<Skeleton>>, remove_n
         }
     }
     let sample_rate = sample_rate.with_context(|| format!("BVH frame time is missing: {}", path.display()))? as f32;
-    let width: usize = channels.iter().map(Vec::len).sum();
-    let samples: Vec<f32> = lines.flat_map(str::split_whitespace).map(str::parse::<f32>).collect::<std::result::Result<_, _>>()?;
-    if samples.len() != frames * width {
+    let kinds: Vec<Vec<Channel>> = channels.iter().map(|c| c.iter().map(|n| Channel::parse(n)).collect::<Result<_>>()).collect::<Result<_>>()?;
+    let width: usize = kinds.iter().map(Vec::len).sum();
+    if width == 0 && frames > 0 {
+        bail!("BVH declares {frames} frames but no channels: {}", path.display());
+    }
+    let samples: Vec<f32> = lines
+        .flat_map(str::split_whitespace)
+        .map(|v| v.parse::<f32>().with_context(|| format!("BVH motion value {v:?} is not a number")))
+        .collect::<Result<_>>()?;
+    if Some(samples.len()) != frames.checked_mul(width) {
         bail!("BVH motion has {} values; expected {frames} frames x {width} channels", samples.len());
     }
     let j = file_skeleton.num_joints();
     let mut poses = Vec::with_capacity(frames * j);
+    let (mut angles, mut order) = (Vec::new(), Vec::new());
     for f in 0..frames {
         let row = &samples[f * width..(f + 1) * width];
         let mut column = 0;
-        for (joint, joint_channels) in channels.iter().enumerate() {
-            let mut t = file_skeleton.reference_local_transforms[joint];
-            let (mut angles, mut order) = (Vec::new(), Vec::new());
+        for (joint, joint_channels) in kinds.iter().enumerate() {
+            let mut t = file_skeleton.reference_local_transforms()[joint];
+            angles.clear();
+            order.clear();
             for channel in joint_channels {
-                let c = channel.to_lowercase();
-                let axis = "xyz".find(&c[..1]).with_context(|| format!("unknown channel {channel}"))?;
-                if c.ends_with("position") {
-                    t.p.0[axis] = row[column] * 0.01;
-                } else if c.ends_with("rotation") {
-                    angles.push(row[column]);
-                    order.push(axis);
+                match *channel {
+                    Channel::Position(axis) => t.p.0[axis] = row[column] * 0.01,
+                    Channel::Rotation(axis) => {
+                        angles.push(row[column]);
+                        order.push(axis);
+                    }
+                    Channel::Other => {}
                 }
                 column += 1;
             }
@@ -158,7 +203,7 @@ pub fn load_bvh(path: impl AsRef<Path>, skeleton: Option<Rc<Skeleton>>, remove_n
             poses.push(t);
         }
     }
-    let clip = AnimationBuffer::new(Rc::new(file_skeleton), sample_rate, poses, None, None)?;
+    let clip = AnimationBuffer::new(Arc::new(file_skeleton), sample_rate, poses, None, None)?;
     Ok(match skeleton {
         Some(s) => create_animation_buffer_for_skeleton(&clip, s),
         None => clip,
@@ -191,15 +236,18 @@ pub fn load_csv(path: impl AsRef<Path>, sample_rate: f32) -> Result<DofAnimation
     let path = path.as_ref();
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut lines = text.trim_start_matches('\u{feff}').lines().filter(|l| !l.trim().is_empty());
-    let header: Vec<&str> = lines.next().context("empty CSV")?.split(',').map(str::trim).collect();
+    let header = split_csv_header(lines.next().context("empty CSV")?);
     if header.len() <= CSV_ROOT_TITLE.len() || header[..CSV_ROOT_TITLE.len()] != CSV_ROOT_TITLE {
         bail!("{}: expected the columns Frame and root_translateX to root_rotateZ, then one column per joint angle", path.display());
     }
-    let names: Vec<String> = header[CSV_ROOT_TITLE.len()..].iter().map(|s| s.to_string()).collect();
+    let names: Vec<String> = header[CSV_ROOT_TITLE.len()..].to_vec();
     let nc = ROOT_COORDINATE_COUNT + names.len();
     let mut poses = Vec::new();
-    for line in lines {
-        let row: Vec<f64> = line.split(',').map(|v| v.trim().parse::<f64>()).collect::<std::result::Result<_, _>>()?;
+    for (row_index, line) in lines.enumerate() {
+        let row: Vec<f64> = line
+            .split(',')
+            .map(|v| v.trim().parse::<f64>().with_context(|| format!("{}: motion row {}: {v:?} is not a number", path.display(), row_index + 1)))
+            .collect::<Result<_>>()?;
         if row.len() != header.len() {
             bail!("{}: row width does not match the CSV header", path.display());
         }
@@ -223,15 +271,39 @@ pub fn load_csv(path: impl AsRef<Path>, sample_rate: f32) -> Result<DofAnimation
     DofAnimationBuffer::new(names, sample_rate, poses, None, None)
 }
 
+/// The fields of a CSV header line, trimmed, with double-quoted fields unquoted (as Python's `csv`).
+fn split_csv_header(line: &str) -> Vec<String> {
+    let (mut fields, mut field, mut quoted) = (Vec::new(), String::new(), false);
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => fields.push(std::mem::take(&mut field).trim().to_string()),
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field.trim().to_string());
+    fields
+}
+
+/// A CSV field, quoted when it holds a comma, quote or line break (as Python's `csv`).
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+}
+
 /// Write the frames in use of `buffer` as a robot motion CSV.
 pub fn save_csv(path: impl AsRef<Path>, buffer: &DofAnimationBuffer) -> Result<()> {
-    if buffer.num_frames == 0 {
+    if buffer.num_frames() == 0 {
         bail!("buffer must contain at least one frame in use");
     }
     let mut out = String::new();
-    out.push_str(&CSV_ROOT_TITLE.iter().copied().chain(buffer.joint_names.iter().map(String::as_str)).collect::<Vec<_>>().join(","));
+    out.push_str(&CSV_ROOT_TITLE.iter().copied().chain(buffer.joint_names().iter().map(String::as_str)).map(csv_field).collect::<Vec<_>>().join(","));
     out.push('\n');
-    for f in 0..buffer.num_frames {
+    for f in 0..buffer.num_frames() {
         let q = buffer.frame(f);
         let e = euler_xyz_extrinsic_from_quat([q[3], q[4], q[5], q[6]]);
         let mut row = vec![f.to_string()];
@@ -268,7 +340,7 @@ impl SpaceConverter {
         SpaceConverter { converter }
     }
     pub fn convert_transform(&self, t: Transform) -> Transform {
-        Transform::new(Vec3::ZERO, self.converter).mul(t)
+        Transform::new(Vec3::ZERO, self.converter) * t
     }
 }
 

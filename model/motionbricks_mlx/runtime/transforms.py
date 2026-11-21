@@ -18,6 +18,9 @@ import numpy as np
 F = np.float32
 IDENTITY_QUAT = np.array([0.0, 0.0, 0.0, 1.0], F)
 IDENTITY = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0], F)
+# Shared defaults of many signatures: read-only, so no caller can change them by accident.
+IDENTITY_QUAT.setflags(write=False)
+IDENTITY.setflags(write=False)
 
 
 def _f(a) -> np.ndarray:
@@ -27,8 +30,10 @@ def _f(a) -> np.ndarray:
 def transform(p, q) -> np.ndarray:
     """Build transforms from positions ``[..., 3]`` and rotations ``[..., 4]``."""
     p, q = _f(p), _f(q)
-    shape = np.broadcast_shapes(p.shape[:-1], q.shape[:-1])
-    out = np.empty(shape + (7,), F)
+    shape = p.shape[:-1]
+    if shape != q.shape[:-1]:
+        shape = np.broadcast_shapes(shape, q.shape[:-1])
+    out = np.empty((*shape, 7), F)
     out[..., :3] = p
     out[..., 3:] = q
     return out
@@ -42,8 +47,16 @@ def rot(t) -> np.ndarray:
     return _f(t)[..., 3:7]
 
 
+def _cross(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """``np.cross`` of 3-vectors with its exact operations (``a1 b2 - a2 b1``, ...), without its
+    per-call overhead, which dominates for the small arrays here."""
+    a0, a1, a2 = a[..., 0], a[..., 1], a[..., 2]
+    b0, b1, b2 = b[..., 0], b[..., 1], b[..., 2]
+    return np.stack([a1 * b2 - a2 * b1, a2 * b0 - a0 * b2, a0 * b1 - a1 * b0], -1)
+
+
 def cross(a, b) -> np.ndarray:
-    return np.cross(_f(a), _f(b)).astype(F)
+    return _cross(_f(a), _f(b))
 
 
 def dot(a, b) -> np.ndarray:
@@ -70,7 +83,7 @@ def quat_mul(a, b) -> np.ndarray:
     a, b = _f(a), _f(b)
     av, aw = a[..., :3], a[..., 3:]
     bv, bw = b[..., :3], b[..., 3:]
-    v = aw * bv + bw * av + np.cross(av, bv)
+    v = aw * bv + bw * av + _cross(av, bv)
     w = aw * bw - (av * bv).sum(-1, keepdims=True)
     return np.concatenate([v, w], -1).astype(F)
 
@@ -87,7 +100,7 @@ def quat_rotate(q, x) -> np.ndarray:
     qv, w = q[..., :3], q[..., 3:]
     c = 2.0 * w * w - 1.0
     d = 2.0 * (qv * x).sum(-1, keepdims=True)
-    return (x * c + qv * d + np.cross(qv, x) * w * 2.0).astype(F)
+    return (x * c + qv * d + _cross(qv, x) * w * 2.0).astype(F)
 
 
 def quat_rotate_inv(q, x) -> np.ndarray:
@@ -95,7 +108,7 @@ def quat_rotate_inv(q, x) -> np.ndarray:
     qv, w = q[..., :3], q[..., 3:]
     c = 2.0 * w * w - 1.0
     d = 2.0 * (qv * x).sum(-1, keepdims=True)
-    return (x * c + qv * d - np.cross(qv, x) * w * 2.0).astype(F)
+    return (x * c + qv * d - _cross(qv, x) * w * 2.0).astype(F)
 
 
 def quat_from_axis_angle(axis, angle) -> np.ndarray:
@@ -120,46 +133,42 @@ def quat_slerp(q0, q1, t) -> np.ndarray:
 
 
 def quat_from_matrix(m) -> np.ndarray:
-    """``wp.quat_from_matrix`` for ``[..., 3, 3]`` rotation matrices (same branches)."""
+    """``wp.quat_from_matrix`` for ``[..., 3, 3]`` rotation matrices (same branches).
+
+    All four of Warp's branches are evaluated with its float32 operation order, and each matrix
+    keeps the one Warp would take, so the result is bitwise the same as the per-matrix code.
+    """
     m = _f(m)
     shape = m.shape[:-2]
-    m = m.reshape(-1, 3, 3)
-    out = np.empty((m.shape[0], 4), F)
-    for i, r in enumerate(m):
-        tr = r[0, 0] + r[1, 1] + r[2, 2]
-        if tr >= 0:
-            h = np.sqrt(tr + F(1))
-            w = F(0.5) * h
-            h = F(0.5) / h
-            x, y, z = (r[2, 1] - r[1, 2]) * h, (r[0, 2] - r[2, 0]) * h, (r[1, 0] - r[0, 1]) * h
-        else:
-            k = 0
-            if r[1, 1] > r[0, 0]:
-                k = 1
-            if r[2, 2] > r[k, k]:
-                k = 2
-            if k == 0:
-                h = np.sqrt((r[0, 0] - (r[1, 1] + r[2, 2])) + F(1))
-                x = F(0.5) * h
-                h = F(0.5) / h
-                y, z, w = (r[0, 1] + r[1, 0]) * h, (r[2, 0] + r[0, 2]) * h, (r[2, 1] - r[1, 2]) * h
-            elif k == 1:
-                h = np.sqrt((r[1, 1] - (r[2, 2] + r[0, 0])) + F(1))
-                y = F(0.5) * h
-                h = F(0.5) / h
-                z, x, w = (r[1, 2] + r[2, 1]) * h, (r[0, 1] + r[1, 0]) * h, (r[0, 2] - r[2, 0]) * h
-            else:
-                h = np.sqrt((r[2, 2] - (r[0, 0] + r[1, 1])) + F(1))
-                z = F(0.5) * h
-                h = F(0.5) / h
-                x, y, w = (r[2, 0] + r[0, 2]) * h, (r[1, 2] + r[2, 1]) * h, (r[1, 0] - r[0, 1]) * h
-        out[i] = (x, y, z, w)
-    return quat_normalize(out).reshape(shape + (4,))
+    r = m.reshape(-1, 3, 3)
+    r00, r01, r02 = r[:, 0, 0], r[:, 0, 1], r[:, 0, 2]
+    r10, r11, r12 = r[:, 1, 0], r[:, 1, 1], r[:, 1, 2]
+    r20, r21, r22 = r[:, 2, 0], r[:, 2, 1], r[:, 2, 2]
+    one, half = F(1), F(0.5)
+    tr = r00 + r11 + r22
+    with np.errstate(invalid="ignore", divide="ignore"):  # branches that are not taken may be NaN
+        h = np.sqrt(tr + one)
+        s = half / h
+        trace_branch = np.stack([(r21 - r12) * s, (r02 - r20) * s, (r10 - r01) * s, half * h], -1)
+        h = np.sqrt((r00 - (r11 + r22)) + one)
+        s = half / h
+        x_branch = np.stack([half * h, (r01 + r10) * s, (r20 + r02) * s, (r21 - r12) * s], -1)
+        h = np.sqrt((r11 - (r22 + r00)) + one)
+        s = half / h
+        y_branch = np.stack([(r01 + r10) * s, half * h, (r12 + r21) * s, (r02 - r20) * s], -1)
+        h = np.sqrt((r22 - (r00 + r11)) + one)
+        s = half / h
+        z_branch = np.stack([(r20 + r02) * s, (r12 + r21) * s, half * h, (r10 - r01) * s], -1)
+    k = np.where(r11 > r00, 1, 0)
+    k = np.where(r22 > np.where(k == 1, r11, r00), 2, k)
+    out = np.where((k == 0)[:, None], x_branch, np.where((k == 1)[:, None], y_branch, z_branch))
+    out = np.where((tr >= 0)[:, None], trace_branch, out)
+    return quat_normalize(out).reshape((*shape, 4))
 
 
 def quat_between_vectors(a, b) -> np.ndarray:
     a, b = normalize(a), normalize(b)
-    c = np.cross(a, b)
+    c = _cross(a, b)
     d = (a * b).sum(-1, keepdims=True)
     return quat_normalize(np.concatenate([c, 1.0 + d], -1))
 
@@ -224,21 +233,45 @@ def matrix_from_cols(x, y, z) -> np.ndarray:
     return np.stack([_f(x), _f(y), _f(z)], -1)
 
 
-def compute_world_poses(local_poses, parent_indices, root_tx=IDENTITY) -> np.ndarray:
-    """Compose local joint transforms ``[..., J, 7]`` through the hierarchy (parents first)."""
+def check_parent_indices(parent_indices) -> np.ndarray:
+    """Parent indices as int32, checked to list parents first: joint 0 is the only root."""
+    parents = np.asarray(parent_indices, dtype=np.int32)
+    if parents.ndim != 1 or parents.size == 0:
+        raise ValueError("parent_indices must be a non-empty vector.")
+    if parents[0] >= 0:
+        raise ValueError(f"Joint 0 must be the root (parent -1), got parent {parents[0]}.")
+    for joint in range(1, parents.size):
+        if not 0 <= parents[joint] < joint:
+            raise ValueError(f"Joint {joint} has parent {parents[joint]}; each parent must come before its children "
+                             "and only joint 0 may be a root.")
+    return parents
+
+
+def hierarchy_levels(parent_indices) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
+    """The joints below the root grouped by depth, as ``(joints, their parents)`` per level."""
+    parents = check_parent_indices(parent_indices)
+    depth = np.zeros(parents.size, np.int64)
+    for joint in range(1, parents.size):
+        depth[joint] = depth[parents[joint]] + 1
+    levels = []
+    for d in range(1, int(depth.max(initial=0)) + 1):
+        joints = np.flatnonzero(depth == d)
+        levels.append((joints, parents[joints]))
+    return tuple(levels)
+
+
+def compute_world_poses(local_poses, parent_indices, root_tx=IDENTITY, levels=None) -> np.ndarray:
+    """Compose local joint transforms ``[..., J, 7]`` through the hierarchy (parents first).
+
+    The joints of one depth are composed together, which gives the same values as joint by joint.
+    ``levels`` is ``hierarchy_levels(parent_indices)``, which ``Skeleton`` keeps; ``None``
+    computes it.
+    """
     local = _f(local_poses)
+    if levels is None:
+        levels = hierarchy_levels(parent_indices)
     world = np.empty_like(local)
     world[..., 0, :] = transform_mul(root_tx, local[..., 0, :])
-    for j in range(1, local.shape[-2]):
-        world[..., j, :] = transform_mul(world[..., parent_indices[j], :], local[..., j, :])
+    for joints, parents in levels:
+        world[..., joints, :] = transform_mul(world[..., parents, :], local[..., joints, :])
     return world
-
-
-def compute_local_poses(world_poses, parent_indices, root_tx=IDENTITY) -> np.ndarray:
-    world = _f(world_poses)
-    local = np.empty_like(world)
-    for j in range(world.shape[-2]):
-        parent = parent_indices[j]
-        parent_tx = np.broadcast_to(_f(root_tx), world[..., j, :].shape) if parent < 0 else world[..., parent, :]
-        local[..., j, :] = transform_mul(transform_inverse(parent_tx), world[..., j, :])
-    return local

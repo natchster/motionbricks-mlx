@@ -107,19 +107,28 @@ inline M3 quat_m(float r, float i, float j, float k) {
   return o;
 }
 
-// SOMA capture <-> standard T-pose retarget of 6D rotations, in place:
-// rows of `x` (row stride `ld`), joint j's 6D at col0 + 6j: m <- (m @ from[j]) @ to[j]^T.
+// SOMA capture <-> standard T-pose retarget of 6D rotations: rows of `src` (row stride `ld`),
+// joint j's 6D at col0 + 6j: m <- (m @ from[j]) @ to[j]^T, written to the same place in `dst`
+// (`dst` may be `src`). copy_pos: also copy the (joints - 1) * 3 joint positions that precede
+// col0 (joint j > 0 copies the position of joint j - 1), so an out-of-place `dst` gets whole rows.
+struct RetargetParams { int rows, ld, col0, joints, copy_pos; };
+
 [[kernel]] void soma_retarget(
-    device float* x [[buffer(0)]], device const float* from [[buffer(1)]], device const float* to [[buffer(2)]],
-    constant int4& p [[buffer(3)]],  // rows, ld, col0, joints
+    device const float* src [[buffer(0)]], device const float* from [[buffer(1)]], device const float* to [[buffer(2)]],
+    constant RetargetParams& p [[buffer(3)]], device float* dst [[buffer(4)]],
     uint gid [[thread_position_in_grid]]) {
-  if (int(gid) >= p.x * p.w) return;
-  const int row = int(gid) / p.w, j = int(gid) % p.w;
-  device float* s = x + (long)row * p.y + p.z + 6 * j;
+  if (int(gid) >= p.rows * p.joints) return;
+  const int row = int(gid) / p.joints, j = int(gid) % p.joints;
+  device const float* s = src + (long)row * p.ld + p.col0 + 6 * j;
+  device float* o = dst + (long)row * p.ld + p.col0 + 6 * j;
   float six[6] = {s[0], s[1], s[2], s[3], s[4], s[5]};
   M3 m = mul(mul(six_to_m(six), load3(from + 9 * j)), tr(load3(to + 9 * j)));
-  s[0] = m.m[0][0]; s[1] = m.m[1][0]; s[2] = m.m[2][0];
-  s[3] = m.m[0][1]; s[4] = m.m[1][1]; s[5] = m.m[2][1];
+  o[0] = m.m[0][0]; o[1] = m.m[1][0]; o[2] = m.m[2][0];
+  o[3] = m.m[0][1]; o[4] = m.m[1][1]; o[5] = m.m[2][1];
+  if (p.copy_pos && j > 0) {
+    const long pos = (long)row * p.ld + p.col0 - 3 * (p.joints - 1) + 3 * (j - 1);
+    dst[pos] = src[pos]; dst[pos + 1] = src[pos + 1]; dst[pos + 2] = src[pos + 2];
+  }
 }
 
 // MLX remainder semantics (result takes the divisor's sign).

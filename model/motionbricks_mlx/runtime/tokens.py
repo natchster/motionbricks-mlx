@@ -73,7 +73,7 @@ class MotionRecorder:
             raise ValueError("capacity must be positive.")
         reference_pose = np.asarray(reference_pose, dtype=F)
         self.capacity = capacity
-        self.poses = np.empty((capacity,) + reference_pose.shape, F)
+        self.poses = np.empty((capacity, *reference_pose.shape), F)
         self.delta_times = np.zeros(capacity, F)
         self.fill(reference_pose)
 
@@ -90,9 +90,9 @@ class MotionRecorder:
         if not np.isfinite(dt) or dt <= 0.0:
             raise ValueError("delta_time must be finite and positive.")
         self.delta_times[-1] = dt
-        self.delta_times[:-1] = self.delta_times[1:].copy()
+        self.delta_times[:-1] = self.delta_times[1:]  # NumPy handles the overlapping shift
         self.delta_times[-1] = 0.0
-        self.poses[:-1] = self.poses[1:].copy()
+        self.poses[:-1] = self.poses[1:]
         self.poses[-1] = pose
 
     def _check(self, pose) -> np.ndarray:
@@ -128,8 +128,8 @@ class PoseToken:
             raise ValueError("History and token joint counts do not match.")
         lower, upper, blends = history_sample_indices(motion_history.delta_times, MODEL_POSES_PER_TOKEN, MODEL_SAMPLE_RATE)
         h = motion_history.poses
-        for k in range(MODEL_POSES_PER_TOKEN):
-            self.poses[k] = T.blend_transform(h[lower[k]], h[upper[k]], np.full(self.num_joints, blends[k], F))
+        weights = np.broadcast_to(blends[:, None], (MODEL_POSES_PER_TOKEN, self.num_joints))
+        self.poses[:] = T.blend_transform(h[lower], h[upper], weights)
         self._num_poses = MODEL_POSES_PER_TOKEN
 
 
@@ -158,9 +158,8 @@ class DOFToken:
             raise ValueError("History and token coordinate counts do not match.")
         lower, upper, blends = history_sample_indices(motion_history.delta_times, MODEL_POSES_PER_TOKEN, MODEL_SAMPLE_RATE)
         h = motion_history.poses
-        for k in range(MODEL_POSES_PER_TOKEN):
-            a, b, w = h[lower[k]], h[upper[k]], F(blends[k])
-            out = (a + (b - a) * w).astype(F)
-            write_root(T.blend_transform(read_root(a), read_root(b), w), out)
-            self.poses[k] = out
+        a, b = h[lower], h[upper]
+        out = (a + (b - a) * blends[:, None]).astype(F)
+        write_root(T.blend_transform(read_root(a), read_root(b), blends), out)
+        self.poses[:] = out
         self._num_poses = MODEL_POSES_PER_TOKEN

@@ -14,11 +14,14 @@ pytestmark = pytest.mark.skipif(not (UPSTREAM / "motionbricks").is_dir(), reason
 def test_cuda_device_is_absent_but_aliasable():
     wp.init()
     assert not wp.is_cuda_available()
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError, match="cuda:0"):
         wp.get_device("cuda:0")
     with cuda_device_alias() as device:
         wp.set_device("cuda:0")  # what upstream examples do
         assert wp.get_device("cuda").is_cpu and device.is_cpu
+        assert wp.zeros(2).device.is_cpu  # allocations on the default device follow the alias
+        with pytest.raises((RuntimeError, ValueError)):  # explicit device="cuda" does not (documented)
+            wp.zeros(2, device="cuda")
     wp.set_device("cpu")
 
 

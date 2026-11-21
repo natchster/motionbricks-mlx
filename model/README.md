@@ -47,6 +47,11 @@ g1 = mb.load("weights/g1.safetensors", dtype="float16")         # float32 | floa
 g1.quantize(bits=8)                                             # experimental: ~4x smaller transformer weights, fastest at N=1
 ```
 
+`run` (and `prepare`) checks every input's ONNX shape on the host and raises `ValueError` naming
+the input, instead of letting the rig kernels read out of bounds. Model names are `soma` and
+`unitree_g1` (alias `g1`) everywhere. For a stream of single requests, overlap host and GPU work
+with `mx.async_eval` (see the [user guide](../docs/user_guide.md#choosing-precision-and-batching)).
+
 Install and get the weights (MLX + NumPy only, no sandbox):
 
 ```sh
@@ -121,6 +126,10 @@ runtime ([model-rs/docs/runtime_api.md](../model-rs/docs/runtime_api.md)).
 - **Parameters are evaluated before compiling.** Casting to FP16/BF16 and `quantize` are lazy in
   MLX. If the first `mx.compile` trace captured them, every compiled call would recompute about
   200 M casts (≈ 4 ms). `set_compute_dtype` and `quantize` therefore evaluate the parameters.
+- **Anything the compiled graph bakes in drops it.** The trace captures the parameters and
+  `num_inference_steps`. Setting `num_inference_steps`, `set_compute_dtype` (and the inherited
+  `set_dtype`, which is routed to it), `quantize`, `update` and `load_weights` all re-evaluate the
+  parameters where needed and force a fresh trace.
 - **The rig runs as custom Metal kernels** (`kernels.py`, source in `assets/rig_kernels.metal`).
   G1 forward kinematics, joint-angle decoding and the SOMA T-pose retarget are hundreds of tiny
   3×3 products as MLX ops, but one thread per pose as kernels. The op-based versions remain the CPU
@@ -135,13 +144,14 @@ runtime ([model-rs/docs/runtime_api.md](../model-rs/docs/runtime_api.md)).
 
 | Tests | Need | Without them |
 |---|---|---|
-| 10 weight-free unit tests (`test_layers.py`) | nothing | always run |
-| 20 behavioural tests (`test_model.py`) | the checkpoints (`motionbricks-mlx download`) | skipped |
-| 40 parity tests (`test_parity.py`) | the golden fixtures from NVIDIA's PyTorch model (`sandbox/setup.sh`) | skipped |
+| 18 weight-free unit tests (`test_layers.py`) and 21 API tests (`test_api.py`) | nothing | always run |
+| 26 behavioural tests (`test_model.py`) | the checkpoints (`motionbricks-mlx download`) | skipped |
+| 42 parity tests (`test_parity.py`), 2 of them on the CPU stream | the golden fixtures from NVIDIA's PyTorch model (`sandbox/setup.sh`) | skipped |
 | 39 Runtime API tests (`test_runtime.py`): 6 weight-free, 25 parity with upstream's runtime, 8 end to end | weight-free: nothing; parity: the runtime fixtures (`sandbox/setup.sh`) and the clips (`download --clips`); end to end: also the checkpoints | skipped |
 
 `MOTIONBRICKS_CHECKPOINTS`, `MOTIONBRICKS_GOLDEN`, `MOTIONBRICKS_RUNTIME_GOLDEN` and
-`MOTIONBRICKS_CLIPS` point the tests at other locations. The parity
+`MOTIONBRICKS_CLIPS` point the tests at other locations. `MOTIONBRICKS_REQUIRE_FIXTURES=1` turns
+every skip into a failure, so a complete run cannot pass by skipping. The parity
 tests compare against NVIDIA's own PyTorch implementation, using golden fixtures recorded by
 `sandbox/scripts/make_golden.py`. Every sub-network is **teacher-forced** with the exact tensors the
 PyTorch run produced, so an error localizes to one module.
@@ -162,11 +172,16 @@ inputs, randomized requests, one-target requests, restricted durations, and on-m
 
 Other tests cover:
 
-- weight-free unit tests of every block against NumPy derivations;
+- weight-free unit tests of every block against NumPy derivations, including multi-step MaskGIT
+  re-masking against a NumPy port of upstream's sampler;
+- input validation, dtype and loading errors, and strict weight loading;
 - batch-row independence, `mx.compile` = eager, forced durations and allowed-duration masks;
+- settings and weight updates reaching the compiled graph;
 - converted-file round trips and multi-step MaskGIT decoding;
-- FP16, BF16 and INT8 durations against FP32;
-- the custom rig kernels against the op-based reference implementation.
+- FP16, BF16 and INT8 durations against FP32 (at most one flip per test batch), and 4-bit weights;
+- the custom rig kernels against the op-based reference implementation (batch 1, 3 and 33), their
+  shape checks, and the packed-rig offsets in `rig_kernels.metal`;
+- end to end on the CPU stream, which uses the op-based rig.
 
 The Runtime API tests compare with upstream's own runtime code.
 `sandbox/scripts/make_runtime_golden.py` runs upstream's engine methods, recorder, target helpers,

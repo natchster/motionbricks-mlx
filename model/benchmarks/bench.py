@@ -11,6 +11,11 @@ Backends (all run the same request batch, see motionbricks_mlx.examples):
 * ``ort-coreml``                            same graph on ONNX Runtime's CoreML EP (slow to build)
 
     uv run python model/benchmarks/bench.py --models soma unitree_g1 --batches 1 8 32
+
+By default each backend is timed in one block, one backend after the other. ``--rounds N``
+interleaves them instead: for every batch size, each backend runs ``--iters`` timed calls in
+turn, N rounds with a rotating start, and the statistics pool all N rounds. Thermal drift then
+spreads evenly over the backends, which matters when comparing close numbers (FP16 vs BF16).
 """
 
 from __future__ import annotations
@@ -58,6 +63,18 @@ def timeit(fn, warmup, iters):
         times.append(time.perf_counter() - start)
     ms = np.array(times) * 1e3
     return {"median_ms": float(np.median(ms)), "p10_ms": float(np.percentile(ms, 10)), "p90_ms": float(np.percentile(ms, 90))}
+
+
+def sample(fn, warmup, iters):
+    """The loop of ``timeit``, returning the raw times in ms (pooled across ``--rounds``)."""
+    for _ in range(warmup):
+        fn()
+    times = []
+    for _ in range(iters):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return np.array(times) * 1e3
 
 
 def mlx_runner(name, dtype, device="gpu", bits=None):
@@ -114,7 +131,7 @@ def ort_runner(name, provider):
         raise FileNotFoundError(f"{path} (run sandbox/scripts/export_onnx.py)")
     providers = ["CPUExecutionProvider"]
     if provider == "coreml":
-        providers = [("CoreMLExecutionProvider", {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"})] + providers
+        providers = [("CoreMLExecutionProvider", {"ModelFormat": "MLProgram", "MLComputeUnits": "ALL"}), *providers]
     options = ort.SessionOptions()
     options.log_severity_level = 3
     session = ort.InferenceSession(str(path), sess_options=options, providers=providers)
@@ -153,6 +170,54 @@ def host():
             "gpu_cores": gpu_cores, "macos": platform.mac_ver()[0], "mlx": mx.__version__}
 
 
+def setup(name, backend):
+    """``(make, setup seconds)``, or None (printed) when the backend is unavailable."""
+    try:
+        start = time.perf_counter()
+        make = BACKENDS[backend](name)
+    except Exception as exc:
+        print(f"{name:10s} {backend:10s} unavailable: {exc}")
+        return None
+    return make, time.perf_counter() - start
+
+
+def interleaved(name, args):
+    """``--rounds``: every backend in turn for each batch size, pooling the rounds."""
+    makers = {}
+    for backend in args.backends:
+        made = setup(name, backend)
+        if made is not None:
+            makers[backend] = made
+    results = []
+    for batch in args.batches:
+        runs, first_ms = {}, {}
+        for backend, (make, _) in makers.items():
+            runs[backend] = make(batch)
+            first = time.perf_counter()
+            runs[backend]()  # includes graph compilation / session warm-up
+            first_ms[backend] = (time.perf_counter() - first) * 1e3
+        order = list(runs)
+        times = {backend: [] for backend in order}
+        for r in range(args.rounds):
+            for backend in order[r % len(order):] + order[:r % len(order)]:
+                iters = max(5, args.iters // 4) if backend in SLOW else args.iters
+                times[backend].append(sample(runs[backend], args.warmup if backend not in SLOW else 2, iters))
+        for backend in order:
+            ms = np.concatenate(times[backend])
+            stats = {"median_ms": float(np.median(ms)), "p10_ms": float(np.percentile(ms, 10)),
+                     "p90_ms": float(np.percentile(ms, 90))}
+            stats.update(model=name, backend=backend, batch=batch, first_call_ms=first_ms[backend],
+                         setup_s=makers[backend][1], requests_per_s=batch / stats["median_ms"] * 1e3, rounds=args.rounds)
+            results.append(stats)
+            print(f"{name:10s} {backend:10s} N={batch:3d}  median {stats['median_ms']:8.2f} ms  "
+                  f"p90 {stats['p90_ms']:8.2f} ms  {stats['requests_per_s']:9.0f} req/s  (first call {first_ms[backend]:7.0f} ms)")
+    if "torch-mps" in makers:
+        from cudashim import torch_cuda
+
+        torch_cuda.disable()
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--models", nargs="+", default=["soma", "unitree_g1"])
@@ -161,18 +226,25 @@ def main():
     parser.add_argument("--iters", type=int, default=40)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--rounds", type=int, default=1,
+                        help="interleave the backends over this many rounds per batch size (default 1: one after the other)")
     args = parser.parse_args()
+    if args.rounds < 1:
+        parser.error("--rounds must be >= 1")
 
     info = host()
     print(f"# {info['chip']} ({info['gpu_cores']}-core GPU), {info['memory_gb']} GB, macOS {info['macos']}, MLX {info['mlx']}")
     results = []
     for name in args.models:
+        if args.rounds > 1:
+            results += interleaved(name, args)
+            continue
         for backend in args.backends:
             try:
                 start = time.perf_counter()
                 make = BACKENDS[backend](name)
                 setup_s = time.perf_counter() - start
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 print(f"{name:10s} {backend:10s} unavailable: {exc}")
                 continue
             for batch in args.batches:

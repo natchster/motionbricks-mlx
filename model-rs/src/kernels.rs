@@ -6,6 +6,7 @@
 //! (`model/motionbricks_mlx/assets/rig_kernels.metal`), dispatched through `mlx_fast_metal_kernel`.
 
 use mlx_rs::fast::{MetalKernel, MetalKernelApplyOptions, MetalKernelOptions, MetalKernelOutput, TemplateArg};
+use mlx_rs::error::Exception;
 use mlx_rs::{Array, Dtype};
 
 use crate::ops::R;
@@ -32,6 +33,22 @@ fn launch(n: i32, per_group: i32) -> ((i32, i32, i32), (i32, i32, i32)) {
     ((n.max(1), 1, 1), (per_group.min(n.max(1)), 1, 1))
 }
 
+/// Row widths the kernels index with (rig_kernels.metal): a G1 MuJoCo pose, the G1 global
+/// feature layout, and the G1 local-pose features the preprocess writes.
+pub const G1_QPOS: i32 = crate::config::G1_QPOS_DIM;
+pub const G1_FEATURES: i32 = 414;
+pub const G1_LOCAL_POSES: i32 = 303;
+
+/// The kernels read fixed row widths, so a mismatched shape would read out of bounds or leave
+/// output rows unwritten: refuse it on the host (metadata only, no GPU work).
+fn expect_shape(what: &str, a: &Array, want: &[i32]) -> R<()> {
+    if a.shape() == want {
+        Ok(())
+    } else {
+        Err(Exception::custom(format!("rig kernel: {what} has shape {:?}; expected {want:?}", a.shape())))
+    }
+}
+
 pub struct RigKernels {
     g1_pre: MetalKernel,
     g1_post: MetalKernel,
@@ -47,30 +64,51 @@ impl RigKernels {
         })
     }
 
+    /// `ctx`, `tgt`: `(B, 4, 36)` float32 MuJoCo poses.
     pub fn g1_preprocess(&self, ctx: &Array, tgt: &Array, rf: &Array, ri: &Array) -> R<Vec<Array>> {
-        let b = ctx.dim(0);
+        let b = ctx.shape().first().copied().unwrap_or(0);
+        expect_shape("context_qpos", ctx, &[b, 4, G1_QPOS])?;
+        expect_shape("target_qpos", tgt, &[b, 4, G1_QPOS])?;
         let (grid, group) = launch(b, 32);
         let opts = MetalKernelApplyOptions { template_args: vec![("B".into(), TemplateArg::Int(b))], ..Default::default() };
-        // SAFETY: one thread per sequence writes exactly its own rows of each output (shapes below).
-        unsafe { self.g1_pre.apply(&[ctx, tgt, rf, ri], &[out(&[b, 8, 5]), out(&[b, 8, 4]), out(&[b, 8, 303])], grid, group, opts) }
+        // SAFETY: inputs checked above; one thread per sequence writes exactly its own rows of
+        // each output (shapes below).
+        unsafe { self.g1_pre.apply(&[ctx, tgt, rf, ri], &[out(&[b, 8, 5]), out(&[b, 8, 4]), out(&[b, 8, G1_LOCAL_POSES])], grid, group, opts) }
     }
 
+    /// `features`: `(B, T, 414)` float32 global features.
     pub fn g1_postprocess(&self, features: &Array, rf: &Array, ri: &Array) -> R<Vec<Array>> {
-        let (b, t) = (features.dim(0), features.dim(1));
+        let (b, t) = match features.shape() {
+            &[b, t, _] => (b, t),
+            _ => (0, 0),
+        };
+        expect_shape("features", features, &[b, t, G1_FEATURES])?;
         let (grid, group) = launch(b * t, 64);
         let opts = MetalKernelApplyOptions { template_args: vec![("ROWS".into(), TemplateArg::Int(b * t))], ..Default::default() };
-        // SAFETY: one thread per frame reads its feature row and writes its qpos/contact rows.
-        unsafe { self.g1_post.apply(&[features, rf, ri], &[out(&[b, t, 36]), out(&[b, t, 4])], grid, group, opts) }
+        // SAFETY: input checked above; one thread per frame reads its feature row and writes its
+        // qpos/contact rows.
+        unsafe { self.g1_post.apply(&[features, rf, ri], &[out(&[b, t, G1_QPOS]), out(&[b, t, 4])], grid, group, opts) }
     }
 
+    /// `six`: `(..., joints * 6)` float32; `src`/`dst`: `(joints, 3, 3)` offsets.
     pub fn soma_retarget(&self, six: &Array, src: &Array, dst: &Array, joints: i32) -> R<Array> {
-        let rows = six.size() as i32 / (joints * 6);
+        if six.ndim() == 0 {
+            return Err(Exception::custom("rig kernel: 6D rotations need at least one axis"));
+        }
+        let mut want = six.shape().to_vec();
+        if let Some(last) = want.last_mut() {
+            *last = joints * 6;
+        }
+        expect_shape("6D rotations", six, &want)?;
+        expect_shape("source offsets", src, &[joints, 3, 3])?;
+        expect_shape("target offsets", dst, &[joints, 3, 3])?;
+        let rows = (six.size() / (joints as usize * 6)) as i32;
         let (grid, group) = launch(rows * joints, 64);
         let opts = MetalKernelApplyOptions {
             template_args: vec![("ROWS".into(), TemplateArg::Int(rows)), ("J".into(), TemplateArg::Int(joints))],
             ..Default::default()
         };
-        // SAFETY: one thread per (row, joint) writes its own 6 values; offsets are (J, 3, 3).
+        // SAFETY: shapes checked above; one thread per (row, joint) writes its own 6 values.
         Ok(unsafe { self.soma.apply(&[six, src, dst], &[out(six.shape())], grid, group, opts) }?.remove(0))
     }
 }

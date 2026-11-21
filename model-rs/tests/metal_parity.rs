@@ -22,14 +22,16 @@ fn put(dst: &Buf, v: &[f32]) {
 }
 
 fn put_i(dst: &Buf, v: &[i32]) {
-    put(dst, &v.iter().map(|&x| f32::from_bits(x as u32)).collect::<Vec<_>>());
+    dst.write_i32(v);
 }
 
 fn mask(n: &Npy) -> Vec<f32> {
     n.to_f32().into_iter().map(|x| (x != 0.0) as i32 as f32).collect()
 }
 
-fn setup(name: &str) -> Option<(MetalModel, Vec<(&'static str, HashMap<String, Npy>)>)> {
+type Cases = Vec<(&'static str, HashMap<String, Npy>)>;
+
+fn setup(name: &str) -> Option<(MetalModel, Cases)> {
     let dir = checkpoints(name)?;
     let cases = goldens(name)?;
     Some((MetalModel::from_checkpoints(name, dir, 8).expect("metal model loads"), cases))
@@ -56,10 +58,10 @@ fn root_network(name: &str) {
         m.encode_root(&mut rec, &m.dims(n, true));
         wait(&rec.commit());
         let want = v("root_out.num_token_logits");
-        let got = &b.logits.as_slice()[..n * 12];
+        let got = b.logits.to_f32(n * 12);
         let finite: Vec<bool> = want.iter().map(|x| x.is_finite()).collect();
         f.check(got.iter().map(|x| x.is_finite()).collect::<Vec<_>>() == finite, || format!("{case}: masked (-inf) classes differ"));
-        let e = rel_err(got, &want, |k| finite[k]);
+        let e = rel_err(&got, &want, |k| finite[k]);
         f.check(e < 1e-4, || format!("{case}: root logits rel err {e}"));
         let tokens = m.num_tokens(n);
         f.check(tokens == g["root_out.pred_num_tokens"].to_i32(), || format!("{case}: durations {tokens:?}"));
@@ -85,7 +87,8 @@ fn pose_network(name: &str) {
         put(&b.pcond, &v("pose_in.pose_cond"));
         put(&b.hpc, &mask(&g["pose_in.has_pose_cond"]));
         put_i(&b.nt, &nt);
-        let le: Vec<f32> = (0..n * 16 * 128).map(|k| m.len_emb_host[(nt[k / (16 * 128)] as usize - 6) * 128 + k % 128]).collect();
+        let len_emb = m.len_emb().to_f32(m.len_emb().len());
+        let le: Vec<f32> = (0..n * 16 * 128).map(|k| len_emb[(nt[k / (16 * 128)] as usize - 6) * 128 + k % 128]).collect();
         put(&b.le, &le);
         put(&b.ppad, &(0..n * 16).map(|k| ((k % 16) as i32 >= nt[k / 16]) as i32 as f32).collect::<Vec<_>>());
         let mut rec = Recorder::new(&m.gpu);
@@ -107,6 +110,7 @@ fn vqvae_decoder(name: &str) {
     let b = &m.b;
     let mut f = Failures::default();
     let (heads, codes, cw) = (m.spec.vq.num_heads as usize, m.spec.vq.codes_per_head as usize, (m.spec.vq.code_dim / m.spec.vq.num_heads) as usize);
+    let codebook = m.codebook().to_f32(m.codebook().len());
     for (case, g) in &cases {
         let v = |k: &str| g[k].to_f32();
         let n = g["pred_num_tokens"].shape[0] as usize;
@@ -116,7 +120,7 @@ fn vqvae_decoder(name: &str) {
             .enumerate()
             .flat_map(|(k, &t)| {
                 let row = (k % heads) * codes + t as usize;
-                m.codebook_host[row * cw..(row + 1) * cw].to_vec()
+                codebook[row * cw..(row + 1) * cw].to_vec()
             })
             .collect();
         put(&b.lat, &lat);

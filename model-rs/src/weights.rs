@@ -95,13 +95,10 @@ pub struct Loaded {
 }
 
 /// Read the three SafeTensors files + stats of a Hugging Face model folder.
+///
+/// Conv1d kernels stay the strided transposed views the Python port keeps. (Storing them
+/// row-contiguously was tried: numerically identical, and the default layout was kept.)
 pub fn read_checkpoints(dir: impl AsRef<Path>, spec: &ModelSpec) -> Result<Loaded> {
-    read_checkpoints_with(dir, spec, false)
-}
-
-/// `contiguous_conv`: store the transposed Conv1d kernels row-contiguously instead of as the
-/// strided views the Python port keeps (an optimization experiment; numerically identical).
-pub fn read_checkpoints_with(dir: impl AsRef<Path>, spec: &ModelSpec, contiguous_conv: bool) -> Result<Loaded> {
     let dir = dir.as_ref();
     let mut tensors = HashMap::new();
     for (module, rel, prefix) in spec.checkpoint_files {
@@ -118,8 +115,7 @@ pub fn read_checkpoints_with(dir: impl AsRef<Path>, spec: &ModelSpec, contiguous
             let key = format!("{module}.{}", mlx_name(rest));
             // Conv1d kernels: PyTorch (out, in, k) -> MLX channels-last (out, k, in).
             let value = if value.ndim() == 3 && key.ends_with(".weight") {
-                let t = value.transpose_axes(&[0, 2, 1])?;
-                if contiguous_conv { t.contiguous()? } else { t }
+                value.transpose_axes(&[0, 2, 1])?
             } else {
                 value
             };
@@ -168,4 +164,30 @@ pub fn read_converted(path: impl AsRef<Path>) -> Result<(String, Loaded)> {
         .map(|(k, v)| Ok((k, v.as_dtype(Dtype::Float32)?)))
         .collect::<std::result::Result<HashMap<_, _>, mlx_rs::error::Exception>>()?;
     Ok((name, Loaded { tensors, mean, std }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn torch_names_map_to_mlx() {
+        assert_eq!(mlx_name("_proj_input.0.weight"), "proj_input.0.weight");
+        assert_eq!(mlx_name("layers.3.self_attn.in_proj_weight"), "layers.3.self_attn.in_proj.weight");
+        assert_eq!(mlx_name("layers.3.self_attn.in_proj_bias"), "layers.3.self_attn.in_proj.bias");
+        assert_eq!(mlx_name("transformer._layers.0.linear1.bias"), "transformer.layers.0.linear1.bias");
+    }
+
+    #[test]
+    fn loading_is_strict() {
+        let t = |names: &[&str]| -> HashMap<String, Array> { names.iter().map(|n| (n.to_string(), Array::from_f32(1.0))).collect() };
+        let mut w = Weights::new(t(&["a.weight", "vqvae.encoder.x"]), Dtype::Float16);
+        assert_eq!(w.get("a.weight").unwrap().dtype(), Dtype::Float16);
+        assert!(w.get("missing").is_err());
+        assert!(w.finish().is_ok(), "the unused VQ-VAE encoder is allowed");
+        let mut w = Weights::new(t(&["a.weight", "b.bias"]), Dtype::Float32);
+        w.get("a.weight").unwrap();
+        let err = w.finish().unwrap_err().to_string();
+        assert!(err.contains("b.bias"), "{err}");
+    }
 }

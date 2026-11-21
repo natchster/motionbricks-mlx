@@ -17,14 +17,16 @@ pub mod player;
 pub mod target_pose;
 pub mod tokens;
 
-pub use animation::{AnimationBuffer, DofAnimationBuffer, FootContacts, Skeleton, create_animation_buffer_for_skeleton, frame_index_from_time, read_root, write_root};
+pub use animation::{AnimationBuffer, DofAnimationBuffer, FootContacts, MotionBuffer, Skeleton, create_animation_buffer_for_skeleton, frame_index_from_time, read_root, write_root};
 pub use contract::*;
-pub use engine::{Backend, GenerationTimer, MlxBackend, MotionBricksSomaEngine, MotionBricksUnitreeG1Engine, Prediction};
+pub use engine::{
+    Backend, EngineCore, ForwardFn, GenerationTimer, MlxBackend, MotionBricksEngine, MotionBricksSomaEngine, MotionBricksUnitreeG1Engine, NoBackend, Prediction,
+};
 pub use io::{CSV_SAMPLE_RATE, FacingDirectionType, SpaceConverter, load_bvh, load_csv, load_skeleton_from_bvh, model_to_runtime, save_csv};
 pub use math::{Quat, Transform, Vec3};
-pub use player::{GeneratedDofMotionPlayer, GeneratedMotionPlayer};
+pub use player::{GeneratedDofMotionPlayer, GeneratedMotionPlayer, GeneratedPlayer};
 pub use target_pose::{
     MAX_TRANSITION_EARLY_BY_FRAMES, TargetPoseIkCorrector, TargetPoseInferenceParams, TwoBoneIkChainConfig, adjust_target_dof_speed,
     adjust_target_pose_speed, create_soma_target_pose_ik_rig, ik_pin, place_target_dof, place_target_poses,
 };
-pub use tokens::{DofToken, MotionRecorder, PoseToken, history_sample_indices};
+pub use tokens::{DofToken, MotionRecorder, MotionToken, PoseToken, history_sample_indices};

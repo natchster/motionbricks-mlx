@@ -33,6 +33,15 @@ pub enum ModelRig {
     UnitreeG1,
 }
 
+impl From<crate::config::ModelKind> for ModelRig {
+    fn from(kind: crate::config::ModelKind) -> Self {
+        match kind {
+            crate::config::ModelKind::Soma => ModelRig::Soma,
+            crate::config::ModelKind::UnitreeG1 => ModelRig::UnitreeG1,
+        }
+    }
+}
+
 impl ModelRig {
     pub fn parse(name: &str) -> Result<Self> {
         match name {
@@ -105,8 +114,12 @@ impl MotionBricksInferenceConfig {
         Ok(())
     }
 
-    /// The allowed token counts as a bit mask, bit 0 for 6 tokens.
+    /// The allowed token counts as a bit mask, bit 0 for 6 tokens. Counts outside 6 to 16 are
+    /// left out (`validate` rejects them).
     pub fn allowed_token_bits(&self) -> u32 {
-        self.allowed_token_counts.iter().fold(0, |bits, c| bits | 1 << (c - MODEL_MIN_TOKEN_COUNT))
+        self.allowed_token_counts
+            .iter()
+            .filter(|c| (MODEL_MIN_TOKEN_COUNT..=MODEL_MAX_TOKEN_COUNT).contains(c))
+            .fold(0, |bits, c| bits | 1 << (c - MODEL_MIN_TOKEN_COUNT))
     }
 }

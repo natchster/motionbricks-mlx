@@ -75,7 +75,8 @@ inline float rem(float a, float b) {
   return (r != 0.0f && ((r < 0.0f) != (b < 0.0f))) ? r + b : r;
 }
 inline float wrap_pi(float a) { return rem(a + M_PI_F, 2.0f * M_PI_F) - M_PI_F; }
-// Packed G1 rig (G1Rig.packed): floats basis 9 | axes 29*3 | q2t_mapped 29*9 | rest 30*3 |
+// Packed G1 rig (G1Rig.rf / G1Rig.ri; sizes in kernels.G1_RF_LAYOUT / G1_RI_LAYOUT, checked by test_layers):
+// floats basis 9 | axes 29*3 | q2t_mapped 29*9 | rest 30*3 |
 // neutral 34*3 | f2q 34*9 | model_axes 29*3; ints parents 30 | model_parents 34 | reverse 34 | mapping 29
 constant constexpr int F_BASIS = 0, F_AXES = 9, F_Q2T = 96, F_REST = 357, F_NEUTRAL = 447, F_F2Q = 549, F_MAXES = 855;
 constant constexpr int I_PARENTS = 0, I_MPARENTS = 30, I_REVERSE = 64, I_MAPPING = 98;

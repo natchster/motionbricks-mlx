@@ -12,6 +12,8 @@ OnnxParser / BuilderConfig / Runtime / ICudaEngine / IExecutionContext with the 
   array's ``ptr`` or a NumPy array's ``ctypes.data`` is the buffer the GPU would see.
 * Execution runs on ONNX Runtime's CPU EP (bit-faithful FP32, the documented TensorRT
   parity reference) or CoreML EP (``CUDASHIM_TRT_PROVIDER=coreml``, uses the GPU/ANE).
+* ``BuilderFlag.FP16`` / ``TF32`` are recorded in the plan but do not change the math: an FP16
+  build runs in FP32 and logs a warning, so it cannot stand in for checking FP16 accuracy.
 
 Install as the importable ``tensorrt`` module with :func:`cudashim.install_tensorrt`.
 """
@@ -145,9 +147,9 @@ class INetworkDefinition:
                         dim.Clear()
                         dim.dim_value = int(size)
             onnx_bytes = self.onnx_model.SerializeToString()
-            session = _session(onnx_bytes)
+            session = _session(onnx_bytes, hand_off=True)
             results = session.run(None, {t.name: _dummy(t) for t in self.inputs})
-            outputs = [ITensor(o.name, r.shape, _FROM_ONNX_NP(r.dtype)) for o, r in zip(session.get_outputs(), results)]
+            outputs = [ITensor(o.name, r.shape, _from_onnx_np(r.dtype)) for o, r in zip(session.get_outputs(), results)]
             self._resolved_key, self._resolved = key, (onnx_bytes, outputs)
         return self._resolved
 
@@ -166,7 +168,7 @@ class OnnxParser:
 
         try:
             model = onnx.load(str(path))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             self._errors.append(f"cannot load {path}: {exc}")
             return False
         return self._populate(model)
@@ -174,7 +176,12 @@ class OnnxParser:
     def parse(self, data: bytes) -> bool:
         import onnx
 
-        return self._populate(onnx.load_from_string(bytes(data)))
+        try:
+            model = onnx.load_from_string(bytes(data))
+        except Exception as exc:
+            self._errors.append(f"cannot parse ONNX bytes: {exc}")
+            return False
+        return self._populate(model)
 
     def _populate(self, model) -> bool:
         def tensors(values):
@@ -219,12 +226,32 @@ def _providers():
     return ["CPUExecutionProvider"]
 
 
-def _session(onnx_bytes: bytes):
+# The session of the latest shape-resolving dry run, kept for the engine built from the same
+# graph so a build + deserialize creates one ONNX Runtime session, not two: [(providers, bytes, session)].
+_handoff: list = []
+
+
+def _session(onnx_bytes: bytes, hand_off: bool = False):
+    providers = _providers()
+    if _handoff:
+        held_providers, held_bytes, held = _handoff[0]
+        if held_providers == providers and len(held_bytes) == len(onnx_bytes) and held_bytes == onnx_bytes:
+            _handoff.clear()
+            return held
     import onnxruntime as ort
 
     options = ort.SessionOptions()
     options.log_severity_level = 3
-    return ort.InferenceSession(onnx_bytes, sess_options=options, providers=_providers())
+    session = ort.InferenceSession(onnx_bytes, sess_options=options, providers=providers)
+    if hand_off:
+        _handoff[:] = [(providers, onnx_bytes, session)]
+    return session
+
+
+def _warn(logger, message: str) -> None:
+    log = getattr(logger, "log", None)
+    if callable(log):
+        log(_Severity.WARNING, message)
 
 
 def _dummy(tensor: ITensor):
@@ -252,6 +279,8 @@ class Builder:
             dynamic = [t.name for t in network.inputs if any(d < 0 for d in t.shape)]
             raise ValueError(f"inputs are still dynamic: {dynamic}")
         onnx_bytes, outputs = resolved
+        if config.get_flag(BuilderFlag.FP16):
+            _warn(self.logger, "BuilderFlag.FP16 is recorded but not emulated: ONNX Runtime runs this plan in FP32")
         header = {
             "inputs": [[t.name, list(t.shape), int(t.dtype)] for t in network.inputs],
             "outputs": [[t.name, list(t.shape), int(t.dtype)] for t in outputs],
@@ -262,7 +291,7 @@ class Builder:
         return memoryview(_MAGIC + len(raw).to_bytes(8, "little") + raw + onnx_bytes)
 
 
-def _FROM_ONNX_NP(dtype) -> DataType:  # noqa: N802
+def _from_onnx_np(dtype) -> DataType:
     for key, value in _NP.items():
         if np.dtype(value) == np.dtype(dtype):
             return key
@@ -307,7 +336,10 @@ class IExecutionContext:
         self.addresses: dict[str, int] = {}
 
     def set_tensor_address(self, name, address) -> bool:
+        """False (like TensorRT) for an unknown name, or a null address for a non-empty tensor."""
         if name not in self.engine._io:
+            return False
+        if int(address) == 0 and int(np.prod(self.engine._io[name][1])) > 0:
             return False
         self.addresses[name] = int(address)
         return True
@@ -324,21 +356,22 @@ class IExecutionContext:
 
     def execute_async_v3(self, stream_handle=0) -> bool:
         """Synchronous on the host; ``stream_handle`` is accepted and ignored."""
-        missing = [n for n in self.engine._names if n not in self.addresses]
+        missing = [n for n in self.engine._names if not self.addresses.get(n) and int(np.prod(self.engine._io[n][1])) > 0]
         if missing:
-            raise RuntimeError(f"tensor addresses not set: {missing}")
+            raise RuntimeError(f"tensor addresses not set (or null): {missing}")
         feeds = {}
         for name in self.engine._names:
             if self.engine._io[name][0] == TensorIOMode.INPUT:
                 feeds[name] = self._view(name).copy()
         outputs = self.engine.session.run(None, feeds)
         for meta, value in zip(self.engine.session.get_outputs(), outputs):
-            np.copyto(self._view(meta.name), value.astype(self._view(meta.name).dtype, copy=False))
+            view = self._view(meta.name)
+            np.copyto(view, value.astype(view.dtype, copy=False))
         return True
 
     def execute_v2(self, bindings) -> bool:
         for name, address in zip(self.engine._names, bindings):
-            self.addresses[name] = int(address)
+            self.addresses[name] = int(address)  # null addresses are rejected by execute_async_v3
         return self.execute_async_v3(0)
 
 

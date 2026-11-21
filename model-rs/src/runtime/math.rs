@@ -213,9 +213,6 @@ impl Transform {
     pub fn to_array(self) -> [f32; 7] {
         [self.p.0[0], self.p.0[1], self.p.0[2], self.q[0], self.q[1], self.q[2], self.q[3]]
     }
-    pub fn mul(self, b: Transform) -> Transform {
-        Transform { p: self.p + quat_rotate(self.q, b.p), q: quat_mul(self.q, b.q) }
-    }
     pub fn inverse(self) -> Transform {
         let q = quat_inverse(self.q);
         Transform { p: -quat_rotate(q, self.p), q }
@@ -228,17 +225,27 @@ impl Transform {
     }
 }
 
+/// `a * b` composes the transforms (`wp.transform_multiply`): `b` first, then `a`.
+impl Mul for Transform {
+    type Output = Transform;
+    #[inline]
+    #[allow(clippy::suspicious_arithmetic_impl)] // composition adds the rotated offset
+    fn mul(self, b: Transform) -> Transform {
+        Transform { p: self.p + quat_rotate(self.q, b.p), q: quat_mul(self.q, b.q) }
+    }
+}
+
 /// Positions lerp, rotations slerp (`pose_utils.blend_transform`).
 pub fn blend_transform(a: Transform, b: Transform, t: f32) -> Transform {
     Transform { p: a.p.lerp(b.p, t), q: quat_slerp(a.q, b.q, t) }
 }
 
 pub fn compute_delta_transform(src: Transform, dst: Transform) -> Transform {
-    src.inverse().mul(dst)
+    src.inverse() * dst
 }
 
 pub fn apply_delta_transform(t: Transform, delta: Transform, weight: f32) -> Transform {
-    t.mul(blend_transform(Transform::IDENTITY, delta, weight))
+    t * blend_transform(Transform::IDENTITY, delta, weight)
 }
 
 /// World-space position offset and post-multiplied rotation from a generated root to a guide root.
@@ -260,15 +267,23 @@ pub fn quadratic_fade_weight(value: f32) -> f32 {
     if t < 0.5 { 1.0 - 2.0 * t * t } else { 2.0 * rem * rem }
 }
 
-/// Compose local joint transforms through the hierarchy (each parent before its children).
+/// Compose local joint transforms through the hierarchy (each parent before its children, as
+/// [`Skeleton`](super::Skeleton) guarantees).
 pub fn compute_world_poses(local: &[Transform], parents: &[i32], root: Transform) -> Vec<Transform> {
     let mut world = Vec::with_capacity(local.len());
-    world.push(root.mul(local[0]));
+    compute_world_poses_into(local, parents, root, &mut world);
+    world
+}
+
+/// The same into `world`, reusing its allocation.
+pub fn compute_world_poses_into(local: &[Transform], parents: &[i32], root: Transform, world: &mut Vec<Transform>) {
+    world.clear();
+    let Some(&first) = local.first() else { return };
+    world.push(root * first);
     for j in 1..local.len() {
         let parent = world[parents[j] as usize];
-        world.push(parent.mul(local[j]));
+        world.push(parent * local[j]);
     }
-    world
 }
 
 #[cfg(test)]
@@ -279,7 +294,7 @@ mod tests {
     fn inverse_and_slerp() {
         let q = quat_normalize([0.3, -0.2, 0.5, 0.7]);
         let t = Transform::new(Vec3::new(1.0, 2.0, -3.0), q);
-        let i = t.mul(t.inverse());
+        let i = t * t.inverse();
         assert!(i.p.length() < 1e-5 && (i.q[3].abs() - 1.0).abs() < 1e-5);
         let half = quat_slerp(QUAT_IDENTITY, q, 0.5);
         let full = quat_mul(half, half);

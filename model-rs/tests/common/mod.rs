@@ -6,8 +6,9 @@
 //!
 //! Checkpoints: `checkpoints/MotionBricks` (`model-rs/scripts/download_weights.sh`), or
 //! `$MOTIONBRICKS_CHECKPOINTS`. Golden fixtures from the PyTorch reference: `sandbox/golden`
-//! (`sandbox/setup.sh`), or `$MOTIONBRICKS_GOLDEN`. Tests that need either print `SKIPPED` and
-//! pass without them (Rust's test harness has no skip state).
+//! (`sandbox/setup.sh`), or `$MOTIONBRICKS_GOLDEN`. Tests that need either print `SKIPPED` to
+//! stderr and pass without them (Rust's test harness has no skip state), unless
+//! `MOTIONBRICKS_REQUIRE_FIXTURES=1`, which turns every skip into a failure.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use mlx_rs::Array;
-use motionbricks_rs::npy::{Npy, load_npz};
+use motionbricks_rs::config::{NUM_TOKEN_CHOICES, checkpoint_dir};
+use motionbricks_rs::examples;
+use motionbricks_rs::npy::{Npy, NpyData, load_npz};
 
 pub const MODELS: [&str; 2] = ["unitree_g1", "soma"];
 pub const CASES: [&str; 5] = ["trace", "random", "one_target", "restricted", "chained"];
@@ -31,41 +34,118 @@ pub fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
 }
 
-fn folder(name: &str) -> &'static str {
-    if name == "soma" { "soma" } else { "g1" }
-}
-
-pub fn checkpoints_root() -> PathBuf {
-    std::env::var_os("MOTIONBRICKS_CHECKPOINTS").map(PathBuf::from).unwrap_or_else(|| root().join("checkpoints/MotionBricks"))
-}
-
 pub fn golden_root() -> PathBuf {
     std::env::var_os("MOTIONBRICKS_GOLDEN").map(PathBuf::from).unwrap_or_else(|| root().join("sandbox/golden"))
 }
 
-/// The checkpoint folder of `name`, or `None` (after printing a skip notice) when it is missing.
+/// Whether missing inputs fail the tests (`MOTIONBRICKS_REQUIRE_FIXTURES=1`) instead of skipping.
+pub fn fixtures_required() -> bool {
+    std::env::var_os("MOTIONBRICKS_REQUIRE_FIXTURES").is_some_and(|v| v == "1")
+}
+
+/// Report a missing test input: a skip notice on stderr, or a panic when fixtures are required.
+pub fn skip(reason: &str) {
+    if fixtures_required() {
+        panic!("{reason} (MOTIONBRICKS_REQUIRE_FIXTURES=1)");
+    }
+    eprintln!("SKIPPED: {reason}");
+}
+
+/// The checkpoint folder of `name`, or `None` (after [`skip`]) when it is missing.
 pub fn checkpoints(name: &str) -> Option<PathBuf> {
-    let dir = checkpoints_root().join(folder(name));
+    let dir = checkpoint_dir(name);
     let has = dir.is_dir() && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false);
     if !has {
-        println!("SKIPPED: {name} checkpoints missing (run model-rs/scripts/download_weights.sh)");
+        skip(&format!("{name} checkpoints missing in {} (run model-rs/scripts/download_weights.sh)", dir.display()));
         return None;
     }
     Some(dir)
 }
 
-/// Golden fixture of `name`/`case`, or `None` (after printing a skip notice) when it is missing.
+/// Golden fixture of `name`/`case`, or `None` (after [`skip`]) when it is missing.
 pub fn golden(name: &str, case: &str) -> Option<HashMap<String, Npy>> {
     let path = golden_root().join(name).join(format!("{case}.npz"));
     if !path.is_file() {
-        println!("SKIPPED: golden fixture {} missing (made by the sandbox: sandbox/setup.sh)", path.display());
+        skip(&format!("golden fixture {} missing (made by the sandbox: sandbox/setup.sh)", path.display()));
         return None;
     }
     Some(load_npz(&path).expect("golden fixture loads"))
 }
 
+/// The synthetic request of `examples::request` for a known model.
+pub fn request(name: &str, batch: usize, seed: u64) -> HashMap<String, Npy> {
+    examples::request(name, batch, seed).expect("known model")
+}
+
+/// A request of 6 rows where row `i` allows only `6 + i` and `16 - i` tokens.
+pub fn restricted_request(name: &str) -> HashMap<String, Npy> {
+    let mut request = request(name, 6, 11);
+    let width = NUM_TOKEN_CHOICES as usize;
+    let mut allowed = vec![0i32; 6 * width];
+    for i in 0..6 {
+        allowed[i * width + i] = 1;
+        allowed[i * width + width - 1 - i] = 1;
+    }
+    request.insert("allowed_pred_num_tokens".into(), Npy { shape: vec![6, width as i32], data: NpyData::I32(allowed) });
+    request
+}
+
+/// The durations chosen for [`restricted_request`] are all allowed.
+pub fn check_restricted(tokens: &[i32]) {
+    assert_eq!(tokens.len(), 6);
+    for (i, &count) in tokens.iter().enumerate() {
+        assert!([i as i32, 10 - i as i32].contains(&(count - 6)), "row {i}: {count} tokens not allowed");
+    }
+}
+
+/// Shared by the FP16/BF16 and INT8 tests (`test_model.py`): >= 75% of durations match FP32,
+/// and (`check_motion`) the median deviation stays below 0.05 where the duration matches.
+/// Finiteness is checked by the callers.
+pub fn tracks_fp32(fp32_tokens: &[i32], low_tokens: &[i32], fp32_motion: &[f32], low_motion: &[f32], check_motion: bool) {
+    let same: Vec<bool> = fp32_tokens.iter().zip(low_tokens).map(|(x, y)| x == y).collect();
+    let agree = same.iter().filter(|&&s| s).count();
+    assert!(agree * 4 >= same.len() * 3, "only {agree}/{} durations match FP32", same.len());
+    if check_motion {
+        let per = fp32_motion.len() / same.len();
+        let diffs: Vec<f32> = (0..fp32_motion.len()).filter(|k| same[k / per]).map(|k| (fp32_motion[k] - low_motion[k]).abs()).collect();
+        let m = median(diffs);
+        assert!(m < 0.05, "median |diff| {m} where durations match");
+    }
+}
+
+/// A fresh temporary directory, removed when dropped (also when the test panics).
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("motionbricks-rs-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        TempDir(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// One `#[test]` per function and model: `mod unitree_g1 { fn t() }` and `mod soma { fn t() }`.
+#[allow(unused_macros)]
+macro_rules! for_both_models {
+    ($($t:ident),* $(,)?) => {
+        mod unitree_g1 { $( #[test] fn $t() { super::$t("unitree_g1") } )* }
+        mod soma { $( #[test] fn $t() { super::$t("soma") } )* }
+    };
+}
+#[allow(unused_imports)]
+pub(crate) use for_both_models;
+
+/// Golden cases by name.
+pub type Cases = Vec<(&'static str, HashMap<String, Npy>)>;
+
 /// All five golden cases of `name`, or `None` if any is missing.
-pub fn goldens(name: &str) -> Option<Vec<(&'static str, HashMap<String, Npy>)>> {
+pub fn goldens(name: &str) -> Option<Cases> {
     CASES.iter().map(|case| golden(name, case).map(|g| (*case, g))).collect()
 }
 
@@ -96,8 +176,10 @@ pub fn argmax_rows(values: &[f32], width: usize) -> Vec<usize> {
     values.chunks(width).map(|r| r.iter().enumerate().fold(0, |b, (k, &x)| if x > r[b] { k } else { b })).collect()
 }
 
+/// Upper median (the middle element after sorting; NaN sorts last). Panics on an empty vector.
 pub fn median(mut v: Vec<f32>) -> f32 {
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!(!v.is_empty(), "median of no values");
+    v.sort_by(f32::total_cmp);
     v[v.len() / 2]
 }
 
@@ -118,6 +200,7 @@ impl Failures {
 
 /// End-to-end tolerances of `test_parity.py::test_end_to_end`, on the frames inside each request's
 /// chosen duration. `out`: `pred_qpos` (G1) or `pred_global_motions` (SOMA), flattened.
+#[allow(clippy::too_many_arguments)]
 pub fn check_end_to_end(
     f: &mut Failures, name: &str, case: &str, label: &str, g: &HashMap<String, Npy>, out: &[f32], durations: &[i32], contacts: Option<&[f32]>,
 ) {
@@ -206,6 +289,7 @@ pub fn to_arrays(w: &HashMap<String, Vec<f32>>, d: usize, ffn: usize) -> HashMap
 }
 
 /// PyTorch `TransformerEncoderLayer` (post-norm, ReLU) in float64; `pad[b * l + j]` = padded key.
+#[allow(clippy::too_many_arguments)]
 pub fn reference_layer(x: &[f64], w: &HashMap<String, Vec<f32>>, layer: usize, b: usize, l: usize, d: usize, ffn: usize, heads: usize, pad: &[bool]) -> Vec<f64> {
     let g = |n: &str| w[&format!("t.layers.{layer}.{n}")].iter().map(|&v| v as f64).collect::<Vec<f64>>();
     let lin = |x: &[f64], wt: &[f64], bias: &[f64], n: usize, k: usize| -> Vec<f64> {

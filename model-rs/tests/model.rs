@@ -14,13 +14,13 @@ use std::rc::Rc;
 
 use common::*;
 use mlx_rs::{Array, Dtype};
-use motionbricks_rs::npy::{Npy, NpyData};
+use motionbricks_rs::npy::Npy;
 use motionbricks_rs::ops::{to_vec_f32, to_vec_i32};
-use motionbricks_rs::{MotionBricks, compiled, convert, examples, parse_dtype};
+use motionbricks_rs::{MotionBricks, Precision, compiled, convert, examples};
 
-fn load(name: &str, dtype: &str) -> Option<MotionBricks> {
+fn load(name: &str, precision: &str) -> Option<MotionBricks> {
     let dir = checkpoints(name)?;
-    Some(MotionBricks::from_checkpoints(name, dir, parse_dtype(dtype).unwrap()).expect("model loads"))
+    Some(MotionBricks::load(name, dir, precision).expect("model loads"))
 }
 
 struct Out {
@@ -50,7 +50,7 @@ fn interface_matches_onnx_contract(name: &str) {
     let _gpu = gpu_lock();
     let Some(model) = load(name, "float32") else { return };
     let model = Rc::new(model);
-    let out = run(&model, &examples::request(name, 2, 0), true);
+    let out = run(&model, &request(name, 2, 0), true);
     if name == "unitree_g1" {
         assert_eq!(out.arrays[0].shape(), &[2, 64, 36]);
         assert_eq!(out.arrays[2].shape(), &[2, 64, 4]);
@@ -66,11 +66,16 @@ fn compiled_equals_eager(name: &str) {
     let _gpu = gpu_lock();
     let Some(model) = load(name, "float32") else { return };
     let model = Rc::new(model);
-    let request = examples::request(name, 3, 5);
+    let request = request(name, 3, 5);
     let (eager, fused) = (run(&model, &request, false), run(&model, &request, true));
     for k in 0..eager.arrays.len() {
         let e = max_abs(&eager.values(k), &fused.values(k), |_| true);
         assert!(e < 1e-5, "output {k}: max abs {e}");
+        // Rust-only, stricter than test_model.py: the explicit attention fallback in layers.rs
+        // exists to make compiled runs bitwise equal to eager ones (MLX 0.32.2 printed scalar
+        // constants into compiled kernels one ulp off), so guard that exactly.
+        let (a, b) = (eager.values(k), fused.values(k));
+        assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()), "output {k}: compiled differs from eager");
     }
 }
 
@@ -78,7 +83,7 @@ fn batch_rows_are_independent(name: &str) {
     let _gpu = gpu_lock();
     let Some(model) = load(name, "float32") else { return };
     let model = Rc::new(model);
-    let request = examples::request(name, 4, 7);
+    let request = request(name, 4, 7);
     let batched = run(&model, &request, true);
     for i in 0..4 {
         let single = run(&model, &examples::rows(&request, i, i + 1), true);
@@ -98,54 +103,37 @@ fn allowed_token_counts_are_respected(name: &str) {
     let _gpu = gpu_lock();
     let Some(model) = load(name, "float32") else { return };
     let model = Rc::new(model);
-    let mut request = examples::request(name, 6, 11);
-    let mut allowed = vec![0i32; 6 * 11];
-    for i in 0..6 {
-        allowed[i * 11 + i] = 1;
-        allowed[i * 11 + 10 - i] = 1;
-    }
-    request.insert("allowed_pred_num_tokens".into(), Npy { shape: vec![6, 11], data: NpyData::I32(allowed) });
-    for (i, count) in run(&model, &request, true).tokens().into_iter().enumerate() {
-        assert!([i as i32, 10 - i as i32].contains(&(count - 6)), "row {i}: {count} tokens not allowed");
-    }
+    check_restricted(&run(&model, &restricted_request(name), true).tokens());
 }
 
 fn forced_duration(name: &str) {
     let _gpu = gpu_lock();
     let Some(model) = load(name, "float32") else { return };
-    let args = model.prepare(&examples::request(name, 2, 0)).unwrap();
+    let args = model.prepare(&request(name, 2, 0)).unwrap();
     let out = model.forward_with(&args, Some(&Array::from_slice(&[7i32, 13], &[2]))).unwrap();
     assert_eq!(to_vec_i32(&out[1]).unwrap(), vec![7, 13]);
+    let checked = model.forward_with_durations(&args, &[7, 13]).unwrap();
+    assert_eq!(to_vec_i32(&checked[1]).unwrap(), vec![7, 13]);
+    assert!(model.forward_with_durations(&args, &[5, 13]).is_err(), "duration 5 is outside 6..=16");
+    assert!(model.forward_with_durations(&args, &[7]).is_err(), "one duration per request");
 }
 
-/// Shared by the FP16/BF16 and INT8 tests: >= 75% of durations match FP32; outputs finite; and
-/// (`check_motion`) the median deviation stays below 0.05 where the duration matches.
-fn tracks_fp32(name: &str, fp32: &Out, low: &Out, check_motion: bool) {
-    let (a, b) = (fp32.tokens(), low.tokens());
-    let same: Vec<bool> = a.iter().zip(&b).map(|(x, y)| x == y).collect();
-    let agree = same.iter().filter(|&&s| s).count();
-    assert!(agree * 4 >= same.len() * 3, "only {agree}/{} durations match FP32", same.len());
+/// Shared by the FP16/BF16 and INT8 tests (see `common::tracks_fp32`), plus finite outputs.
+fn check_tracks_fp32(fp32: &Out, low: &Out, check_motion: bool) {
     assert!(low.finite(), "non-finite outputs");
-    if check_motion {
-        let (x, y) = (fp32.values(0), low.values(0));
-        let per = x.len() / same.len();
-        let diffs: Vec<f32> = (0..x.len()).filter(|k| same[k / per]).map(|k| (x[k] - y[k]).abs()).collect();
-        let m = median(diffs);
-        assert!(m < 0.05, "median |diff| {m} where durations match");
-    }
-    let _ = name;
+    tracks_fp32(&fp32.tokens(), &low.tokens(), &fp32.values(0), &low.values(0), check_motion);
 }
 
 fn low_precision_tracks_fp32(name: &str) {
     let _gpu = gpu_lock();
     let Some(fp32) = load(name, "float32") else { return };
     let fp32 = Rc::new(fp32);
-    let request = examples::request(name, 8, 3);
+    let request = request(name, 8, 3);
     let reference = run(&fp32, &request, true);
-    for dtype in ["float16", "bfloat16"] {
-        let low = Rc::new(load(name, dtype).unwrap());
-        assert_eq!(low.core.dtype, parse_dtype(dtype).unwrap());
-        tracks_fp32(name, &reference, &run(&low, &request, true), true);
+    for precision in [Precision::Float16, Precision::BFloat16] {
+        let low = Rc::new(load(name, precision.name()).unwrap());
+        assert_eq!(low.core.dtype, precision.compute_dtype());
+        check_tracks_fp32(&reference, &run(&low, &request, true), true);
     }
 }
 
@@ -153,11 +141,11 @@ fn converted_weights_round_trip(name: &str) {
     let _gpu = gpu_lock();
     let Some(original) = load(name, "float32") else { return };
     let original = Rc::new(original);
-    let dir = std::env::temp_dir().join(format!("motionbricks-rs-test-{}-{name}", std::process::id()));
-    let path = convert(name, checkpoints(name).unwrap(), dir.join("w.safetensors"), Dtype::Float32).unwrap();
+    let dir = TempDir::new(&format!("test-{name}"));
+    let path = convert(name, checkpoints(name).unwrap(), dir.0.join("w.safetensors"), Dtype::Float32).unwrap();
     let reloaded = Rc::new(MotionBricks::from_converted(&path, Dtype::Float32).unwrap());
-    std::fs::remove_dir_all(&dir).ok();
-    let request = examples::request(name, 2, 4);
+    drop(dir);
+    let request = request(name, 2, 4);
     let (a, b) = (run(&original, &request, true), run(&reloaded, &request, true));
     for k in 0..a.arrays.len() {
         assert_eq!(a.values(k), b.values(k), "output {k} differs after the round trip");
@@ -169,25 +157,52 @@ fn multi_step_decoding_runs(name: &str) {
     let Some(mut model) = load(name, "float32") else { return };
     model.num_inference_steps = 3;
     let model = Rc::new(model);
-    assert!(run(&model, &examples::request(name, 2, 9), true).finite());
+    assert!(run(&model, &request(name, 2, 9), true).finite());
 }
 
 fn quantized_8bit_tracks_fp32(name: &str) {
     let _gpu = gpu_lock();
     let Some(fp32) = load(name, "float32") else { return };
     let fp32 = Rc::new(fp32);
-    let mut q8 = load(name, "float32").unwrap();
-    q8.quantize(8, 64).unwrap();
+    let mut q8 = load(name, "int8").unwrap();
+    assert_eq!(q8.quantization, Some((8, 64)));
+    assert!(q8.quantize(8, 64).is_err(), "quantizing twice is refused");
     let q8 = Rc::new(q8);
-    let request = examples::request(name, 16, 21);
-    tracks_fp32(name, &run(&fp32, &request, true), &run(&q8, &request, true), false);
+    let request = request(name, 16, 21);
+    check_tracks_fp32(&run(&fp32, &request, true), &run(&q8, &request, true), false);
 }
 
-macro_rules! for_both_models {
-    ($($t:ident),* $(,)?) => {
-        mod unitree_g1 { $( #[test] fn $t() { super::$t("unitree_g1") } )* }
-        mod soma { $( #[test] fn $t() { super::$t("soma") } )* }
-    };
+/// Malformed requests are errors (not panics or out-of-bounds kernel reads): wrong input
+/// count, shapes, batch sizes, inconsistent arrays, unknown names, zero MaskGIT steps.
+fn malformed_inputs_are_errors(name: &str) {
+    let _gpu = gpu_lock();
+    let Some(mut model) = load(name, "float32") else { return };
+    let good = request(name, 2, 0);
+    let args = model.prepare(&good).unwrap();
+    assert!(model.forward(&args).is_ok());
+    assert!(model.forward(&args[1..]).is_err(), "missing input");
+    for k in 0..args.len() {
+        let mut bad = args.clone();
+        let shape = bad[k].shape().to_vec();
+        bad[k] = mlx_rs::ops::zeros_dtype(&[shape[0], shape[1] + 1], bad[k].dtype()).unwrap();
+        assert!(model.forward(&bad).is_err(), "{}: wrong width", model.input_names()[k]);
+        let mut bad = args.clone();
+        let mut shape = shape.clone();
+        shape[0] = 3;
+        bad[k] = mlx_rs::ops::zeros_dtype(&shape, bad[k].dtype()).unwrap();
+        assert!(model.forward(&bad).is_err(), "{}: other batch size", model.input_names()[k]);
+    }
+    assert!(model.forward_with(&args, Some(&Array::from_slice(&[7i32, 8, 9], &[3]))).is_err(), "one duration per request");
+    let mut inconsistent = good.clone();
+    let first = model.input_names()[0];
+    inconsistent.get_mut(first).unwrap().shape[0] = 3;
+    assert!(model.prepare(&inconsistent).is_err(), "shape and data disagree");
+    let mut missing = good.clone();
+    missing.remove(first);
+    assert!(model.prepare(&missing).is_err());
+    assert!(examples::request("smoa", 1, 0).is_err());
+    model.num_inference_steps = 0;
+    assert!(model.forward(&args).is_err(), "zero MaskGIT steps");
 }
 
 for_both_models!(
@@ -200,4 +215,5 @@ for_both_models!(
     converted_weights_round_trip,
     multi_step_decoding_runs,
     quantized_8bit_tracks_fp32,
+    malformed_inputs_are_errors,
 );

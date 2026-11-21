@@ -9,13 +9,18 @@
 (engines, tokens, animation buffers, motion players), see docs/runtime_api.md.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from .config import FRAMES_PER_TOKEN, MAX_FRAMES, MAX_TOKENS, MIN_TOKENS, G1, SOMA, get_spec
 from .model import MotionBricks, convert, from_checkpoints, from_converted, load
-from . import hub, runtime  # noqa: E402
+from . import hub, runtime
 from .hub import download
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("motionbricks-mlx")  # single source: model/pyproject.toml
+except PackageNotFoundError:  # imported from a source tree that is not installed
+    __version__ = "0+unknown"
 __all__ = [
-    "FRAMES_PER_TOKEN", "MAX_FRAMES", "MAX_TOKENS", "MIN_TOKENS", "G1", "SOMA", "MotionBricks",
+    "FRAMES_PER_TOKEN", "G1", "MAX_FRAMES", "MAX_TOKENS", "MIN_TOKENS", "SOMA", "MotionBricks",
     "convert", "download", "from_checkpoints", "from_converted", "get_spec", "hub", "load", "runtime",
 ]

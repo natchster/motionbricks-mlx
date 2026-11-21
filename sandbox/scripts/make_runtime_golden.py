@@ -6,28 +6,33 @@ also runs on Warp's CPU backend. This script drives the real upstream engine met
 CPU, with inference done by NVIDIA's PyTorch model in place of TensorRT. It also records upstream's
 clip loaders, recorder sampling, target placement, speed scaling, IK pins and buffer sampling.
 
-The Python and Rust runtime tests teacher-force each step against these fixtures.
+The Python and Rust runtime tests teacher-force each step against these fixtures. ``meta.json``
+next to them records the versions that produced them.
 
-    uv run --all-packages python sandbox/scripts/make_runtime_golden.py
+    uv run --all-packages python sandbox/scripts/make_runtime_golden.py [--out DIR]
 """
 
 from __future__ import annotations
 
-import importlib.util
+import argparse
+import functools
+import operator
 import sys
 from pathlib import Path
 
 import numpy as np
+from cudashim.paths import GOLDEN, UPSTREAM
+from motionbricks_mlx import hub
 
-ROOT = Path(__file__).resolve().parents[2]
-UPSTREAM = ROOT / "sandbox" / "upstream"
-OUT = ROOT / "sandbox" / "golden" / "runtime"
-sys.path.insert(0, str(ROOT / "sandbox"))
+if not (UPSTREAM / "motionbricks").is_dir():
+    raise SystemExit(f"{UPSTREAM} missing: run sandbox/setup.sh (or sandbox/scripts/fetch_assets.py) first")
 sys.path.insert(0, str(UPSTREAM))
 
-import cudashim  # noqa: E402
+import cudashim
 
-cudashim.enable_all()  # `import tensorrt` -> the ONNX Runtime shim, so upstream's engine modules import
+# Only `import tensorrt` needs the shim (upstream's engine modules import it). The torch.cuda
+# remap stays off: the oracle runs on the CPU, and nothing may silently move it to MPS.
+cudashim.install_tensorrt()
 
 import warp as wp  # noqa: E402
 
@@ -56,21 +61,23 @@ from motionbricks.runtime.target_pose import (  # noqa: E402
 )
 from motionbricks.utils.space_conversion_utils import FacingDirectionType, SpaceConverter  # noqa: E402
 
-CLIPS = {
-    "soma": ("assets/motions/soma/locomotion/bs_1d_linear/Neutral_walk_forward_002__A057.bvh",
-             "assets/motions/soma/locomotion/bs_1d_linear/neutral_jog_ff_180_R_001__A534.bvh"),
-    "unitree_g1": ("assets/motions/unitree_g1/locomotion/bs_1d_linear/Neutral_walk_forward_002__A057.csv",
-                   "assets/motions/unitree_g1/locomotion/bs_1d_linear/neutral_jog_ff_180_R_001__A534.csv"),
-}
+MODELS = ("soma", "unitree_g1")
+CLIP_ENTRIES = hub.manifest(hub.CLIP_MANIFEST)  # the walk and jog clip of each model
+
+
+def clip_paths(name: str) -> tuple[str, str]:
+    """(walk, jog) clip of a model, repository-relative, from the package's clip manifest."""
+    paths = [e.path for e in CLIP_ENTRIES if e.path.startswith(f"assets/motions/{name}/")]
+    walk = [p for p in paths if "_walk_" in p]
+    jog = [p for p in paths if "_jog_" in p]
+    assert len(walk) == len(jog) == 1, paths
+    return walk[0], jog[0]
 
 
 def fetch_clips() -> None:
-    spec = importlib.util.spec_from_file_location("fetch_assets", ROOT / "sandbox/scripts/fetch_assets.py")
-    fetch = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fetch)
-    for paths in CLIPS.values():
-        for rel in paths:
-            fetch.fetch_lfs(rel)
+    """Replace the clips' Git LFS pointers in the upstream checkout with the verified files."""
+    for entry in CLIP_ENTRIES:
+        hub.fetch(entry, UPSTREAM, url=hub.clip_url(entry))
 
 
 def no_root_skeleton(path: Path) -> Skeleton:
@@ -143,13 +150,19 @@ def window(clip, start: float, offset, n: int = 4) -> np.ndarray:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", type=Path, default=GOLDEN / "runtime", help="output directory (default: sandbox/golden/runtime)")
+    parser.add_argument("--models", nargs="+", default=list(MODELS), choices=MODELS)
+    args = parser.parse_args()
     fetch_clips()
-    OUT.mkdir(parents=True, exist_ok=True)
+    out = args.out
+    out.mkdir(parents=True, exist_ok=True)
     mujoco = SpaceConverter(FacingDirectionType.MUJOCO).convert_transform(wp.transform_identity())
-    for name in ("soma", "unitree_g1"):
+    for name in args.models:
         rec: dict[str, np.ndarray] = {}
-        walk_path, jog_path = (UPSTREAM / p for p in CLIPS[name])
+        walk_path, jog_path = (UPSTREAM / p for p in clip_paths(name))
         torch_model = reference.build(name)
+        # Per-model constructors and pose layout, bound now (no closures over loop variables).
         if name == "soma":
             skeleton = no_root_skeleton(walk_path)
             walk, jog = load_bvh(str(walk_path), skeleton), load_bvh(str(jog_path), skeleton)
@@ -158,13 +171,16 @@ def main() -> None:
             # Joint names as UTF-8 bytes joined by newlines (readable without NumPy string arrays).
             rec["skeleton.names_utf8"] = np.frombuffer("\n".join(skeleton.joint_names).encode(), np.uint8).astype(np.int32)
             m2r_default = mujoco
-            engine_cls, token = MotionBricksSOMAEngine, (lambda: PoseToken(skeleton.num_joints))
-            new_output = lambda e: e.create_output(skeleton)  # noqa: E731
+            engine_cls, token = MotionBricksSOMAEngine, functools.partial(PoseToken, skeleton.num_joints)
+            new_output = operator.methodcaller("create_output", skeleton)
+            pose_dtype, pose_len = wp.transform, skeleton.num_joints
         else:
+            skeleton = None
             walk, jog = load_csv(walk_path), load_csv(jog_path)
             m2r_default = wp.transform_identity()
-            engine_cls, token = MotionBricksUnitreeG1Engine, (lambda: DOFToken(29))
-            new_output = lambda e: e.create_output()  # noqa: E731
+            engine_cls, token = MotionBricksUnitreeG1Engine, functools.partial(DOFToken, 29)
+            new_output = operator.methodcaller("create_output")
+            pose_dtype, pose_len = wp.float32, walk.num_coordinates
         # Clip loading: a few frames of each clip as upstream's loader produced them.
         for label, clip in (("walk", walk), ("jog", jog)):
             rec[f"clip.{label}.frames"] = clip.poses.numpy()[[0, 1, 2, 100, 500, clip.num_frames - 1]].copy()
@@ -204,7 +220,7 @@ def main() -> None:
         # Recorder: irregular update steps, then four context poses resampled at 30 Hz.
         dts = np.array([1 / 60, 1 / 45, 1 / 120, 1 / 30, 1 / 90, 1 / 60, 1 / 24, 1 / 75, 1 / 60, 1 / 50, 1 / 100, 1 / 60], np.float32)
         poses = window(walk, 0.5, m2r_default, len(dts) + 1)
-        history = MotionRecorder(wp.array(poses[0], dtype=wp.transform if name == "soma" else wp.float32), capacity=8)
+        history = MotionRecorder(wp.array(poses[0], dtype=pose_dtype), capacity=8)
         for dt, pose in zip(dts, poses[1:]):
             history.record(float(dt), wp.array(pose, dtype=history.poses.dtype))
         tok = token()
@@ -228,8 +244,7 @@ def main() -> None:
         # Buffer sampling with a root offset, foot contacts, and make_loopable.
         offset = placement(40.0, 1.0, 2.0)
         for t in (0.0, 0.37, 1.234, 99.0):
-            pose = wp.empty(skeleton.num_joints if name == "soma" else walk.num_coordinates,
-                            dtype=wp.transform if name == "soma" else wp.float32)
+            pose = wp.empty(pose_len, dtype=pose_dtype)
             walk.sample(t, pose, root_offset=offset)
             rec[f"sample.{t:g}"] = pose.numpy()
         loop = walk.copy()
@@ -250,8 +265,10 @@ def main() -> None:
                 rec[f"ik.{label}.mask"], rec[f"ik.{label}.weight"] = np.array(int(mask), np.int32), np.array(weight, np.float32)
                 rec[f"ik.{label}.result"] = pose.numpy()
 
-        np.savez_compressed(OUT / f"{name}.npz", **rec)
-        print(f"wrote {OUT / f'{name}.npz'} ({len(rec)} arrays)")
+        np.savez_compressed(out / f"{name}.npz", **rec)
+        print(f"wrote {out / f'{name}.npz'} ({len(rec)} arrays)")
+    reference.write_meta(out, reference.fixture_meta("sandbox/scripts/make_runtime_golden.py", "cpu",
+                                                     warp_device="cpu", models=list(args.models)))
 
 
 if __name__ == "__main__":

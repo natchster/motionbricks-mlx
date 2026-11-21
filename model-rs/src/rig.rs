@@ -105,6 +105,12 @@ pub fn wrap(angle: &Array) -> R<Array> {
     Ok(&ops::remainder(angle + f(pi), f(2.0 * pi))? - f(pi))
 }
 
+/// The outputs of one kernel launch, by position.
+fn outputs<const N: usize>(o: Vec<Array>) -> R<[Array; N]> {
+    let n = o.len();
+    o.try_into().map_err(|_| mlx_rs::error::Exception::custom(format!("rig kernel returned {n} outputs, expected {N}")))
+}
+
 fn take_rows(a: &Array, axis: i32, idx: usize) -> R<Array> {
     index(a, axis, idx as i32)
 }
@@ -246,10 +252,9 @@ impl G1Rig {
     /// Placed G1 poses -> `(global_root (B,8,5), local_root (B,8,4), local_poses (B,8,303))`, on the
     /// rig kernel (one thread per sequence).
     pub fn preprocess(&self, context_qpos: &Array, target_qpos: &Array) -> R<(Array, Array, Array)> {
-        let mut o = self.kernels.g1_preprocess(context_qpos, target_qpos, &self.rf, &self.ri)?;
-        let lp = o.pop().unwrap();
-        let lr = o.pop().unwrap();
-        Ok((o.pop().unwrap(), lr, lp))
+        let o = self.kernels.g1_preprocess(context_qpos, target_qpos, &self.rf, &self.ri)?;
+        let [global_root, local_root, local_poses] = outputs(o)?;
+        Ok((global_root, local_root, local_poses))
     }
 
     /// Op-based reference of [`Self::preprocess`].
@@ -284,9 +289,8 @@ impl G1Rig {
     /// Global features -> `(pred_qpos (B,T,36) XYZW root quaternion, foot contacts (B,T,4))`, on the
     /// rig kernel (one thread per frame).
     pub fn postprocess(&self, pred_global: &Array) -> R<(Array, Array)> {
-        let mut o = self.kernels.g1_postprocess(pred_global, &self.rf, &self.ri)?;
-        let contacts = o.pop().unwrap();
-        Ok((o.pop().unwrap(), contacts))
+        let [qpos, contacts] = outputs(self.kernels.g1_postprocess(pred_global, &self.rf, &self.ri)?)?;
+        Ok((qpos, contacts))
     }
 
     /// Op-based reference of [`Self::postprocess`].

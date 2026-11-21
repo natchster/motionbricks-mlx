@@ -2,12 +2,13 @@
 
 Checkpoints: ``checkpoints/MotionBricks`` (``motionbricks-mlx download``), or
 ``$MOTIONBRICKS_CHECKPOINTS``. Golden fixtures from the PyTorch reference: ``sandbox/golden``
-(``sandbox/setup.sh``), or ``$MOTIONBRICKS_GOLDEN``. Tests needing either skip without them.
+(``sandbox/setup.sh``), or ``$MOTIONBRICKS_GOLDEN``. Tests needing either skip without them,
+or fail with ``MOTIONBRICKS_REQUIRE_FIXTURES=1`` (see conftest.py).
 """
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 import numpy as np
@@ -25,13 +26,18 @@ def have_checkpoints(name: str) -> bool:
     return (CHECKPOINTS / HF_FOLDERS[name]).is_dir() and any((CHECKPOINTS / HF_FOLDERS[name]).rglob("*.safetensors"))
 
 
-@lru_cache(maxsize=None)
-def load_model(name: str, dtype: str = "float32"):
+def fresh_model(name: str, dtype: str = "float32"):
+    """A new, uncached model, for tests that change it; skips without the checkpoints."""
     import motionbricks_mlx as mb
 
     if not have_checkpoints(name):
         pytest.skip(f"{name} checkpoints missing (run `motionbricks-mlx download`)")
     return mb.load(name, CHECKPOINTS / HF_FOLDERS[name], dtype=dtype)
+
+
+@cache
+def load_model(name: str, dtype: str = "float32"):
+    return fresh_model(name, dtype)
 
 
 def load_golden(name: str, case: str) -> dict[str, np.ndarray]:

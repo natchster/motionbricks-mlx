@@ -3,7 +3,6 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.benchmarks/
 *.egg-info/
 build/
 dist/
@@ -15,8 +14,9 @@ sandbox/assets/
 sandbox/native/build/
 sandbox/native/toolchains/
 
-# Generated reference fixtures and benchmark results
+# Generated reference fixtures (golden-<device>/: non-CPU oracle runs) and benchmark results
 sandbox/golden/
+sandbox/golden-*/
 model/benchmarks/results/*.json
 !model/benchmarks/results/.gitkeep
 !model/benchmarks/results/2026-11-21-Apple-M4-Pro.json

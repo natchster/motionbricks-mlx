@@ -30,23 +30,23 @@ fn report(frames: usize, roots: &[Transform], timer: &GenerationTimer) {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let model = args.get(1).map_or("soma", String::as_str);
+    let rig = ModelRig::parse(args.get(1).map_or("soma", String::as_str))?;
     let precision = args.get(2).map_or("float32", String::as_str);
-    let backend = load_model(model, precision)?;
+    let backend = load_model(rig, precision)?;
     let config = MotionBricksInferenceConfig::default();
     let context_start = CONTEXT_END - (MODEL_POSES_PER_TOKEN - 1) as f32 / MODEL_SAMPLE_RATE;
-    match load_clip(model, WALK)? {
+    match load_clip(rig, WALK)? {
         Clip::Soma { clip, skeleton } => {
             let mut engine = MotionBricksSomaEngine::new(Some(backend), model_to_runtime(ModelRig::Soma))?;
             let (mut context, mut target, mut output) = (engine.create_input(&skeleton)?, engine.create_input(&skeleton)?, engine.create_output(&skeleton)?);
-            let mut context_poses = soma_window(&clip, context_start, Transform::IDENTITY);
+            let mut context_poses = soma_window(&clip, context_start, Transform::IDENTITY)?;
             for t in TARGET_TIMES {
                 context.update_from_poses(&context_poses)?;
-                target.update_from_poses(&soma_window(&clip, t, Transform::IDENTITY))?;
+                target.update_from_poses(&soma_window(&clip, t, Transform::IDENTITY)?)?;
                 engine.generate_animation(&context, &target, &mut output, &config)?;
-                // The output buffer has room for the longest result. Only num_frames frames are valid.
-                let frames = output.num_frames;
-                report(frames, &output.root_transforms(), &engine.timer);
+                // The output buffer has room for the longest result. Only num_frames() frames are valid.
+                let frames = output.num_frames();
+                report(frames, &output.root_transforms(), engine.timer());
                 // Play the whole motion, so the last four poses are what the character showed.
                 context_poses = (frames - MODEL_POSES_PER_TOKEN..frames).map(|f| output.frame(f).to_vec()).collect();
             }
@@ -54,13 +54,13 @@ fn main() -> Result<()> {
         Clip::G1(clip) => {
             let mut engine = MotionBricksUnitreeG1Engine::new(Some(backend), model_to_runtime(ModelRig::UnitreeG1))?;
             let (mut context, mut target, mut output) = (engine.create_input(), engine.create_input(), engine.create_output());
-            let mut context_poses = dof_window(&clip, context_start, Transform::IDENTITY);
+            let mut context_poses = dof_window(&clip, context_start, Transform::IDENTITY)?;
             for t in TARGET_TIMES {
                 context.update_from_poses(&context_poses)?;
-                target.update_from_poses(&dof_window(&clip, t, Transform::IDENTITY))?;
+                target.update_from_poses(&dof_window(&clip, t, Transform::IDENTITY)?)?;
                 engine.generate_animation(&context, &target, &mut output, &config)?;
-                let frames = output.num_frames;
-                report(frames, &output.root_transforms(), &engine.timer);
+                let frames = output.num_frames();
+                report(frames, &output.root_transforms(), engine.timer());
                 context_poses = (frames - MODEL_POSES_PER_TOKEN..frames).map(|f| output.frame(f).to_vec()).collect();
             }
         }

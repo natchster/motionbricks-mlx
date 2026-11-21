@@ -8,8 +8,13 @@ FP32 graph through the sandbox. Results: [`results/`](results/). `report.py` ren
 ```sh
 uv run --all-packages python model/benchmarks/bench.py                       # default backends, N = 1 8 16 32
 uv run --all-packages python model/benchmarks/bench.py --backends mlx-fp32 mlx-int8 --batches 1
+uv run --all-packages python model/benchmarks/bench.py --backends mlx-fp16 mlx-bf16 --rounds 5   # interleaved
 uv run --all-packages python model/benchmarks/report.py model/benchmarks/results/<file>.json
 ```
+
+By default each backend is timed in one block, after the previous one. `--rounds N` interleaves
+them instead (every backend in turn, N rounds per batch size, statistics pooled), so thermal drift
+of up to about 10% spreads evenly when comparing close numbers.
 
 The torch and ONNX Runtime backends need the sandbox (`sandbox/setup.sh`). The MLX port alone can
 be timed without it: `uv run --package motionbricks-mlx motionbricks-mlx bench --model soma

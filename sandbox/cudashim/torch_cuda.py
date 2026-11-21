@@ -5,8 +5,10 @@ PyTorch's macOS wheels have no CUDA backend at all (``.cuda()`` raises "Torch no
 compiled with CUDA enabled"). This shim rewrites the *device*, not the kernels: every
 ``device="cuda[:N]"`` / ``.cuda()`` / ``.to("cuda")`` lands on the Metal (MPS) backend, and
 the ``torch.cuda`` utility API (sync, events, seeds, memory stats, autocast) is mapped onto
-``torch.mps``. Kernels that MPS lacks fall back to CPU when
-``PYTORCH_ENABLE_MPS_FALLBACK=1`` (set by :func:`enable`). FP64 does not exist on Apple GPUs.
+``torch.mps``; ``torch.autocast("cuda")``, ``torch.amp.autocast("cuda")`` and the deprecated
+``torch.cuda.amp.autocast`` autocast on the target device. Kernels that MPS lacks fall back to
+CPU when ``PYTORCH_ENABLE_MPS_FALLBACK=1`` (set by :func:`enable`). FP64 does not exist on
+Apple GPUs.
 
     from cudashim import torch_cuda
     with torch_cuda.enabled():            # or torch_cuda.enable() for the whole process
@@ -23,7 +25,7 @@ from types import SimpleNamespace
 import torch
 from torch.overrides import TorchFunctionMode
 
-_state: dict = {"mode": None, "saved": None, "target": None}
+_state: dict = {"mode": None, "saved": None, "target": None, "saved_autocast": None}
 
 
 def _target() -> torch.device:
@@ -153,6 +155,21 @@ def _patches():
     }
 
 
+def _autocast_on(target_type: str, base: type) -> type:
+    """``base`` (``torch.autocast``) with ``device_type="cuda"`` meaning the shim target.
+
+    Without it, ``torch.autocast("cuda")`` silently does nothing on a Mac: the shim reports CUDA
+    as available, so torch doesn't even warn, and the code runs in full precision."""
+
+    class autocast(base):
+        def __init__(self, device_type, *args, **kwargs):
+            super().__init__(target_type if device_type == "cuda" else device_type, *args, **kwargs)
+
+    autocast.__qualname__ = autocast.__name__ = "autocast"
+    autocast.__module__ = __name__
+    return autocast
+
+
 def enable() -> torch.device:
     """Install the shim process-wide. Returns the device that ``cuda`` now means."""
     if _state["mode"] is not None:
@@ -163,10 +180,16 @@ def enable() -> torch.device:
     _state["saved"] = {name: getattr(torch.cuda, name, None) for name in patches}
     for name, value in patches.items():
         setattr(torch.cuda, name, value)
-    _state["saved_autocast"] = torch.cuda.amp.autocast if hasattr(torch.cuda, "amp") else None
+    target_type = _state["target"].type
+    _state["saved_autocast"] = {
+        "cuda.amp": torch.cuda.amp.autocast if hasattr(torch.cuda, "amp") else None,
+        "torch": torch.autocast,
+        "amp": torch.amp.autocast,
+    }
+    patched = _autocast_on(target_type, torch.autocast)
+    torch.autocast = torch.amp.autocast = patched
     if hasattr(torch.cuda, "amp"):
-        target_type = _state["target"].type
-        torch.cuda.amp.autocast = lambda *a, **k: torch.autocast(target_type, *a, **k)
+        torch.cuda.amp.autocast = lambda *a, **k: patched(target_type, *a, **k)
     _state["mode"] = CudaToMpsMode()
     _state["mode"].__enter__()
     return _state["target"]
@@ -181,9 +204,11 @@ def disable() -> None:
             delattr(torch.cuda, name)
         else:
             setattr(torch.cuda, name, value)
-    if _state.get("saved_autocast") is not None:
-        torch.cuda.amp.autocast = _state["saved_autocast"]
-    _state.update(mode=None, saved=None, target=None)
+    saved = _state["saved_autocast"]
+    torch.autocast, torch.amp.autocast = saved["torch"], saved["amp"]
+    if saved["cuda.amp"] is not None:
+        torch.cuda.amp.autocast = saved["cuda.amp"]
+    _state.update(mode=None, saved=None, target=None, saved_autocast=None)
 
 
 @contextlib.contextmanager

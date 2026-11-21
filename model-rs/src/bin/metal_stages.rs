@@ -3,29 +3,37 @@
 // Original model: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
 //! GPU time per stage of the Metal runtime (each stage re-run on valid buffers from a full pass).
+//! Development tool (`--features dev-tools`):
+//!
+//!     metal-stages [float32|float16|bfloat16|int8] [batches...]
+//!
+//! Checkpoints: `$MOTIONBRICKS_CHECKPOINTS` or `checkpoints/MotionBricks`.
+
+mod common;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
+use common::{Argv, median};
+use motionbricks_rs::config::{Precision, checkpoint_dir};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::{Recorder, wait};
 use motionbricks_rs::npy::load_npz;
 
 fn main() -> Result<()> {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let prec = std::env::args().nth(1).unwrap_or("float32".into());
-    let batches: Vec<usize> = std::env::args().skip(2).map(|v| v.parse().unwrap()).collect();
-    let batches = if batches.is_empty() { vec![1, 32] } else { batches };
+    let mut argv = Argv::from_env();
+    let prec = argv.next().unwrap_or("float32".into()).parse::<Precision>()?.name();
+    let batches: Vec<usize> = argv.rest("batch size", &[1, 32])?;
     for name in ["soma", "unitree_g1"] {
-        let folder = if name == "soma" { "soma" } else { "g1" };
-        let m = MetalModel::from_checkpoints_with(name, here.join("../checkpoints/MotionBricks").join(folder), 64, &prec)?;
+        let m = MetalModel::from_checkpoints_with(name, checkpoint_dir(name), 64, prec)?;
         for &batch in &batches {
             let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
             m.run(&req)?;
             let d = m.dims(batch, false);
             let time = |f: &dyn Fn(&mut Recorder)| -> f64 {
                 let mut v: Vec<f64> = (0..15).map(|_| { let mut r = Recorder::new(&m.gpu); f(&mut r); wait(&r.commit()) }).collect();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[7]
+                median(&mut v)
             };
             let input = time(&|r| m.encode_input(r, &d));
             let root = time(&|r| m.encode_root(r, &d));
@@ -39,22 +47,21 @@ fn main() -> Result<()> {
             let dispatches = probe.dispatches;
             wait(&probe.commit());
             // End to end (upload, encode, wait, read back): chunked commits vs one command buffer.
-            let e2e = |chunked: bool| -> f64 {
+            let e2e = |chunked: bool| -> Result<f64> {
                 let mut v: Vec<f64> = (0..25)
                     .map(|_| {
                         let t = std::time::Instant::now();
-                        let n = m.upload_inputs(&req).unwrap();
+                        let n = m.upload_inputs(&req)?;
                         let mut r = if chunked { m.recorder() } else { Recorder::new(&m.gpu) };
                         m.encode(&mut r, &m.dims(n, false));
                         wait(&r.commit());
                         std::hint::black_box(m.outputs(n));
-                        t.elapsed().as_secs_f64() * 1e3
+                        Ok(t.elapsed().as_secs_f64() * 1e3)
                     })
-                    .collect();
-                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                v[12]
+                    .collect::<Result<_>>()?;
+                Ok(median(&mut v))
             };
-            let (single, chunked) = (e2e(false), e2e(true));
+            let (single, chunked) = (e2e(false)?, e2e(true)?);
             println!("{name:<10} {prec:<8} N={batch:<2} end to end ms: one command buffer {single:.2} | chunked commits {chunked:.2}");
             println!("{name:<10} {prec:<8} N={batch:<2} GPU ms: input {input:.2} | root {root:.2} | root->pose {r2p:.2} | pose {pose:.2} | vq {vq:.2} | finish {fin:.2} | whole {all:.2} | {dispatches} dispatches");
         }

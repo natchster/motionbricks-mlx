@@ -16,7 +16,7 @@ use anyhow::Result;
 use mlx_rs::transforms::eval;
 use motionbricks_rs::npy::load_npz;
 use motionbricks_rs::ops::{to_vec_f32, to_vec_i32};
-use motionbricks_rs::{MotionBricks, compiled, examples, parse_dtype};
+use motionbricks_rs::{MotionBricks, Precision, compiled, examples};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -25,14 +25,10 @@ fn main() -> Result<()> {
         [_, n, c, r, p] => (n, c, r, p.as_str()),
         _ => anyhow::bail!("usage: generate <soma|unitree_g1> <checkpoint dir> <batch | request.npz> [float32|float16|bfloat16|int8]"),
     };
-    let dtype = parse_dtype(if precision == "int8" { "float32" } else { precision })?;
-    let mut model = MotionBricks::from_checkpoints(name, checkpoints, dtype)?;
-    if precision == "int8" {
-        model.quantize(8, 64)?;
-    }
-    let model = Rc::new(model);
+    let precision: Precision = precision.parse()?;
+    let model = Rc::new(MotionBricks::load(name, checkpoints, precision)?); // INT8: float32 + quantize(8, 64)
     let request = match request.parse::<usize>() {
-        Ok(batch) => examples::request(name, batch, 0),
+        Ok(batch) => examples::request(name, batch, 0)?,
         Err(_) => load_npz(request)?,
     };
     let mut forward = compiled(model.clone());

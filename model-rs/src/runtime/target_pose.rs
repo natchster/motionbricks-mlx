@@ -56,7 +56,7 @@ pub struct TwoBoneIkChainConfig {
 impl TwoBoneIkChainConfig {
     pub fn from_joint_names(pin: u32, skeleton: &Skeleton, root: &str, mid: &str, tip: &str, hint: Vec3) -> Result<Self> {
         let find = |n: &str| skeleton.joint_index(n).ok_or_else(|| anyhow::anyhow!("IK chain joint {n:?} is missing from the skeleton"));
-        if ![ik_pin::LEFT_HAND, ik_pin::RIGHT_HAND, ik_pin::LEFT_FOOT, ik_pin::RIGHT_FOOT].contains(&pin) {
+        if !SINGLE_PINS.contains(&pin) {
             bail!("pin must identify exactly one supported IK pin");
         }
         Ok(TwoBoneIkChainConfig { pin, root_index: find(root)?, mid_index: find(mid)?, tip_index: find(tip)?, hint_offset_local: hint })
@@ -77,6 +77,7 @@ pub fn create_soma_target_pose_ik_rig(skeleton: &Skeleton) -> Result<Vec<TwoBone
 }
 
 const EPSILON: f32 = 1e-3;
+const SINGLE_PINS: [u32; 4] = [ik_pin::LEFT_HAND, ik_pin::RIGHT_HAND, ik_pin::LEFT_FOOT, ik_pin::RIGHT_FOOT];
 
 /// Solved world transforms of the chain start, middle joint and tip, so the tip reaches `t_world`.
 /// `weight` blends from the input pose (0) to the solved pose (1); with `use_hint` the chain bends
@@ -88,7 +89,8 @@ pub fn solve_two_bone_ik(weight: f32, a_parent: Transform, a: Transform, b: Tran
     let t = pc.lerp(t_world.p, weight);
     let l_ab = (pb - pa).length();
     let l_cb = (pb - pc).length();
-    let l_at = (t - pa).length().clamp(EPSILON, l_ab + l_cb - EPSILON);
+    // min(max(..)) as in Python, not clamp: a degenerate chain or a NaN pose must not panic.
+    let l_at = (t - pa).length().max(EPSILON).min(l_ab + l_cb - EPSILON);
     let axis = if use_hint { (pc - pa).cross(hint_world - pa) } else { (pc - pa).cross(pb - pa) }.normalize();
     let ac_ab_0 = axis.dot((pc - pa).cross(pb - pa)).atan2((pc - pa).dot(pb - pa));
     let ba_bc_0 = axis.dot((pa - pb).cross(pc - pb)).atan2((pa - pb).dot(pc - pb));
@@ -98,15 +100,15 @@ pub fn solve_two_bone_ik(weight: f32, a_parent: Transform, a: Transform, b: Tran
     let rot_a = quat_from_axis_angle(quat_rotate_inv(a.q, axis), ac_ab_1 - ac_ab_0);
     let rot_b = quat_from_axis_angle(quat_rotate_inv(b.q, axis), ba_bc_1 - ba_bc_0);
     let rotation = |q: Quat| Transform::new(Vec3::ZERO, q);
-    let mut a_local = a_parent.inverse().mul(a).mul(rotation(rot_a));
-    let a_world = a_parent.mul(a_local);
+    let mut a_local = a_parent.inverse() * a * rotation(rot_a);
+    let a_world = a_parent * a_local;
     let ac_local = quat_rotate_inv(a_world.q, pc - pa);
     let at_local = quat_rotate_inv(a_world.q, t - pa);
-    a_local = a_local.mul(rotation(quat_between_vectors(ac_local, at_local)));
-    let a_world = a_parent.mul(a_local);
-    let b_local = a.inverse().mul(b).mul(rotation(rot_b));
-    let b_world = a_world.mul(b_local);
-    let c_world = b_world.mul(b.inverse().mul(c));
+    a_local = a_local * rotation(quat_between_vectors(ac_local, at_local));
+    let a_world = a_parent * a_local;
+    let b_local = a.inverse() * b * rotation(rot_b);
+    let b_world = a_world * b_local;
+    let c_world = b_world * (b.inverse() * c);
     // The conjugate is the inverse only for unit quaternions, so renormalize.
     (
         Transform::new(a_world.p, quat_normalize(a_world.q)),
@@ -121,6 +123,8 @@ pub struct TargetPoseIkCorrector {
     chains: Vec<TwoBoneIkChainConfig>,
     pin_mask: u32,
     pinned: Vec<Transform>,
+    // World transforms of the pose being corrected, reused across frames.
+    world: Vec<Transform>,
 }
 
 impl TargetPoseIkCorrector {
@@ -128,13 +132,20 @@ impl TargetPoseIkCorrector {
         if chains.is_empty() {
             bail!("target pose IK chains cannot be empty");
         }
+        let n = skeleton.num_joints();
         for c in &chains {
+            if !SINGLE_PINS.contains(&c.pin) {
+                bail!("pin must identify exactly one supported IK pin");
+            }
+            if c.root_index >= n || c.mid_index >= n || c.tip_index >= n {
+                bail!("IK chain joint indices must be below {n}");
+            }
             if skeleton.joint_parent(c.mid_index) != c.root_index as i32 || skeleton.joint_parent(c.tip_index) != c.mid_index as i32 {
                 bail!("an IK chain's mid joint must be a child of its start, and its tip a child of its mid joint");
             }
         }
-        let n = chains.len();
-        Ok(TargetPoseIkCorrector { skeleton: skeleton.clone(), chains, pin_mask: ik_pin::NONE, pinned: vec![Transform::IDENTITY; n] })
+        let pinned = vec![Transform::IDENTITY; chains.len()];
+        Ok(TargetPoseIkCorrector { skeleton: skeleton.clone(), chains, pin_mask: ik_pin::NONE, pinned, world: Vec::with_capacity(n) })
     }
     pub fn pin_mask(&self) -> u32 {
         self.pin_mask
@@ -146,32 +157,34 @@ impl TargetPoseIkCorrector {
             return Ok(());
         }
         self.check(target_pose)?;
-        let world = self.skeleton.compute_world_transforms(target_pose, Transform::IDENTITY);
+        self.skeleton.compute_world_transforms_into(target_pose, Transform::IDENTITY, &mut self.world);
         for (i, c) in self.chains.iter().enumerate() {
-            self.pinned[i] = world[c.tip_index];
+            self.pinned[i] = self.world[c.tip_index];
         }
         self.pin_mask = pin_mask;
         Ok(())
     }
-    /// Correct the pinned chains of a sampled local pose in place (`weight` 0..1).
-    pub fn apply(&self, pose: &mut [Transform], weight: f32) -> Result<()> {
+    /// Correct the pinned chains of a sampled local pose in place (`weight` 0..1). Reuses an
+    /// internal buffer, so it does not allocate.
+    pub fn apply(&mut self, pose: &mut [Transform], weight: f32) -> Result<()> {
         if self.pin_mask == ik_pin::NONE || weight <= 0.0 {
             return Ok(());
         }
         self.check(pose)?;
-        let world = self.skeleton.compute_world_transforms(pose, Transform::IDENTITY);
+        self.skeleton.compute_world_transforms_into(pose, Transform::IDENTITY, &mut self.world);
+        let world = &self.world;
         for (i, c) in self.chains.iter().enumerate() {
             if self.pin_mask & c.pin == 0 {
                 continue;
             }
-            let parent = self.skeleton.parent_indices[c.root_index];
+            let parent = self.skeleton.parent_indices()[c.root_index];
             let parent_world = if parent >= 0 { world[parent as usize] } else { Transform::IDENTITY };
             let mid = world[c.mid_index];
             let hint = mid.point(c.hint_offset_local);
             let (ra, rb, rc) = solve_two_bone_ik(weight, parent_world, world[c.root_index], mid, world[c.tip_index], self.pinned[i], true, hint);
-            pose[c.root_index] = parent_world.inverse().mul(ra);
-            pose[c.mid_index] = ra.inverse().mul(rb);
-            pose[c.tip_index] = rb.inverse().mul(rc);
+            pose[c.root_index] = parent_world.inverse() * ra;
+            pose[c.mid_index] = ra.inverse() * rb;
+            pose[c.tip_index] = rb.inverse() * rc;
         }
         Ok(())
     }
@@ -201,8 +214,8 @@ fn check_speed(desired_speed: f32) -> Result<()> {
 
 /// Scale the root's ground motion of 30 Hz target poses (at least two) to a mean speed, in place.
 pub fn adjust_target_pose_speed(target_poses: &mut [Vec<Transform>], desired_speed: f32) -> Result<()> {
-    if target_poses.len() < 2 {
-        bail!("target_poses must contain at least two poses");
+    if target_poses.len() < 2 || target_poses.iter().any(|p| p.is_empty()) {
+        bail!("target_poses must contain at least two poses, each with its root");
     }
     check_speed(desired_speed)?;
     let start = target_poses[0][0].p;
@@ -242,7 +255,7 @@ pub fn place_target_poses(ground_position: Vec3, facing_direction: Vec3, blended
         .iter()
         .map(|pose| {
             let mut out = pose.clone();
-            out[0] = placement.mul(out[0]);
+            out[0] = placement * out[0];
             out
         })
         .collect()
@@ -255,7 +268,7 @@ pub fn place_target_dof(ground_position: Vec3, facing_direction: Vec3, blended_j
         .iter()
         .map(|q| {
             let mut out = q.clone();
-            write_root(placement.mul(read_root(q)), &mut out);
+            write_root(placement * read_root(q), &mut out);
             out
         })
         .collect()

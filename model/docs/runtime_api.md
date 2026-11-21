@@ -116,7 +116,8 @@ with rt.MotionBricksUnitreeG1Engine.from_checkpoints("checkpoints/MotionBricks/g
   their reference transforms in generated motion. Upstream reads its skeleton from
   `soma_base_skel_minimal_no_root.usd`. Here `load_skeleton_from_bvh(path, remove_root=True)` builds
   the same `Hips`-rooted skeleton from any SOMA BVH clip, without USD. The clips' identity `Root`
-  joint is dropped.
+  joint is dropped. A `Skeleton` lists parents before their children, with joint 0 as its only
+  root; it raises `ValueError` naming the first joint that breaks this.
 - **G1 joints:** the G1 engine works directly on the robot's joint coordinates.
 - **Backends:** the `model` argument is anything with `run(inputs) -> outputs` on the ONNX tensor
   names, so another backend (ONNX Runtime, a server) can stand in. `model=None` builds an engine
@@ -124,9 +125,10 @@ with rt.MotionBricksUnitreeG1Engine.from_checkpoints("checkpoints/MotionBricks/g
 - **Stages:** each stage is a public method, which makes them easy to inspect or replace:
   `encode_inputs()`, `run_model()`, `decode_prediction()`, `correct_endpoints()`.
   `engine.timer.milliseconds` holds the time of each stage of the last generation. On an
-  M4 Pro, encode and decode take a few ms for SOMA and well under 1 ms for the G1. FP32 inference
-  takes 11–15 ms at batch 1 after the first call, which also compiles the graph. The Rust runtime
-  needs about 7 ms for the whole generation.
+  M4 Pro, encoding, decoding and endpoint correction together take about 1.6 ms for SOMA (with a
+  77-joint skeleton) and 0.4 ms for the G1. FP32 inference takes 11–15 ms at batch 1 after the
+  first call, which also compiles the graph. The Rust runtime needs about 7 ms for the whole
+  generation.
 - **Source compatibility:** `stream=` arguments and `synchronize()` are accepted so upstream code
   ports with few edits. Generation is synchronous here.
 
@@ -163,6 +165,10 @@ and angles in degrees at 120 Hz, and converts them to meters, XYZW quaternions a
 `load_bvh(path, skeleton)` remaps a clip onto a skeleton by joint name. Clips are only one source of
 poses: any pose with the right layout works as a context or a target.
 
+`save_csv()` writes the frames in use of a `DOFAnimationBuffer` in the same format. The format has no
+sample rate, so read a saved generation back with `load_csv(path, sample_rate=30.0)`; the default of
+120 Hz would play it four times too fast.
+
 `motionbricks-mlx download --clips` fetches the four sample clips the examples use. They come from
 upstream's repository at the pinned commit, and each one is SHA-256 verified. The clips are NVIDIA
 sample data under the NVIDIA Sample Data Evaluation License and are not redistributed here.
@@ -184,15 +190,17 @@ generated motion and its foot contacts.
 
 ### Settings for each target
 
-Each target carries its own settings in `TargetPoseInferenceParams`. The motion players read them in
-`generate()`.
+Each target carries its own settings in `TargetPoseInferenceParams`. The motion players read the
+first three in `generate()`; `ik_pin_mask` is for your app's IK step (see
+[Target pose IK](#target-pose-ik)). The constructor raises `ValueError` for values outside the ranges
+below or for non-integers.
 
 | Field | Effect |
 | --- | --- |
 | `num_poses_to_use` | How many of the target's four poses inform the model, 1 to 4. One pose sets the destination, with the posture and facing at which the character stops. A second adds velocity; a third and fourth add acceleration and momentum. |
-| `transition_early_by_frames` | Moves the transition point this many frames before the end of the generated motion. A larger value makes the target a guide. |
+| `transition_early_by_frames` | Moves the transition point this many frames (0 or more) before the end of the generated motion. A larger value makes the target a guide. Upstream's apps offer 0 to `MAX_TRANSITION_EARLY_BY_FRAMES` (20). |
 | `allowed_token_counts` | Replaces the generation settings' counts for this target. A single count gives exact control over the length. |
-| `ik_pin_mask` | SOMA only. `TargetPoseIKCorrector` eases the pinned hands and feet onto the target with two-bone IK as playback nears it. |
+| `ik_pin_mask` | SOMA only. The `IKPin` hands and feet that `TargetPoseIKCorrector` eases onto the target with two-bone IK as playback nears it. The players do not apply it themselves. |
 
 ### Generation length
 
@@ -261,6 +269,13 @@ from the middle of a segment.
 | `sample(delta_time, pose, foot_contacts)` | Advances the playback time, then writes the pose and its foot contacts in place |
 | `record_pose(delta_time, pose)` | Records the pose that you showed |
 | `time_to_transition` | Seconds left until the transition point |
+| `playback_time`, `playback_duration` | The time played since the last generation, and the time of its transition point |
+| `current_root_position()` | The generated root position at the playback time |
+| `refresh_context()` | Reads the context from the history (`generate()` does this) |
+| `output` | The motion being played. A generation writes into a second buffer and the two swap when it succeeds, so read `player.output` again after each `generate()` |
+
+If `generate()` raises, the player keeps playing its previous motion with its playback time and
+transition point.
 
 The player does not decide when to generate. Your code calls `generate()`, usually when
 `time_to_transition` drops below the next update's time step. Sampling can continue past the
@@ -288,6 +303,39 @@ def update(delta_time, desired_velocity):
 movement input changes enough. Place target poses that match the desired speed
 (`adjust_target_pose_speed()`) ahead of the character along the desired velocity.
 
+### Target pose IK
+
+`TargetPoseIKCorrector` pins SOMA hands and feet to a target pose with two-bone IK. Your app drives
+it, as upstream's demo character does (`app/runtime/common/character.py`): capture
+the pins of a target's first pose when you generate toward it, and correct each sampled pose with a
+weight that rises over the second half of the segment.
+
+```python
+corrector = rt.TargetPoseIKCorrector(skeleton, rt.create_soma_target_pose_ik_rig(skeleton))
+
+
+def generate_to(target_poses, params):
+    player.generate(target_poses, params)
+    corrector.capture_pins(target_poses[0], params.ik_pin_mask)  # IKPin.NONE clears the pins
+
+
+def ik_weight(start_fraction=0.5):  # upstream: smoothstep(0.5, 1, progress through the segment)
+    if player.playback_duration <= 0.0:
+        return 1.0
+    progress = 1.0 - player.time_to_transition / player.playback_duration
+    t = min(max((progress - start_fraction) / (1.0 - start_fraction), 0.0), 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def update(delta_time):
+    player.sample(delta_time, current_pose, foot_contacts)
+    corrector.apply(current_pose, ik_weight())  # in place; does nothing without pins or at weight 0
+    player.record_pose(delta_time, current_pose)
+```
+
+The pins are the world transforms of the target's hands and feet, so capture them from the placed
+target poses.
+
 ## Differences from upstream
 
 | Upstream | Here |
@@ -296,7 +344,10 @@ movement input changes enough. Place target poses that match the desired speed
 | Warp arrays on a device | NumPy float32 arrays: transforms are `[..., 7]`, the `wp.transform` layout |
 | `MotionBricksSOMAEngine(onnx_path, ...)` | `MotionBricksSOMAEngine(model, ...)` or `.from_checkpoints(dir, dtype=...)` |
 | skeleton from `soma_base_skel_minimal_no_root.usd` | `load_skeleton_from_bvh(clip, remove_root=True)` (the same hierarchy, from the clip) |
-| `place_target_poses(..., target_poses)` writes into its last argument | also returns the placed poses (and writes into `target_poses` when given) |
+| `place_target_poses(..., target_poses)` writes into its last argument | also returns the placed poses (and writes into `target_poses` when given); `sample()` and `sample_foot_contacts()` likewise return their result when no output array is given |
+| arrays must be float32 Warp arrays | other dtypes are converted to float32. `AnimationBuffer` and `DOFAnimationBuffer` use a float32 `poses` array as is, like upstream, and copy any other dtype, so `make_loopable()` changes the caller's array only when it was float32 |
+| a failed `generate()` leaves the player's output empty | the player keeps its previous motion, playback time and transition point |
+| `Skeleton` and `TargetPoseInferenceParams` accept any values | a skeleton must list parents first with one root, and target settings must be in range; both raise `ValueError` otherwise |
 | renderers, blend spaces, Smart Primitives, the demo apps | not ported: the API covers generation, playback, recording, IK pins and clips |
 
 ## Verification
@@ -309,7 +360,9 @@ movement input changes enough. Place target poses that match the desired speed
   correction, and a non-identity `model_to_runtime`.
 - **Teacher-forced checks:** each step is checked against those fixtures. Encoding, decoding, endpoint
   correction, clip loading, recorder sampling, target placement and speed scaling, buffer sampling
-  and looping all agree with upstream within 2e-5, and IK pins within 5e-5.
+  and looping all agree with upstream within 2e-5, and IK pins within 5e-5. A backend that returns
+  the recorded predictions also runs the whole `generate_animation()` and a SOMA player without
+  weights.
 - **End to end:** every generation picks the same duration as upstream, and its poses stay within
   3e-3, the model's float noise after the rotation decoding.
 

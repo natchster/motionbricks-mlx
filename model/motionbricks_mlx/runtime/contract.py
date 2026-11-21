@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -65,6 +66,14 @@ UNITREE_G1_FOOT_CONTACT_OFFSETS = ((0.0, 0.0, 0.0), (0.14, 0.0, -0.035)) * 2
 DEFAULT_TOKEN_COUNTS = tuple(range(8, 15))
 
 
+def token_counts(values) -> tuple[int, ...]:
+    """Token counts as a tuple of ints; anything that is not an integer raises ``ValueError``."""
+    try:
+        return tuple(operator.index(v) for v in values)
+    except TypeError:
+        raise ValueError(f"Token counts must be integers, got {values!r}.") from None
+
+
 @dataclass(frozen=True, slots=True)
 class MotionBricksInferenceConfig:
     """Generation settings for output length, heading alignment and endpoint correction.
@@ -82,6 +91,7 @@ class MotionBricksInferenceConfig:
     heading_alignment: tuple[float, float] = (1.0, 0.0)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "allowed_token_counts", token_counts(self.allowed_token_counts))
         if not self.allowed_token_counts:
             raise ValueError("allowed_token_counts cannot be empty.")
         if not all(MODEL_MIN_TOKEN_COUNT <= c <= MODEL_MAX_TOKEN_COUNT for c in self.allowed_token_counts):

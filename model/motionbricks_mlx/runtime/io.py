@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from enum import IntEnum, auto
 from itertools import chain
 from pathlib import Path
@@ -118,7 +119,10 @@ def load_bvh(file_path, skeleton: Skeleton | None = None, *, remove_namespace: b
             if tokens[0] == "Frames:":
                 frame_count = int(tokens[1])
             elif tokens[:2] == ["Frame", "Time:"]:
-                sample_rate = round(1.0 / float(tokens[2]), 2)
+                frame_time = float(tokens[2])
+                if not (frame_time > 0.0 and math.isfinite(frame_time)):
+                    raise ValueError(f"BVH frame time must be positive, got {frame_time}: {file_path}.")
+                sample_rate = round(1.0 / frame_time, 2)
                 break
         if sample_rate is None:
             raise ValueError(f"BVH frame time is missing: {file_path}.")

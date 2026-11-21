@@ -44,7 +44,7 @@ def generate(model: str, dtype: str = "float32") -> list[np.ndarray]:
             # The output buffer has room for the longest result. Only num_frames frames are valid.
             frames = output.num_frames
             motions.append(output.poses[:frames].copy())
-            root = output.root_transforms()[:frames, :3]
+            root = output.root_transforms()[:, :3]  # the frames in use
             stages = ", ".join(f"{k} {v:.1f}" for k, v in engine.timer.milliseconds.items())
             print(f"generated {frames} frames ({frames / rt.MODEL_SAMPLE_RATE:.2f} s), "
                   f"root from {root[0].round(2)} to {root[-1].round(2)}  [ms: {stages}]")

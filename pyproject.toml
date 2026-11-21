@@ -4,13 +4,14 @@
 members = ["model", "sandbox"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-benchmark>=4"]
+dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["model/tests", "sandbox/tests"]
+# Undeclared markers are errors (a typo would otherwise silently select nothing). Set
+# MOTIONBRICKS_REQUIRE_FIXTURES=1 to turn skips for missing fixtures/weights into failures.
 markers = [
     "weights: needs the Hugging Face checkpoints (motionbricks-mlx download)",
     "reference: needs the upstream PyTorch reference (torch + sandbox/upstream)",
-    "slow: long-running",
 ]
-addopts = "-ra"
+addopts = "-ra --strict-markers"

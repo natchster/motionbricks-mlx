@@ -20,9 +20,10 @@ use common::*;
 use mlx_rs::ops::{DequantizeOptions, QuantizeOptions, dequantize, quantize};
 use mlx_rs::Array;
 use motionbricks_rs::metal::transformer::{
-    ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, Plan, QWeight, Scratch, TILES, Transformer, Weight,
+    ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, M4_PRO_PLANS, Plan, PlanKey, QWeight, Scratch, TILES, Transformer, Weight,
+    parse_plans,
 };
-use motionbricks_rs::metal::{Buf, Gpu, Precision, Recorder, wait};
+use motionbricks_rs::metal::{Buf, Elem, Gpu, Precision, Recorder, wait};
 use motionbricks_rs::ops::to_vec_f32;
 
 const DQ: DequantizeOptions = DequantizeOptions { mode: mlx_rs::ops::QuantizationMode::Affine, group_size: Some(64), bits: Some(8) };
@@ -331,4 +332,101 @@ fn transformer_layer_matches_reference() {
             }
         }
     }
+}
+
+/// A plan-table line for `key` with `plan` (the format `gemm-tune` writes).
+fn plan_line(prec: &str, m: i32, plan: &str) -> String {
+    format!("{prec} {m} 512 512 0 0 0 0 0 0  {plan}")
+}
+
+#[test]
+fn plan_tables_parse_strictly() {
+    let key = |m: i32| PlanKey { m, n: 512, k: 512, taps: 0, up: 0, concat: false, mask: false, arelu: false, q8: false };
+    // Comments, blank lines, other precisions; a repeated key keeps its last plan (gemm-tune appends).
+    let text = [
+        "# header".to_string(),
+        String::new(),
+        plan_line("float32", 8, "32 32 16 2 2 8  # 1.0 us"),
+        plan_line("bfloat16", 8, "16 32 32 1 2 4"),
+        plan_line("float32", 16, "16 64 32 1 4 4"),
+        plan_line("float32", 8, "16 64 32 1 4 2"),
+    ]
+    .join("\n");
+    let t = parse_plans(&text, Precision::F32).unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t[&key(8)], Plan { tile: TILES[1], splits: 2 }, "last entry wins");
+    assert_eq!(t[&key(16)], Plan { tile: TILES[1], splits: 4 });
+    assert_eq!(parse_plans(&text, Precision::BF16).unwrap()[&key(8)], Plan { tile: TILES[0], splits: 4 });
+    assert!(parse_plans(&text, Precision::F16).unwrap().is_empty());
+    // Malformed lines are errors naming the line, in any precision.
+    for (bad, why) in [
+        (plan_line("float32", 8, "32 32 16 2 2 0"), "splits must be at least 1"),
+        (plan_line("float32", 8, "32 32 16 2 2 -2"), "splits must be at least 1"),
+        (plan_line("float16", 8, "48 32 16 2 2 1"), "not one of the compiled tiles"),
+        (plan_line("float32", 8, "32 32 16 2 2"), "expected 16 fields"),
+        (plan_line("float32", 8, "32 32 16 2 x 1"), "not an integer"),
+        (plan_line("int8", 8, "32 32 16 2 2 1"), "unknown precision"),
+        ("float32 8 512 512 0 0 2 0 0 0  32 32 16 2 2 1".to_string(), "must be 0 or 1"),
+        ("float32 0 512 512 0 0 0 0 0 0  32 32 16 2 2 1".to_string(), "must be positive"),
+    ] {
+        let text = format!("# ok\n{}\n{bad}\n", plan_line("float32", 8, "32 32 16 2 2 1"));
+        let e = format!("{:#}", parse_plans(&text, Precision::F32).unwrap_err());
+        assert!(e.contains("line 3") && e.contains(why), "{bad:?}: {e}");
+    }
+}
+
+#[test]
+fn built_in_plan_table_parses_completely() {
+    for prec in [Precision::F32, Precision::F16, Precision::BF16] {
+        let lines = M4_PRO_PLANS.lines().filter(|l| l.split_whitespace().next() == Some(prec.name())).count();
+        let table = parse_plans(M4_PRO_PLANS, prec).unwrap();
+        assert!(lines > 200, "{prec:?}: {lines} lines");
+        assert_eq!(table.len(), lines, "{prec:?}: every line is a distinct launch class");
+    }
+}
+
+#[test]
+fn attention_support_matches_the_kernels() {
+    for (l, hd, ok) in [(9, 32, true), (25, 32, true), (16, 64, true), (32, 64, true), (7, 16, true), (33, 32, false), (25, 128, false)] {
+        assert_eq!(Kernels::attention_supported(l, hd), ok, "L={l} head dim {hd}");
+    }
+}
+
+#[test]
+fn int8_weights_refuse_the_scalar_loader() {
+    let _gpu = gpu_lock();
+    let gpu = Gpu::new().unwrap();
+    let k = Kernels::new(&gpu).unwrap();
+    let (m, n, kk) = (8, 64, 64);
+    let w = Weight::Q8(QWeight { q: gpu.upload_u32(&vec![0u32; n * kk / 4]), scales: gpu.upload(&vec![0.0; n]), biases: gpu.upload(&vec![0.0; n]) });
+    let (a, bias, y) = (gpu.buffer_t(m * 66), gpu.buffer_t(n), gpu.buffer_t(m * n));
+    let mut p = GemmParams::new(m, n, kk);
+    p.lda = 66; // not a multiple of 4: only the scalar loader could read A, and it has no INT8 path
+    let mut rec = Recorder::new(&gpu);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| k.run(&mut rec, &GemmCall::new(&a, &w, &bias, &y, p))));
+    assert!(r.is_err(), "INT8 launch with an unaligned A was accepted");
+    assert_eq!(rec.dispatches, 0);
+    rec.discard();
+}
+
+#[test]
+fn buffers_check_element_type_and_bounds() {
+    let _gpu = gpu_lock();
+    let gpu = Gpu::with_precision(Precision::BF16).unwrap();
+    let ints = gpu.upload_i32(&[7, -3, 1 << 30]);
+    assert_eq!(ints.kind(), Elem::I32);
+    assert_eq!(ints.to_i32(3), vec![7, -3, 1 << 30]);
+    let t = gpu.upload_t(&[1.0, 2.5, -0.375]);
+    assert_eq!((t.kind(), t.len()), (Elem::T(Precision::BF16), 3));
+    assert_eq!(t.to_f32(3), vec![1.0, 2.5, -0.375]);
+    let f = gpu.buffer(4);
+    f.write_f32_at(2, &[5.0, 6.0]);
+    f.fill_f32(0, 2, [1.0, 2.0].into_iter());
+    assert_eq!(f.to_f32(4), vec![1.0, 2.0, 5.0, 6.0]);
+    let refused = |f: &dyn Fn()| std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err();
+    assert!(refused(&|| ints.write_f32(&[1.0])), "float write into an int32 buffer");
+    assert!(refused(&|| drop(t.to_i32(1))), "int read of a T buffer");
+    assert!(refused(&|| f.write_f32_at(3, &[1.0, 2.0])), "write past the end");
+    assert!(refused(&|| drop(f.to_f32(5))), "read past the end");
+    assert!(refused(&|| f.fill_f32(0, 3, [1.0].into_iter())), "short iterator");
 }

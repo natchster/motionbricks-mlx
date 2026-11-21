@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import math
+import operator
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import IntFlag
@@ -18,7 +19,7 @@ import numpy as np
 
 from . import transforms as T
 from .animation import Skeleton, read_root, write_root
-from .contract import MODEL_SAMPLE_RATE, ROOT_COORDINATE_COUNT
+from .contract import MODEL_POSES_PER_TOKEN, MODEL_SAMPLE_RATE, ROOT_COORDINATE_COUNT, token_counts
 
 F = np.float32
 MAX_TRANSITION_EARLY_BY_FRAMES = 20
@@ -54,6 +55,24 @@ class TargetPoseInferenceParams:
     num_poses_to_use: int
     ik_pin_mask: IKPin = IKPin.NONE
     allowed_token_counts: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        try:
+            early, count, mask = (operator.index(v) for v in (self.transition_early_by_frames, self.num_poses_to_use, self.ik_pin_mask))
+        except TypeError:
+            raise ValueError("transition_early_by_frames, num_poses_to_use and ik_pin_mask must be integers.") from None
+        if early < 0:
+            raise ValueError(f"transition_early_by_frames must be zero or more, got {early}.")
+        if not 1 <= count <= MODEL_POSES_PER_TOKEN:
+            raise ValueError(f"num_poses_to_use must be 1 to {MODEL_POSES_PER_TOKEN}, got {count}.")
+        if mask & ~int(IKPin.ALL):
+            raise ValueError(f"ik_pin_mask must combine IKPin flags, got {mask}.")
+        object.__setattr__(self, "transition_early_by_frames", early)
+        object.__setattr__(self, "num_poses_to_use", count)
+        object.__setattr__(self, "ik_pin_mask", IKPin(mask))
+        if self.allowed_token_counts is not None:
+            # Checked against 6..16 when they replace the generation config's counts.
+            object.__setattr__(self, "allowed_token_counts", token_counts(self.allowed_token_counts))
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,9 +132,9 @@ def solve_two_bone_ik(weight, a_parent, a, b, c, t_world, use_hint: bool, hint_w
     l_ab = np.linalg.norm(pb - pa).astype(F)
     l_cb = np.linalg.norm(pb - pc).astype(F)
     l_at = F(min(max(np.linalg.norm(t - pa), _EPSILON), l_ab + l_cb - _EPSILON))
-    axis = T.normalize(np.cross(pc - pa, hint_world - pa) if use_hint else np.cross(pc - pa, pb - pa))
-    ac_ab_0 = np.arctan2(T.dot(axis, np.cross(pc - pa, pb - pa)), T.dot(pc - pa, pb - pa))
-    ba_bc_0 = np.arctan2(T.dot(axis, np.cross(pa - pb, pc - pb)), T.dot(pa - pb, pc - pb))
+    axis = T.normalize(T.cross(pc - pa, hint_world - pa) if use_hint else T.cross(pc - pa, pb - pa))
+    ac_ab_0 = np.arctan2(T.dot(axis, T.cross(pc - pa, pb - pa)), T.dot(pc - pa, pb - pa))
+    ba_bc_0 = np.arctan2(T.dot(axis, T.cross(pa - pb, pc - pb)), T.dot(pa - pb, pc - pb))
     ac_ab_1 = _acos((l_ab * l_ab + l_at * l_at - l_cb * l_cb) / (2.0 * l_ab * l_at))
     ba_bc_1 = _acos((l_ab * l_ab + l_cb * l_cb - l_at * l_at) / (2.0 * l_ab * l_cb))
     rot_a = T.quat_from_axis_angle(T.quat_rotate_inv(a[3:], axis), F(ac_ab_1 - ac_ab_0))
@@ -196,10 +215,18 @@ class TargetPoseIKCorrector:
         return pose
 
 
+_ONE, _SPEED_EPSILON = F(1.0), F(1.0e-6)
+_Z_AXIS = np.array([0.0, 0.0, 1.0], F)
+
+
 def _ground_speed_scale(start, end, pose_count: int, desired_speed: float) -> F:
+    """Scale from the ground (XY) positions of the first and last pose to the desired mean speed."""
+    # float32 values like upstream's kernel (wp.length of the ground velocity). A float64 division or
+    # square root of float32 values rounded to float32 equals the float32 operation.
     velocity = (end - start) * F(MODEL_SAMPLE_RATE / (pose_count - 1))
-    speed = math.hypot(float(velocity[0]), float(velocity[1]))
-    return F(1.0) if speed <= 1.0e-6 else F(desired_speed / speed)
+    vx, vy = velocity[0], velocity[1]
+    speed = F(math.sqrt(vx * vx + vy * vy))
+    return _ONE if speed <= _SPEED_EPSILON else F(desired_speed) / speed
 
 
 def _check_speed(desired_speed: float) -> None:
@@ -212,9 +239,9 @@ def adjust_target_pose_speed(target_poses: np.ndarray, desired_speed: float, str
     if target_poses.ndim != 3 or target_poses.shape[0] < 2 or target_poses.shape[2] != 7:
         raise ValueError("target_poses must contain at least two poses.")
     _check_speed(desired_speed)
-    start = target_poses[0, 0, :3].copy()
-    scale = _ground_speed_scale(start, target_poses[-1, 0, :3], target_poses.shape[0], desired_speed)
-    target_poses[1:, 0, :2] = start[:2] + (target_poses[1:, 0, :2] - start[:2]) * scale
+    start = target_poses[0, 0, :2]  # ground position; row 0 is not written below
+    scale = _ground_speed_scale(start, target_poses[-1, 0, :2], target_poses.shape[0], desired_speed)
+    target_poses[1:, 0, :2] = start + (target_poses[1:, 0, :2] - start) * scale
 
 
 def adjust_target_dof_speed(target_joint_q: np.ndarray, desired_speed: float, stream=None) -> None:
@@ -222,31 +249,38 @@ def adjust_target_dof_speed(target_joint_q: np.ndarray, desired_speed: float, st
     if target_joint_q.ndim != 2 or target_joint_q.shape[0] < 2 or target_joint_q.shape[1] < ROOT_COORDINATE_COUNT:
         raise ValueError("target_joint_q must contain at least two poses with root XYZ and XYZW values.")
     _check_speed(desired_speed)
-    start = target_joint_q[0, :3].copy()
-    scale = _ground_speed_scale(start, target_joint_q[-1, :3], target_joint_q.shape[0], desired_speed)
-    target_joint_q[1:, :2] = start[:2] + (target_joint_q[1:, :2] - start[:2]) * scale
+    start = target_joint_q[0, :2]  # ground position; row 0 is not written below
+    scale = _ground_speed_scale(start, target_joint_q[-1, :2], target_joint_q.shape[0], desired_speed)
+    target_joint_q[1:, :2] = start + (target_joint_q[1:, :2] - start) * scale
 
 
 def _ground_placement(ground_position, facing_direction) -> np.ndarray:
-    yaw = F(math.atan2(float(facing_direction[1]), float(facing_direction[0])))
-    return T.transform(np.asarray(ground_position, F), T.quat_from_axis_angle([0.0, 0.0, 1.0], yaw))
+    yaw = np.arctan2(F(facing_direction[1]), F(facing_direction[0]))  # float32, like upstream's kernel
+    return T.transform(np.asarray(ground_position, F), T.quat_from_axis_angle(_Z_AXIS, yaw))
+
+
+def _write_placed(out: np.ndarray, target) -> np.ndarray:
+    if target is None:
+        return out
+    if target.shape != out.shape:
+        raise ValueError(f"The output array must have the shape of the poses, {out.shape}; got {target.shape}.")
+    target[...] = out
+    return target
 
 
 def place_target_poses(ground_position, facing_direction, blended_poses, target_poses: np.ndarray | None = None, stream=None) -> np.ndarray:
     """Move the roots of local poses ``[n, J, 7]`` to a ground position, turned to face a direction (Z up)."""
     out = np.array(blended_poses, F, copy=True)
+    if out.ndim != 3 or out.shape[2] != 7:
+        raise ValueError(f"blended_poses must be local poses [n, J, 7], got shape {out.shape}; pass one pose as pose[None].")
     out[:, 0] = T.transform_mul(_ground_placement(ground_position, facing_direction), out[:, 0])
-    if target_poses is not None:
-        target_poses[...] = out
-        return target_poses
-    return out
+    return _write_placed(out, target_poses)
 
 
 def place_target_dof(ground_position, facing_direction, blended_joint_q, target_joint_q: np.ndarray | None = None, stream=None) -> np.ndarray:
-    """The same for joint coordinates ``[n, 36]``; the joint angles are kept."""
+    """The same for joint coordinates ``[n, 36]`` (or one pose ``[36]``); the joint angles are kept."""
     out = np.array(blended_joint_q, F, copy=True)
+    if out.ndim not in (1, 2) or out.shape[-1] < ROOT_COORDINATE_COUNT:
+        raise ValueError(f"blended_joint_q must be joint coordinates [n, 7 + dofs], got shape {out.shape}.")
     write_root(T.transform_mul(_ground_placement(ground_position, facing_direction), read_root(out)), out)
-    if target_joint_q is not None:
-        target_joint_q[...] = out
-        return target_joint_q
-    return out
+    return _write_placed(out, target_joint_q)

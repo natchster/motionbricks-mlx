@@ -18,7 +18,7 @@ use std::rc::Rc;
 use common::*;
 use mlx_rs::{Array, Dtype};
 use motionbricks_rs::npy::Npy;
-use motionbricks_rs::ops::{i, to_vec_f32, to_vec_i32};
+use motionbricks_rs::ops::{to_vec_f32, to_vec_i32};
 use motionbricks_rs::{MotionBricks, compiled};
 
 struct G<'a>(&'a HashMap<String, Npy>);
@@ -28,7 +28,7 @@ impl G<'_> {
         self.0[k].f32_array()
     }
     fn flag(&self, k: &str) -> Array {
-        self.0[k].i32_array().ne(i(0)).unwrap()
+        self.0[k].bool_array()
     }
     fn int(&self, k: &str) -> Array {
         self.0[k].i32_array()
@@ -39,7 +39,7 @@ impl G<'_> {
 }
 
 /// The model and all golden cases, or `None` (skip).
-fn setup(name: &str) -> Option<(MotionBricks, Vec<(&'static str, HashMap<String, Npy>)>)> {
+fn setup(name: &str) -> Option<(MotionBricks, Cases)> {
     let dir = checkpoints(name)?;
     let cases = goldens(name)?;
     Some((MotionBricks::from_checkpoints(name, dir, Dtype::Float32).expect("model loads"), cases))

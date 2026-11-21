@@ -6,7 +6,7 @@
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
 //! Skeletons and animation buffers: local joint transforms (SOMA) and joint coordinates (G1).
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
@@ -15,19 +15,44 @@ use super::math::*;
 
 /// The frame at a time, the next frame, and the blend toward it; both clamped to the clip.
 pub fn frame_index_from_time(time: f32, sample_rate: f32, num_frames: usize) -> (usize, usize, f32) {
+    frame_index_at(time as f64, sample_rate, num_frames)
+}
+
+/// [`frame_index_from_time`] for an `f64` time (the players' clock).
+pub(crate) fn frame_index_at(time: f64, sample_rate: f32, num_frames: usize) -> (usize, usize, f32) {
     let last = num_frames.saturating_sub(1);
-    let fractional = time as f64 * sample_rate as f64;
+    let fractional = time * sample_rate as f64;
     let frame = (fractional.floor().max(0.0) as usize).min(last);
     let blend = if frame < last { (fractional - frame as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
     (frame, (frame + 1).min(last), blend)
 }
 
+fn check_sample_rate(sample_rate: f32) -> Result<()> {
+    if !(sample_rate > 0.0 && sample_rate.is_finite()) {
+        bail!("sample_rate must be positive and finite, got {sample_rate}");
+    }
+    Ok(())
+}
+
+/// The frames and blend to sample at a time (the buffer must have frames in use).
+fn sample_frames(time: f64, sample_rate: f32, num_frames: usize) -> Result<(usize, usize, f32)> {
+    if num_frames == 0 {
+        bail!("cannot sample an empty animation buffer");
+    }
+    if !time.is_finite() {
+        bail!("sample time must be finite, got {time}");
+    }
+    Ok(frame_index_at(time, sample_rate, num_frames))
+}
+
 /// Joint hierarchy and reference pose (one local transform per joint, parents first).
+///
+/// Joint 0 is the only root (parent index < 0); every other joint's parent comes before it.
 #[derive(Clone, Debug)]
 pub struct Skeleton {
-    pub joint_names: Vec<String>,
-    pub parent_indices: Vec<i32>,
-    pub reference_local_transforms: Vec<Transform>,
+    joint_names: Vec<String>,
+    parent_indices: Vec<i32>,
+    reference_local_transforms: Vec<Transform>,
 }
 
 impl Skeleton {
@@ -38,15 +63,38 @@ impl Skeleton {
         if parent_indices.len() != joint_names.len() || reference_local_transforms.len() != joint_names.len() {
             bail!("expected {} parent indices and local transforms", joint_names.len());
         }
+        for (j, &p) in parent_indices.iter().enumerate() {
+            let ok = if j == 0 { p < 0 } else { p >= 0 && (p as usize) < j };
+            if !ok {
+                bail!(
+                    "joint {j} ({:?}) has parent index {p}: joint 0 must be the only root (parent < 0) and every other joint's parent must come before it",
+                    joint_names[j]
+                );
+            }
+        }
         Ok(Skeleton { joint_names, parent_indices, reference_local_transforms })
     }
     pub fn num_joints(&self) -> usize {
         self.joint_names.len()
     }
+    pub fn joint_names(&self) -> &[String] {
+        &self.joint_names
+    }
+    /// Parent of each joint, -1 (or any negative value) for the root.
+    pub fn parent_indices(&self) -> &[i32] {
+        &self.parent_indices
+    }
+    /// Reference pose, one local joint transform per joint.
+    pub fn reference_local_transforms(&self) -> &[Transform] {
+        &self.reference_local_transforms
+    }
     pub fn joint_index(&self, name: &str) -> Option<usize> {
         self.joint_names.iter().position(|n| n == name)
     }
-    /// Parent index, or -1 for the root.
+    pub fn joint_name(&self, index: usize) -> Option<&str> {
+        self.joint_names.get(index).map(String::as_str)
+    }
+    /// Parent index, negative for the root. Panics if `index` is not a joint.
     pub fn joint_parent(&self, index: usize) -> i32 {
         self.parent_indices[index]
     }
@@ -63,6 +111,10 @@ impl Skeleton {
     pub fn compute_world_transforms(&self, local: &[Transform], root: Transform) -> Vec<Transform> {
         compute_world_poses(local, &self.parent_indices, root)
     }
+    /// The same into `world`, reusing its allocation.
+    pub fn compute_world_transforms_into(&self, local: &[Transform], root: Transform, world: &mut Vec<Transform>) {
+        compute_world_poses_into(local, &self.parent_indices, root, world)
+    }
 }
 
 /// Foot contacts of one frame: left heel, left toe, right heel, right toe (confidence 0..1).
@@ -72,24 +124,47 @@ fn lerp_contacts(a: FootContacts, b: FootContacts, t: f32) -> FootContacts {
     std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
 }
 
+fn check_num_frames(num_frames: usize, capacity: usize) -> Result<()> {
+    if num_frames > capacity {
+        bail!("num_frames must be in [0, {capacity}], got {num_frames}");
+    }
+    Ok(())
+}
+
+/// What the motion players need from both buffer types ([`AnimationBuffer`], [`DofAnimationBuffer`]).
+pub trait MotionBuffer {
+    /// One value of a pose: a joint [`Transform`] (SOMA) or a joint coordinate (G1).
+    type Elem: Copy + Default;
+    fn num_frames(&self) -> usize;
+    /// Set the frames in use, 0 to the capacity.
+    fn set_num_frames(&mut self, num_frames: usize) -> Result<()>;
+    fn sample_rate(&self) -> f32;
+    /// Values per pose.
+    fn pose_len(&self) -> usize;
+    fn root_position(&self, frame: usize) -> Vec3;
+    /// The pose at an `f64` time (the players' clock), root moved by `root_offset`.
+    fn sample_at(&self, time: f64, root_offset: Transform) -> Result<Vec<Self::Elem>>;
+    /// The same into `out` (`pose_len` values).
+    fn sample_into_at(&self, time: f64, root_offset: Transform, out: &mut [Self::Elem]) -> Result<()>;
+    fn foot_contacts_at(&self, time: f64) -> Result<FootContacts>;
+}
+
 /// Animation frames as local joint transforms at a fixed sample rate (SOMA, clips).
 ///
-/// `poses` is `[capacity][num_joints]` flattened; `num_frames` counts the frames in use;
-/// `foot_contacts` holds `capacity` frames for generated motion and is `None` for clips.
+/// `poses()` is `[capacity][num_joints]` flattened; `num_frames()` counts the frames in use;
+/// `foot_contacts()` holds `capacity` frames for generated motion and is `None` for clips.
 #[derive(Clone, Debug)]
 pub struct AnimationBuffer {
-    pub skeleton: Rc<Skeleton>,
-    pub sample_rate: f32,
-    pub poses: Vec<Transform>,
-    pub num_frames: usize,
-    pub foot_contacts: Option<Vec<FootContacts>>,
+    pub(crate) skeleton: Arc<Skeleton>,
+    pub(crate) sample_rate: f32,
+    pub(crate) poses: Vec<Transform>,
+    pub(crate) num_frames: usize,
+    pub(crate) foot_contacts: Option<Vec<FootContacts>>,
 }
 
 impl AnimationBuffer {
-    pub fn new(skeleton: Rc<Skeleton>, sample_rate: f32, poses: Vec<Transform>, num_frames: Option<usize>, foot_contacts: Option<Vec<FootContacts>>) -> Result<Self> {
-        if sample_rate <= 0.0 {
-            bail!("sample_rate must be positive");
-        }
+    pub fn new(skeleton: Arc<Skeleton>, sample_rate: f32, poses: Vec<Transform>, num_frames: Option<usize>, foot_contacts: Option<Vec<FootContacts>>) -> Result<Self> {
+        check_sample_rate(sample_rate)?;
         let j = skeleton.num_joints();
         if poses.len() % j != 0 {
             bail!("poses must have shape [capacity, num_joints]");
@@ -99,16 +174,42 @@ impl AnimationBuffer {
             bail!("foot_contacts must have shape [{capacity}, 4]");
         }
         let num_frames = num_frames.unwrap_or(capacity);
-        if num_frames > capacity {
-            bail!("num_frames must be in [0, {capacity}]");
-        }
+        check_num_frames(num_frames, capacity)?;
         Ok(AnimationBuffer { skeleton, sample_rate, poses, num_frames, foot_contacts })
+    }
+    pub fn skeleton(&self) -> &Arc<Skeleton> {
+        &self.skeleton
+    }
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+    /// Frames in use, 0 to `capacity()`.
+    pub fn num_frames(&self) -> usize {
+        self.num_frames
+    }
+    pub fn set_num_frames(&mut self, num_frames: usize) -> Result<()> {
+        check_num_frames(num_frames, self.capacity())?;
+        self.num_frames = num_frames;
+        Ok(())
     }
     pub fn capacity(&self) -> usize {
         self.poses.len() / self.skeleton.num_joints()
     }
     pub fn duration(&self) -> f32 {
         self.num_frames.saturating_sub(1) as f32 / self.sample_rate
+    }
+    /// All `capacity` frames, flattened.
+    pub fn poses(&self) -> &[Transform] {
+        &self.poses
+    }
+    pub fn poses_mut(&mut self) -> &mut [Transform] {
+        &mut self.poses
+    }
+    pub fn foot_contacts(&self) -> Option<&[FootContacts]> {
+        self.foot_contacts.as_deref()
+    }
+    pub fn foot_contacts_mut(&mut self) -> Option<&mut [FootContacts]> {
+        self.foot_contacts.as_deref_mut()
     }
     pub fn frame(&self, i: usize) -> &[Transform] {
         let j = self.skeleton.num_joints();
@@ -124,17 +225,14 @@ impl AnimationBuffer {
     }
     /// The pose at a time (two nearest frames blended; times clamped), root moved by `root_offset`.
     pub fn sample(&self, time: f32, root_offset: Transform) -> Result<Vec<Transform>> {
-        if self.num_frames == 0 {
-            bail!("cannot sample an empty animation buffer");
-        }
-        let (f, n, b) = frame_index_from_time(time, self.sample_rate, self.num_frames);
-        let (a, c) = (self.frame(f), self.frame(n));
-        let mut pose: Vec<Transform> = a.iter().zip(c).map(|(x, y)| blend_transform(*x, *y, b)).collect();
-        pose[0] = root_offset.mul(pose[0]);
-        Ok(pose)
+        self.sample_at(time as f64, root_offset)
+    }
+    /// The same into `out` (one transform per joint), without allocating.
+    pub fn sample_into(&self, time: f32, root_offset: Transform, out: &mut [Transform]) -> Result<()> {
+        self.sample_into_at(time as f64, root_offset, out)
     }
     pub fn sample_foot_contacts(&self, time: f32) -> Result<FootContacts> {
-        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time)
+        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time as f64)
     }
     /// A copy of the frames in use (and their foot contacts).
     pub fn copy(&self) -> AnimationBuffer {
@@ -167,22 +265,63 @@ impl AnimationBuffer {
     }
 }
 
+impl MotionBuffer for AnimationBuffer {
+    type Elem = Transform;
+    fn num_frames(&self) -> usize {
+        self.num_frames
+    }
+    fn set_num_frames(&mut self, num_frames: usize) -> Result<()> {
+        AnimationBuffer::set_num_frames(self, num_frames)
+    }
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+    fn pose_len(&self) -> usize {
+        self.skeleton.num_joints()
+    }
+    fn root_position(&self, frame: usize) -> Vec3 {
+        self.frame(frame)[0].p
+    }
+    fn sample_at(&self, time: f64, root_offset: Transform) -> Result<Vec<Transform>> {
+        let (f, n, b) = sample_frames(time, self.sample_rate, self.num_frames)?;
+        let (a, c) = (self.frame(f), self.frame(n));
+        let mut pose: Vec<Transform> = a.iter().zip(c).map(|(x, y)| blend_transform(*x, *y, b)).collect();
+        pose[0] = root_offset * pose[0];
+        Ok(pose)
+    }
+    fn sample_into_at(&self, time: f64, root_offset: Transform, out: &mut [Transform]) -> Result<()> {
+        let (f, n, b) = sample_frames(time, self.sample_rate, self.num_frames)?;
+        if out.len() != self.skeleton.num_joints() {
+            bail!("the output pose must hold {} transforms, got {}", self.skeleton.num_joints(), out.len());
+        }
+        let (a, c) = (self.frame(f), self.frame(n));
+        for ((o, x), y) in out.iter_mut().zip(a).zip(c) {
+            *o = blend_transform(*x, *y, b);
+        }
+        out[0] = root_offset * out[0];
+        Ok(())
+    }
+    fn foot_contacts_at(&self, time: f64) -> Result<FootContacts> {
+        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time)
+    }
+}
+
 /// Remap an animation to another skeleton by joint name; missing joints keep its reference pose.
-pub fn create_animation_buffer_for_skeleton(animation: &AnimationBuffer, skeleton: Rc<Skeleton>) -> AnimationBuffer {
-    if Rc::ptr_eq(&animation.skeleton, &skeleton) {
+pub fn create_animation_buffer_for_skeleton(animation: &AnimationBuffer, skeleton: Arc<Skeleton>) -> AnimationBuffer {
+    if Arc::ptr_eq(&animation.skeleton, &skeleton) {
         return animation.clone();
     }
     let j = skeleton.num_joints();
-    let mapping: Vec<Option<usize>> = animation.skeleton.joint_names.iter().map(|n| skeleton.joint_index(n)).collect();
+    let mapping: Vec<Option<usize>> = animation.skeleton.joint_names().iter().map(|n| skeleton.joint_index(n)).collect();
     let mut poses = Vec::with_capacity(animation.num_frames * j);
     for frame in 0..animation.num_frames {
-        let mut pose = skeleton.reference_local_transforms.clone();
+        let start = poses.len();
+        poses.extend_from_slice(skeleton.reference_local_transforms());
         for (source, target) in mapping.iter().enumerate() {
             if let Some(t) = target {
-                pose[*t] = animation.frame(frame)[source];
+                poses[start + *t] = animation.frame(frame)[source];
             }
         }
-        poses.extend(pose);
     }
     AnimationBuffer { skeleton, sample_rate: animation.sample_rate, poses, num_frames: animation.num_frames, foot_contacts: None }
 }
@@ -198,22 +337,36 @@ pub fn write_root(root: Transform, q: &mut [f32]) {
     q[3..7].copy_from_slice(&quat_normalize(root.q));
 }
 
+/// Lerp joint coordinates `a` -> `c` into `out` (angles also across +-pi) and return the slerped
+/// root, for the caller to write.
+pub(crate) fn blend_joint_coordinates(a: &[f32], c: &[f32], b: f32, out: &mut [f32]) -> Transform {
+    for ((o, x), y) in out.iter_mut().zip(a).zip(c) {
+        *o = x + (y - x) * b;
+    }
+    blend_transform(read_root(a), read_root(c), b)
+}
+
+/// Joint coordinates of the identity pose (zero root position and angles).
+pub(crate) fn identity_joint_coordinates(num_dofs: usize) -> Vec<f32> {
+    let mut q = vec![0.0; ROOT_COORDINATE_COUNT + num_dofs];
+    q[6] = 1.0;
+    q
+}
+
 /// Animation frames as joint coordinates: root position (m), root rotation (XYZW), joint angles
-/// (rad) in `joint_names` order (G1). `poses` is `[capacity][7 + num_dofs]` flattened.
+/// (rad) in `joint_names` order (G1). `poses()` is `[capacity][7 + num_dofs]` flattened.
 #[derive(Clone, Debug)]
 pub struct DofAnimationBuffer {
-    pub joint_names: Vec<String>,
-    pub sample_rate: f32,
-    pub poses: Vec<f32>,
-    pub num_frames: usize,
-    pub foot_contacts: Option<Vec<FootContacts>>,
+    pub(crate) joint_names: Vec<String>,
+    pub(crate) sample_rate: f32,
+    pub(crate) poses: Vec<f32>,
+    pub(crate) num_frames: usize,
+    pub(crate) foot_contacts: Option<Vec<FootContacts>>,
 }
 
 impl DofAnimationBuffer {
     pub fn new(joint_names: Vec<String>, sample_rate: f32, poses: Vec<f32>, num_frames: Option<usize>, foot_contacts: Option<Vec<FootContacts>>) -> Result<Self> {
-        if sample_rate <= 0.0 {
-            bail!("sample_rate must be positive");
-        }
+        check_sample_rate(sample_rate)?;
         let nc = ROOT_COORDINATE_COUNT + joint_names.len();
         if poses.len() % nc != 0 {
             bail!("poses must have shape [capacity, {nc}]");
@@ -223,10 +376,22 @@ impl DofAnimationBuffer {
             bail!("foot_contacts must have shape [{capacity}, 4]");
         }
         let num_frames = num_frames.unwrap_or(capacity);
-        if num_frames > capacity {
-            bail!("num_frames must be in [0, {capacity}]");
-        }
+        check_num_frames(num_frames, capacity)?;
         Ok(DofAnimationBuffer { joint_names, sample_rate, poses, num_frames, foot_contacts })
+    }
+    pub fn joint_names(&self) -> &[String] {
+        &self.joint_names
+    }
+    pub fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+    pub fn num_frames(&self) -> usize {
+        self.num_frames
+    }
+    pub fn set_num_frames(&mut self, num_frames: usize) -> Result<()> {
+        check_num_frames(num_frames, self.capacity())?;
+        self.num_frames = num_frames;
+        Ok(())
     }
     pub fn num_dofs(&self) -> usize {
         self.joint_names.len()
@@ -239,6 +404,19 @@ impl DofAnimationBuffer {
     }
     pub fn duration(&self) -> f32 {
         self.num_frames.saturating_sub(1) as f32 / self.sample_rate
+    }
+    /// All `capacity` frames, flattened.
+    pub fn poses(&self) -> &[f32] {
+        &self.poses
+    }
+    pub fn poses_mut(&mut self) -> &mut [f32] {
+        &mut self.poses
+    }
+    pub fn foot_contacts(&self) -> Option<&[FootContacts]> {
+        self.foot_contacts.as_deref()
+    }
+    pub fn foot_contacts_mut(&mut self) -> Option<&mut [FootContacts]> {
+        self.foot_contacts.as_deref_mut()
     }
     pub fn frame(&self, i: usize) -> &[f32] {
         let nc = self.num_coordinates();
@@ -253,17 +431,14 @@ impl DofAnimationBuffer {
     }
     /// Joint coordinates at a time; angles lerp (also across +-pi), the root slerps.
     pub fn sample(&self, time: f32, root_offset: Transform) -> Result<Vec<f32>> {
-        if self.num_frames == 0 {
-            bail!("cannot sample an empty animation buffer");
-        }
-        let (f, n, b) = frame_index_from_time(time, self.sample_rate, self.num_frames);
-        let (a, c) = (self.frame(f), self.frame(n));
-        let mut out: Vec<f32> = a.iter().zip(c).map(|(x, y)| x + (y - x) * b).collect();
-        write_root(root_offset.mul(blend_transform(read_root(a), read_root(c), b)), &mut out);
-        Ok(out)
+        self.sample_at(time as f64, root_offset)
+    }
+    /// The same into `out` (`num_coordinates()` values), without allocating.
+    pub fn sample_into(&self, time: f32, root_offset: Transform, out: &mut [f32]) -> Result<()> {
+        self.sample_into_at(time as f64, root_offset, out)
     }
     pub fn sample_foot_contacts(&self, time: f32) -> Result<FootContacts> {
-        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time)
+        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time as f64)
     }
     pub fn copy(&self) -> DofAnimationBuffer {
         let nc = self.num_coordinates();
@@ -293,11 +468,46 @@ impl DofAnimationBuffer {
     }
 }
 
-fn sample_foot_contacts(contacts: Option<&[FootContacts]>, num_frames: usize, sample_rate: f32, time: f32) -> Result<FootContacts> {
-    let Some(c) = contacts else { bail!("cannot sample foot contacts from an animation buffer that has none") };
-    if num_frames == 0 {
-        bail!("cannot sample an empty animation buffer");
+impl MotionBuffer for DofAnimationBuffer {
+    type Elem = f32;
+    fn num_frames(&self) -> usize {
+        self.num_frames
     }
-    let (f, n, b) = frame_index_from_time(time, sample_rate, num_frames);
+    fn set_num_frames(&mut self, num_frames: usize) -> Result<()> {
+        DofAnimationBuffer::set_num_frames(self, num_frames)
+    }
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+    fn pose_len(&self) -> usize {
+        self.num_coordinates()
+    }
+    fn root_position(&self, frame: usize) -> Vec3 {
+        read_root(self.frame(frame)).p
+    }
+    fn sample_at(&self, time: f64, root_offset: Transform) -> Result<Vec<f32>> {
+        let (f, n, b) = sample_frames(time, self.sample_rate, self.num_frames)?;
+        let (a, c) = (self.frame(f), self.frame(n));
+        let mut out: Vec<f32> = a.iter().zip(c).map(|(x, y)| x + (y - x) * b).collect();
+        write_root(root_offset * blend_transform(read_root(a), read_root(c), b), &mut out);
+        Ok(out)
+    }
+    fn sample_into_at(&self, time: f64, root_offset: Transform, out: &mut [f32]) -> Result<()> {
+        let (f, n, b) = sample_frames(time, self.sample_rate, self.num_frames)?;
+        if out.len() != self.num_coordinates() {
+            bail!("the output pose must hold {} coordinates, got {}", self.num_coordinates(), out.len());
+        }
+        let root = blend_joint_coordinates(self.frame(f), self.frame(n), b, out);
+        write_root(root_offset * root, out);
+        Ok(())
+    }
+    fn foot_contacts_at(&self, time: f64) -> Result<FootContacts> {
+        sample_foot_contacts(self.foot_contacts.as_deref(), self.num_frames, self.sample_rate, time)
+    }
+}
+
+fn sample_foot_contacts(contacts: Option<&[FootContacts]>, num_frames: usize, sample_rate: f32, time: f64) -> Result<FootContacts> {
+    let Some(c) = contacts else { bail!("cannot sample foot contacts from an animation buffer that has none") };
+    let (f, n, b) = sample_frames(time, sample_rate, num_frames)?;
     Ok(lerp_contacts(c[f], c[n], b))
 }

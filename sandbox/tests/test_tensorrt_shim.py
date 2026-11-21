@@ -11,14 +11,14 @@ import pytest
 onnx = pytest.importorskip("onnx")
 pytest.importorskip("onnxruntime")
 import cudashim  # noqa: E402
+from cudashim.paths import ASSETS, GOLDEN as GOLDEN_ROOT, ROOT  # noqa: E402
 from cudashim.warp_cpu import UPSTREAM, upstream_on_path  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[2]
 # Locally exported by sandbox/scripts/export_onnx.py, else the released LFS file.
-G1_ONNX = next((p for p in (ROOT / "sandbox/assets/onnx/mmm_v6_g1_fp32.onnx",
+G1_ONNX = next((p for p in (ASSETS / "onnx/mmm_v6_g1_fp32.onnx",
                             UPSTREAM / "motionbricks/assets/onnx/unitree_g1/mmm_v6_g1_fp32.onnx")
                 if p.is_file() and p.stat().st_size > 10_000), ROOT / "missing.onnx")
-GOLDEN = ROOT / "sandbox/golden/unitree_g1/trace.npz"
+GOLDEN = GOLDEN_ROOT / "unitree_g1/trace.npz"
 
 
 @pytest.fixture(autouse=True)
@@ -59,6 +59,63 @@ def test_named_tensor_flow(trt, tmp_path):
     context.set_tensor_address("x", x.ctypes.data)
     context.set_tensor_address("y", y.ctypes.data)
     assert context.execute_async_v3(0)
+    assert np.allclose(y, x @ np.arange(1, 7, dtype=np.float32).reshape(3, 2))
+
+
+def build_tiny_engine(trt, tmp_path, fp16=False, logger=None):
+    tiny_onnx(tmp_path / "tiny.onnx")
+    logger = logger or trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network(0)
+    assert trt.OnnxParser(network, logger).parse_from_file(str(tmp_path / "tiny.onnx"))
+    network.get_input(0).shape = (4, 3)
+    config = builder.create_builder_config()
+    if fp16:
+        config.set_flag(trt.BuilderFlag.FP16)
+    return trt.Runtime(logger).deserialize_cuda_engine(builder.build_serialized_network(network, config))
+
+
+def test_build_reuses_the_dry_run_session(trt, tmp_path):
+    """Building + deserializing one graph creates a single ONNX Runtime session."""
+    engine = build_tiny_engine(trt, tmp_path)
+    assert trt._handoff == []  # handed to the engine, nothing left holding the graph
+    assert engine.session is not None
+
+
+def test_fp16_flag_warns_that_it_is_not_emulated(trt, tmp_path):
+    class Recorder(trt.ILogger):
+        def __init__(self):
+            super().__init__()
+            self.messages = []
+
+        def log(self, severity, msg):
+            self.messages.append((severity, msg))
+
+    logger = Recorder()
+    engine = build_tiny_engine(trt, tmp_path, fp16=True, logger=logger)
+    assert engine.header["fp16"] is True
+    assert any(severity == trt.ILogger.Severity.WARNING and "FP16" in msg for severity, msg in logger.messages)
+
+
+def test_errors_are_reported_like_tensorrt(trt, tmp_path):
+    logger = trt.Logger(trt.Logger.ERROR)
+    parser = trt.OnnxParser(trt.Builder(logger).create_network(0), logger)
+    assert not parser.parse(b"not an onnx graph") and parser.num_errors == 1
+    assert not parser.parse_from_file(str(tmp_path / "absent.onnx")) and parser.num_errors == 2
+    assert trt.Runtime(logger).deserialize_cuda_engine(b"not a plan") is None
+
+    engine = build_tiny_engine(trt, tmp_path)
+    context = engine.create_execution_context()
+    x = np.ones((4, 3), np.float32)
+    assert not context.set_tensor_address("nope", x.ctypes.data)
+    assert not context.set_tensor_address("y", 0)  # null for a non-empty tensor
+    assert context.set_tensor_address("x", x.ctypes.data)
+    with pytest.raises(RuntimeError, match="not set"):
+        context.execute_async_v3(0)
+    with pytest.raises(RuntimeError, match="null"):
+        context.execute_v2([x.ctypes.data, 0])
+    y = np.zeros((4, 2), np.float32)
+    assert context.execute_v2([x.ctypes.data, y.ctypes.data])
     assert np.allclose(y, x @ np.arange(1, 7, dtype=np.float32).reshape(3, 2))
 
 

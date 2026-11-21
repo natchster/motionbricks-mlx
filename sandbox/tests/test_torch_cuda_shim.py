@@ -48,9 +48,27 @@ def test_cuda_events_time_kernels():
 def test_cuda_autocast_maps_to_mps():
     with torch_cuda.enabled():
         x = torch.randn(32, 32, device="cuda")
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=torch.float16):  # the deprecated API
             y = x @ x
         assert y.dtype == torch.float16
+
+
+@pytest.mark.parametrize("make", [
+    lambda: torch.autocast("cuda", dtype=torch.float16),
+    lambda: torch.autocast(device_type="cuda", dtype=torch.float16),
+    lambda: torch.amp.autocast("cuda", dtype=torch.float16),
+], ids=["torch.autocast", "device_type=", "torch.amp.autocast"])
+def test_modern_cuda_autocast_maps_to_mps(make):
+    """Unmapped, these silently stay FP32 (the shim reports CUDA as available, so no warning)."""
+    original = torch.autocast
+    with torch_cuda.enabled():
+        x = torch.randn(32, 32, device="cuda")
+        with make():
+            y = x @ x
+        assert y.dtype == torch.float16
+        with torch.autocast("cpu", dtype=torch.bfloat16):  # other device types pass through
+            assert (torch.randn(4, 4) @ torch.randn(4, 4)).dtype == torch.bfloat16
+    assert torch.autocast is original and torch.amp.autocast is original  # cleanly restored
 
 
 def test_matches_cpu_numerics():

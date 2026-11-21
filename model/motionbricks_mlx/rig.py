@@ -78,6 +78,17 @@ def wrap(angle):
     return mx.remainder(angle + math.pi, 2 * math.pi) - math.pi
 
 
+def _check_g1_layout(floats: list[np.ndarray], ints: list[np.ndarray], indices: dict[str, np.ndarray]) -> None:
+    """The Metal kernels hard-code the packed rig and feature layout; refuse anything else."""
+    got = [part.size for part in floats], [part.size for part in ints]
+    want = [size for _, size in kernels.G1_RF_LAYOUT], [size for _, size in kernels.G1_RI_LAYOUT]
+    layout = (int(indices["all"].size), int(indices["global_rot_data"][0]), int(indices["foot_contacts"][0]))
+    want_layout = (kernels.G1_FEATURES, kernels.G1_ROTATIONS_AT, kernels.G1_CONTACTS_AT)
+    if got != want or layout != want_layout:
+        raise ValueError(f"G1 rig does not match the layout of the Metal kernels: packed sizes {got} vs {want}, "
+                         f"(features, rotations at, contacts at) {layout} vs {want_layout}.")
+
+
 class G1Rig:
     """Unitree G1: MuJoCo joint coordinates <-> the model's 34-joint skeleton features.
 
@@ -96,23 +107,28 @@ class G1Rig:
         self.parents = arrays["mujoco_joint_including_root_parent_list"].tolist()
         self.model_parents = arrays["joint_parents"].tolist()
         self.reverse = arrays["motion_indices_to_mujoco_indices"].tolist()
-        self.mapping = mx.array(np.asarray(arrays["mujoco_indices_to_motion_indices"], dtype=np.int32))
-        self.q2t_mapped = self.q2t[self.mapping]
+        mapping = np.asarray(arrays["mujoco_indices_to_motion_indices"], dtype=np.int32)
+        q2t_mapped = np.asarray(arrays["rot_offsets_q2t"], np.float32)[mapping]
+        self.mapping = mx.array(mapping)
+        self.q2t_mapped = mx.array(q2t_mapped)
         self.rotation_indices = mx.array(indices["global_rot_data"].astype(np.int32))
         self.root_indices = mx.array(indices["global_root_pos"].astype(np.int32))
         self.contact_indices = mx.array(indices["foot_contacts"].astype(np.int32))
         self.parent_indices = mx.array(np.asarray(self.model_parents[1:], dtype=np.int32))
         self.identity = mx.eye(3)
         self.num_joints = len(self.model_parents)
-        # Packed constants for the custom Metal kernels (layout documented in kernels.HEADER).
-        q2t_mapped = np.asarray(arrays["rot_offsets_q2t"], np.float32)[np.asarray(arrays["mujoco_indices_to_motion_indices"])]
-        self.rf = mx.array(np.concatenate([np.asarray(arrays[k], np.float32).ravel() for k in (
+        # Packed constants for the custom Metal kernels, in the order of kernels.G1_RF_LAYOUT /
+        # G1_RI_LAYOUT (the F_* / I_* offsets in rig_kernels.metal).
+        floats = [np.asarray(arrays[k], np.float32).ravel() for k in (
             "mujoco_to_motion_matrix", "mujoco_joint_axis_values_mujoco_space")] + [q2t_mapped.ravel()] + [
             np.asarray(arrays[k], np.float32).ravel() for k in (
-                "capture_neutral_joints_mujoco", "neutral_joints", "rot_offsets_f2q", "mujoco_joint_axis_values_motion_space")]))
-        self.ri = mx.array(np.concatenate([np.asarray(arrays[k]).astype(np.int32).ravel() for k in (
+                "capture_neutral_joints_mujoco", "neutral_joints", "rot_offsets_f2q", "mujoco_joint_axis_values_motion_space")]
+        ints = [np.asarray(arrays[k]).astype(np.int32).ravel() for k in (
             "mujoco_joint_including_root_parent_list", "joint_parents", "motion_indices_to_mujoco_indices",
-            "mujoco_indices_to_motion_indices")]))
+            "mujoco_indices_to_motion_indices")]
+        _check_g1_layout(floats, ints, indices)
+        self.rf = mx.array(np.concatenate(floats))
+        self.ri = mx.array(np.concatenate(ints))
 
     def fk(self, qpos):
         """``qpos (..., 36)`` with a WXYZ root quaternion -> joint positions ``(..., 34, 3)``

@@ -3,14 +3,13 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 import subprocess
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-NATIVE = ROOT / "sandbox" / "native" / "toolchains"
-
+from .paths import CHECKPOINTS, NATIVE, UPSTREAM
 
 XCODE = Path("/Applications/Xcode.app/Contents/Developer")
 
@@ -35,7 +34,7 @@ def report() -> list[tuple[str, str, str]]:
         info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
         rows.append(("mlx (metal)", "ok", f"mlx {mx.__version__}, {info.get('device_name', '?')}, "
                      f"max buffer {info.get('max_buffer_length', 0) / 2**30:.0f} GB"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         rows.append(("mlx (metal)", "missing", str(exc)))
 
     try:
@@ -43,14 +42,14 @@ def report() -> list[tuple[str, str, str]]:
 
         mps = torch.backends.mps.is_available()
         rows.append(("torch.cuda -> mps", "ok" if mps else "cpu-only", f"torch {torch.__version__}, mps={mps}"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         rows.append(("torch.cuda -> mps", "missing", str(exc)))
 
     try:
         import onnxruntime as ort
 
         rows.append(("tensorrt -> onnxruntime", "ok", f"ort {ort.__version__}: {', '.join(ort.get_available_providers())}"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         rows.append(("tensorrt -> onnxruntime", "missing", str(exc)))
 
     try:
@@ -58,27 +57,31 @@ def report() -> list[tuple[str, str, str]]:
 
         w = device_report()
         rows.append(("warp kernels -> cpu", "ok", f"warp {w['warp']}, devices {w['devices']}, cuda={w['cuda_available']}"))
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         rows.append(("warp kernels -> cpu", "missing", str(exc)))
 
     # Like the CuMetal installer and tests: aim xcrun at Xcode per process when xcode-select points
     # at the Command Line Tools, which have no Metal compiler.
     metal = _run(["xcrun", "-sdk", "macosx", "-f", "metal"])
     if not metal and XCODE.is_dir():
-        import os
-
         metal = _run(["xcrun", "-sdk", "macosx", "-f", "metal"], env={**os.environ, "DEVELOPER_DIR": str(XCODE)})
         metal = metal and f"{metal} (DEVELOPER_DIR={XCODE})"
     rows.append(("xcode metal compiler", "ok" if metal else "missing", metal or "install Xcode + `xcodebuild -downloadComponent MetalToolchain`"))
-    cumetal = shutil.which("cumetal") or next(iter(NATIVE.glob("cumetal*/bin/cumetal")), None)
+    cumetal = shutil.which("cumetal") or next(iter((NATIVE / "toolchains").glob("cumetal*/bin/cumetal")), None)
     rows.append(("cuda c++ -> metal (cumetal)", "ok" if cumetal else "not installed",
                  str(cumetal) if cumetal else "optional: sandbox/native/install_cumetal.sh"))
 
-    upstream = ROOT / "sandbox" / "upstream"
-    rows.append(("upstream reference", "ok" if (upstream / "tools/onnx/models").is_dir() else "missing", str(upstream)))
-    ckpt = ROOT / "checkpoints" / "MotionBricks"
-    found = sorted(p.parent.parent.parent.name for p in ckpt.rglob("*.safetensors")) if ckpt.is_dir() else []
-    rows.append(("checkpoints", "ok" if len(found) >= 6 else "incomplete", f"{len(found)}/6 safetensors in {ckpt}"))
+    rows.append(("upstream reference", "ok" if (UPSTREAM / "tools/onnx/models").is_dir() else "missing", str(UPSTREAM)))
+    try:
+        from motionbricks_mlx import hub
+
+        # Size check only (cheap); `motionbricks-mlx download --dir ...` verifies SHA-256 too.
+        entries = hub.manifest()
+        found = sum((CHECKPOINTS / e.path).is_file() and (CHECKPOINTS / e.path).stat().st_size == e.size for e in entries)
+        rows.append(("checkpoints", "ok" if found == len(entries) else "incomplete",
+                     f"{found}/{len(entries)} files of the right size in {CHECKPOINTS}"))
+    except Exception as exc:
+        rows.append(("checkpoints", "unknown", str(exc)))
     return rows
 
 

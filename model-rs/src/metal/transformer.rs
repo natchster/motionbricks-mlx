@@ -5,14 +5,15 @@
 //! GEMM front-end (tile planning, split-K, kernel specialization) and the post-norm transformer
 //! encoder (PyTorch `nn.TransformerEncoderLayer`, ReLU FFN) on the custom Metal runtime.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use mlx_rs::Array;
 use mlx_rs::ops::{QuantizeOptions, quantize};
 
-use super::{Arg, Buf, Gpu, Pipeline, Precision, Recorder, as_bytes};
+use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, Recorder, as_bytes};
 use crate::ops::to_vec_f32;
 
 #[repr(C)]
@@ -46,6 +47,9 @@ pub struct GemmParams {
     pub r_mod: i32,
 }
 
+// SAFETY: all fields are i32 (no padding, no pointers).
+unsafe impl Pod for GemmParams {}
+
 impl GemmParams {
     /// Plain `Y[M, N] = A[M, K] Wᵀ + b` with contiguous rows.
     pub fn new(m: usize, n: usize, k: usize) -> Self {
@@ -65,6 +69,9 @@ struct AttnParams {
     scale: f32,
 }
 
+// SAFETY: 4-byte fields only (no padding, no pointers).
+unsafe impl Pod for AttnParams {}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LnParams {
@@ -72,9 +79,21 @@ struct LnParams {
     eps: f32,
 }
 
+// SAFETY: 4-byte fields only (no padding, no pointers).
+unsafe impl Pod for LnParams {}
+
 pub const ACT_NONE: i32 = 0;
 pub const ACT_RELU: i32 = 1;
 pub const ACT_LEAKY: i32 = 2;
+
+/// Longest sequence the attention kernels handle (one simdgroup lane per key).
+pub const MAX_ATTENTION_LEN: usize = 32;
+/// Head dimensions with a simdgroup-matrix attention kernel.
+pub const MMA_HEAD_DIMS: [usize; 2] = [32, 64];
+/// Split-K partial sums buffer of [`Kernels::new`] (float32 elements).
+pub const PARTIAL_MAX: usize = 16 << 20;
+/// Threadgroup memory every Apple GPU provides (the scalar attention fallback stages Q/K/V there).
+const THREADGROUP_MEMORY: usize = 32 << 10;
 
 /// INT8 weight in MLX's affine format (bits 8, group 64): packed u32 [N][K/4], f32 scales/biases [N][K/64].
 pub struct QWeight {
@@ -118,7 +137,7 @@ pub const TILES: [Tile; 11] = [
 ];
 
 /// A GEMM launch plan: tile and number of K splits.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub tile: Tile,
     pub splits: usize,
@@ -170,36 +189,59 @@ impl PlanKey {
 pub const M4_PRO_PLANS: &str = include_str!("plans/apple_m4_pro.txt");
 
 /// The plan table for this device and precision. `MB_PLAN_TABLE` overrides the built-in choice:
-/// `0` disables tuned plans, any other value is the path of a table file written by `gemm-tune`.
+/// `0` disables tuned plans, any other non-empty value is the path of a table file written by
+/// `gemm-tune` (an empty value counts as unset).
 fn plan_table(gpu: &Gpu) -> Result<HashMap<PlanKey, Plan>> {
-    Ok(match std::env::var("MB_PLAN_TABLE") {
-        Ok(v) if v == "0" => HashMap::new(),
-        Ok(path) => parse_plans(&std::fs::read_to_string(&path).map_err(|e| anyhow!("MB_PLAN_TABLE {path}: {e}"))?, gpu.prec),
-        Err(_) if gpu.device_name() == "Apple M4 Pro" => parse_plans(M4_PRO_PLANS, gpu.prec),
-        Err(_) => HashMap::new(),
-    })
+    match std::env::var_os("MB_PLAN_TABLE") {
+        Some(v) if v == "0" => Ok(HashMap::new()),
+        Some(v) if !v.is_empty() => {
+            let path = PathBuf::from(v);
+            let text = std::fs::read_to_string(&path).with_context(|| format!("MB_PLAN_TABLE {}", path.display()))?;
+            parse_plans(&text, gpu.prec).with_context(|| format!("MB_PLAN_TABLE {}", path.display()))
+        }
+        _ if gpu.device_name() == "Apple M4 Pro" => parse_plans(M4_PRO_PLANS, gpu.prec).context("built-in plan table plans/apple_m4_pro.txt"),
+        _ => Ok(HashMap::new()),
+    }
 }
 
-/// Parse the plan-table lines of one precision.
-pub fn parse_plans(text: &str, prec: Precision) -> HashMap<PlanKey, Plan> {
+/// Parse a plan table (see `plans/`) and return the plans of one precision. Every line is
+/// checked, whatever its precision: 16 fields, integer values, 0/1 flags, a tile of [`TILES`] and
+/// at least one split; errors name the line. `#` starts a comment. A key listed twice keeps its
+/// last plan (`gemm-tune` appends to the table file).
+pub fn parse_plans(text: &str, prec: Precision) -> Result<HashMap<PlanKey, Plan>> {
     let mut out = HashMap::new();
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() != 16 || f[0] != prec.name() {
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
-        let v: Vec<i32> = f[1..].iter().filter_map(|x| x.parse().ok()).collect();
-        if v.len() != 15 {
-            continue;
-        }
-        let key = PlanKey { m: v[0], n: v[1], k: v[2], taps: v[3], up: v[4], concat: v[5] != 0, mask: v[6] != 0, arelu: v[7] != 0, q8: v[8] != 0 };
-        let t = tile(v[9] as usize, v[10] as usize, v[11] as usize, v[12] as usize, v[13] as usize);
-        if TILES.contains(&t) {
-            out.entry(key).or_insert(Plan { tile: t, splits: v[14] as usize });
+        let parsed = (|| -> Result<Option<(PlanKey, Plan)>> {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            ensure!(f.len() == 16, "expected 16 fields (precision, m n k taps up concat mask arelu q8, bm bn bk wm wn splits), got {}", f.len());
+            ensure!(
+                [Precision::F32, Precision::F16, Precision::BF16].iter().any(|p| p.name() == f[0]),
+                "unknown precision {:?} (float32, float16 or bfloat16; INT8 rows are float32 with q8 = 1)",
+                f[0]
+            );
+            let v = f[1..].iter().map(|x| x.parse::<i32>().map_err(|_| anyhow!("{x:?} is not an integer"))).collect::<Result<Vec<i32>>>()?;
+            ensure!(v[0] > 0 && v[1] > 0 && v[2] > 0, "m, n and k must be positive");
+            ensure!(v[5..9].iter().all(|&b| b == 0 || b == 1), "concat, mask, arelu and q8 must be 0 or 1");
+            ensure!(v[9..14].iter().all(|&x| x > 0), "tile sizes must be positive");
+            let t = tile(v[9] as usize, v[10] as usize, v[11] as usize, v[12] as usize, v[13] as usize);
+            ensure!(TILES.contains(&t), "tile {}x{}x{} {}x{} is not one of the compiled tiles", t.bm, t.bn, t.bk, t.wm, t.wn);
+            ensure!(v[14] >= 1, "splits must be at least 1, got {}", v[14]);
+            if f[0] != prec.name() {
+                return Ok(None);
+            }
+            let key = PlanKey { m: v[0], n: v[1], k: v[2], taps: v[3], up: v[4], concat: v[5] != 0, mask: v[6] != 0, arelu: v[7] != 0, q8: v[8] != 0 };
+            Ok(Some((key, Plan { tile: t, splits: v[14] as usize })))
+        })()
+        .with_context(|| format!("plan table line {}: {raw:?}", i + 1))?;
+        if let Some((key, plan)) = parsed {
+            out.insert(key, plan);
         }
     }
-    out
+    Ok(out)
 }
 
 /// One GEMM launch: operands, parameters and optional side inputs.
@@ -236,7 +278,8 @@ struct Flags {
     vec: bool,
 }
 
-/// Kernels used by the runtime; GEMM pipelines are specialized lazily per (tile, flags).
+/// Kernels used by the runtime; GEMM pipelines are specialized lazily per (tile, flags)
+/// (`MetalModel` compiles every variant it can use at load time).
 pub struct Kernels {
     gpu: Gpu,
     pub reduce: Pipeline,
@@ -248,7 +291,7 @@ pub struct Kernels {
     pub add_ln: Pipeline,
     pub dummy: Buf,
     pub dummy_t: Buf,
-    /// Split-K partial sums.
+    /// Split-K partial sums. Its length caps splits * M * N (larger plans use fewer splits).
     pub partial: Buf,
     /// Override for sweeps: always use this plan.
     pub force: Option<Plan>,
@@ -257,10 +300,18 @@ pub struct Kernels {
     /// When set, every GEMM launch appends (params with plan, INT8) here; for profiling tools.
     pub log: RefCell<Option<Vec<(GemmParams, bool)>>>,
     gemm: RefCell<HashMap<(Tile, Flags), Pipeline>>,
+    /// While warming up, GEMM pipeline errors are collected here instead of panicking.
+    warming: Cell<bool>,
+    warm_error: RefCell<Option<anyhow::Error>>,
 }
 
 impl Kernels {
     pub fn new(gpu: &Gpu) -> Result<Self> {
+        Self::with_partial_len(gpu, PARTIAL_MAX)
+    }
+
+    /// Like [`Kernels::new`] with a split-K partial buffer of `len` float32 elements.
+    pub fn with_partial_len(gpu: &Gpu, len: usize) -> Result<Self> {
         Ok(Kernels {
             reduce: gpu.pipeline("gemm_splitk_reduce")?,
             attention: gpu.pipeline("attention")?,
@@ -272,13 +323,25 @@ impl Kernels {
             add_ln: gpu.pipeline("add_layernorm")?,
             dummy: gpu.buffer(4),
             dummy_t: gpu.buffer_t(4),
-            partial: gpu.buffer(16 << 20),
+            partial: gpu.buffer(len),
             force: None,
             table: plan_table(gpu)?,
             log: RefCell::new(None),
             gemm: RefCell::new(HashMap::new()),
+            warming: Cell::new(false),
+            warm_error: RefCell::new(None),
             gpu: gpu.clone(),
         })
+    }
+
+    /// Number of GEMM pipeline variants compiled so far.
+    pub fn gemm_variants(&self) -> usize {
+        self.gemm.borrow().len()
+    }
+
+    /// Replace the split-K partial buffer by one of `len` float32 elements.
+    pub fn set_partial_len(&mut self, len: usize) {
+        self.partial = self.gpu.buffer(len);
     }
 
     fn pipeline(&self, t: Tile, f: Flags) -> Pipeline {
@@ -287,9 +350,33 @@ impl Kernels {
         }
         let name = format!("gemm_mma_{}_{}_{}_{}_{}", t.bm, t.bn, t.bk, t.wm, t.wn);
         let consts = [(0, f.plain), (1, f.conv), (2, f.concat), (3, f.amask), (4, f.arelu), (5, f.up), (6, f.q8), (7, f.vec)];
-        let p = self.gpu.specialized(&name, &consts).expect("gemm pipeline");
-        self.gemm.borrow_mut().insert((t, f), p.clone());
-        p
+        match self.gpu.specialized(&name, &consts) {
+            Ok(p) => {
+                self.gemm.borrow_mut().insert((t, f), p.clone());
+                p
+            }
+            Err(e) if self.warming.get() => {
+                // The warm-up recording is discarded, never run: any pipeline stands in.
+                self.warm_error.borrow_mut().get_or_insert(e.context(format!("{f:?}")));
+                self.reduce.clone()
+            }
+            Err(e) => panic!("{:#}", e.context(format!("{f:?}"))),
+        }
+    }
+
+    /// Start collecting GEMM pipeline errors instead of panicking (recordings made until
+    /// [`Kernels::end_warm_up`] must be discarded, not committed).
+    pub(crate) fn begin_warm_up(&self) {
+        self.warming.set(true);
+    }
+
+    /// Stop collecting; the first GEMM pipeline error since [`Kernels::begin_warm_up`], if any.
+    pub(crate) fn end_warm_up(&self) -> Result<()> {
+        self.warming.set(false);
+        match self.warm_error.borrow_mut().take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Fallback plan (launches missing from the tuned table): the first preferred tile, among
@@ -316,11 +403,6 @@ impl Kernels {
         Plan { tile, splits }
     }
 
-    /// The plan for a dense GEMM of this shape (forced, else the heuristic).
-    pub fn plan(&self, m: usize, n: usize, k: usize) -> Plan {
-        self.force.unwrap_or_else(|| self.heuristic(m, n, k, false))
-    }
-
     /// The plan for a launch: forced, else tuned, else the heuristic.
     pub fn plan_for(&self, p: &GemmParams, q8: bool) -> Plan {
         if let Some(f) = self.force {
@@ -330,13 +412,17 @@ impl Kernels {
         self.table.get(&PlanKey::of(p, q8)).copied().unwrap_or_else(|| self.heuristic(m, n, k, q8))
     }
 
-    /// `Y = epilogue(A Wᵀ + b)` with the planned kernel (plus a reduce dispatch when split over K).
-    pub fn run(&self, rec: &mut Recorder, g: &GemmCall) {
-        let mut p = g.p;
+    /// Largest number of K splits a plan of this `Kernels` can ask for (heuristic: 8).
+    pub fn max_splits(&self) -> usize {
+        self.table.values().map(|p| p.splits).chain(self.force.map(|p| p.splits)).fold(8, usize::max)
+    }
+
+    /// The launch of `p`: parameters with the K split filled in, tile and loader flags.
+    fn resolve(&self, p: &GemmParams, q8: bool) -> (GemmParams, Tile, Flags) {
+        let mut p = *p;
         let (m, n, k) = (p.m as usize, p.n as usize, p.k as usize);
-        let q8 = matches!(g.w, Weight::Q8(_));
         let mut plan = self.plan_for(&p, q8);
-        while plan.splits > 1 && (plan.splits * m * n > self.partial.len || k / plan.splits < plan.tile.bk) {
+        while plan.splits > 1 && (plan.splits * m * n > self.partial.len() || k / plan.splits < plan.tile.bk) {
             plan.splits /= 2;
         }
         let t = plan.tile;
@@ -348,6 +434,8 @@ impl Kernels {
         let concat = p.k1 > 0;
         let m4 = |v: i32| v % 4 == 0;
         let vec = m4(p.k) && m4(p.lda) && (!conv || m4(p.conv_cin)) && (!concat || (m4(p.k1) && m4(p.k2) && m4(p.lda2) && m4(p.lda3)));
+        // The scalar loader (neither plain nor vector) has no INT8 path.
+        assert!(!q8 || vec, "INT8 weights need K, lda and the conv/concat extents to be multiples of 4: {p:?}");
         let flags = Flags {
             plain: vec
                 && m % t.bm == 0
@@ -363,6 +451,14 @@ impl Kernels {
             q8,
             vec,
         };
+        (p, t, flags)
+    }
+
+    /// `Y = epilogue(A Wᵀ + b)` with the planned kernel (plus a reduce dispatch when split over K).
+    pub fn run(&self, rec: &mut Recorder, g: &GemmCall) {
+        let q8 = matches!(g.w, Weight::Q8(_));
+        let (p, t, flags) = self.resolve(&g.p, q8);
+        let (m, n, splits) = (p.m as usize, p.n as usize, p.splits as usize);
         let pso = self.pipeline(t, flags);
         if let Some(log) = self.log.borrow_mut().as_mut() {
             log.push((p, q8));
@@ -419,6 +515,11 @@ impl Kernels {
         rec.dispatch(&self.add_ln, &args, (rows, 1, 1), (256, 1, 1));
     }
 
+    /// Whether [`Kernels::attention`] supports `l` tokens of head dimension `hd`.
+    pub fn attention_supported(l: usize, hd: usize) -> bool {
+        l <= MAX_ATTENTION_LEN && (MMA_HEAD_DIMS.contains(&hd) || 3 * l * (hd + 1) * 4 <= THREADGROUP_MEMORY)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn attention(&self, rec: &mut Recorder, qkv: &Buf, pad: Option<&Buf>, out: &Buf, b: usize, l: usize, d: usize, h: usize) {
         let hd = d / h;
@@ -433,11 +534,15 @@ impl Kernels {
         };
         let args = [Arg::Buf(qkv, 0), Arg::Buf(pad.unwrap_or(&self.dummy), 0), Arg::Buf(out, 0), Arg::Bytes(as_bytes(&p))];
         let lp = if l <= 16 { 16 } else { 32 };
-        if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= 32 && !self.scalar_attention) {
+        if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= MAX_ATTENTION_LEN && !self.scalar_attention) {
             rec.dispatch(pso, &args, (b * h, 1, 1), (lp * 4, 1, 1));
             return;
         }
-        rec.threadgroup_memory(3 * l * (hd + 1) * 4, 0);
+        // Scalar fallback (not used by the model: its head dims have MMA kernels).
+        assert!(l <= MAX_ATTENTION_LEN && h > 0 && d % h == 0, "attention: {l} tokens, d {d}, {h} heads unsupported (<= {MAX_ATTENTION_LEN} tokens)");
+        let smem = 3 * l * (hd + 1) * 4;
+        assert!(smem <= THREADGROUP_MEMORY, "scalar attention: {l} tokens of head dim {hd} need {smem} bytes of threadgroup memory");
+        rec.threadgroup_memory(smem, 0);
         rec.dispatch(&self.attention, &args, (b * h, 1, 1), (l * 32, 1, 1));
     }
 }
@@ -506,11 +611,21 @@ impl Scratch {
             ff: gpu.buffer_t(rows * ffn),
         }
     }
+
+    /// Whether these buffers hold `rows` tokens of a transformer of width `d` and FFN width `ffn`.
+    pub fn fits(&self, rows: usize, d: usize, ffn: usize) -> bool {
+        self.x2.len() >= rows * d && self.qkv.len() >= rows * 3 * d && self.attn.len() >= rows * d && self.proj.len() >= rows * d && self.ff.len() >= rows * ffn
+    }
 }
 
 impl Transformer {
     /// `int8`: quantize the four projections of every layer (as the Python port's `quantize(8)`).
     pub fn load(gpu: &Gpu, tensors: &HashMap<String, Array>, prefix: &str, n_layers: usize, heads: usize, int8: bool) -> Result<Self> {
+        let d = tensor(tensors, &format!("{prefix}.layers.0.norm1.weight"))?.dim(0) as usize;
+        let ffn = tensor(tensors, &format!("{prefix}.layers.0.linear1.bias"))?.dim(0) as usize;
+        if heads == 0 || d % heads != 0 {
+            bail!("{prefix}: width {d} is not divisible into {heads} heads");
+        }
         let mut layers = Vec::new();
         for i in 0..n_layers {
             let p = |n: &str| format!("{prefix}.layers.{i}.{n}");
@@ -531,42 +646,21 @@ impl Transformer {
                 n2_b: u("norm2.bias")?,
             });
         }
-        let d = tensors[&format!("{prefix}.layers.0.norm1.weight")].dim(0) as usize;
-        let ffn = tensors[&format!("{prefix}.layers.0.linear1.bias")].dim(0) as usize;
         Ok(Transformer { layers, d, heads, ffn })
     }
 
     /// In place on `x` (batch * len rows of d). `pad`: (batch, len) float, 1 = padded key.
     #[allow(clippy::too_many_arguments)]
     pub fn encode(&self, k: &Kernels, rec: &mut Recorder, x: &Buf, pad: Option<&Buf>, batch: usize, len: usize, s: &Scratch) {
-        self.encode_parts(k, rec, x, pad, batch, len, s, 7);
-    }
-
-    /// `parts`: bitmask of kernel families to encode (1 GEMMs, 2 attention, 4 layer norms); for profiling.
-    #[allow(clippy::too_many_arguments)]
-    pub fn encode_parts(&self, k: &Kernels, rec: &mut Recorder, x: &Buf, pad: Option<&Buf>, batch: usize, len: usize, s: &Scratch, parts: u32) {
         let (rows, d, f) = (batch * len, self.d, self.ffn);
-        let (g, a, n) = (parts & 1 != 0, parts & 2 != 0, parts & 4 != 0);
         for l in &self.layers {
-            if g {
-                k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE);
-            }
-            if a {
-                k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads);
-            }
-            if g {
-                k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
-            }
-            if n {
-                k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
-            }
-            if g {
-                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
-                k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
-            }
-            if n {
-                k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
-            }
+            k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE);
+            k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads);
+            k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
+            k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
+            k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
+            k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
+            k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
         }
     }
 }

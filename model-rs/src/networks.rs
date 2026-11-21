@@ -145,7 +145,6 @@ impl RootNetwork {
 
 pub struct PoseNetwork {
     spec: PoseSpec,
-    heads: i32,
     pub mask_id: i32,
     num_with_mask: i32,
     pub transformer: TransformerEncoder,
@@ -164,7 +163,6 @@ impl PoseNetwork {
         let p = "pose";
         Ok(PoseNetwork {
             spec: *spec,
-            heads: vq.num_heads,
             mask_id: vq.codes_per_head,
             num_with_mask: vq.codes_per_head + 1,
             transformer: TransformerEncoder::load(w, &format!("{p}.transformer_model"), spec.n_layers, spec.n_head)?,
@@ -198,7 +196,6 @@ impl PoseNetwork {
         let x = ops::add(&x, self.position_emb.table(positions)?)?;
         let padding = unsq(&arange(positions)?, 0)?.ge(unsq(num_tokens, 1)?)?;
         let out = self.transformer.forward(&x, Some(&padding))?;
-        let _ = self.heads;
         self.proj_pose_output_logit.forward(&out)?.reshape(&[batch, positions, heads, -1])
     }
 }

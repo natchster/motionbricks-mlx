@@ -4,19 +4,23 @@
 Warp compiles the same ``@wp.kernel`` Python source to LLVM for the CPU when no CUDA
 device exists, so kernels need no translation. What differs on macOS is the *runtime*
 around them: there are no streams, CUDA graphs, memory pools or ``cuda:0`` device.
-:func:`cuda_device_alias` lets code that hard-codes ``wp.set_device("cuda:0")`` /
-``device="cuda"`` run unchanged by aliasing those names to ``cpu``.
+:func:`cuda_device_alias` lets code that selects the device through ``wp.set_device("cuda:0")``
+/ ``wp.get_device("cuda")`` (and so ``wp.ScopedDevice("cuda")`` and allocations on the default
+device) run unchanged by aliasing those names to ``cpu``. An explicit ``device="cuda"`` argument
+to an allocation or launch (``wp.zeros(..., device="cuda")``) is *not* aliased: Warp resolves it
+internally and raises, so such code needs ``device="cpu"``.
 """
 
 from __future__ import annotations
 
 import contextlib
 import sys
-from pathlib import Path
 
 import warp as wp
 
-UPSTREAM = Path(__file__).resolve().parents[1] / "upstream"
+from .paths import UPSTREAM
+
+__all__ = ["UPSTREAM", "cuda_device_alias", "device_report", "upstream_on_path"]
 
 
 @contextlib.contextmanager
@@ -32,7 +36,9 @@ def upstream_on_path():
 
 @contextlib.contextmanager
 def cuda_device_alias():
-    """Within the block, ``wp.get_device("cuda[:0]")`` / ``wp.set_device("cuda:0")`` mean the CPU."""
+    """Within the block, ``wp.get_device("cuda[:0]")`` / ``wp.set_device("cuda:0")`` mean the CPU.
+
+    Explicit ``device="cuda"`` arguments to allocations and launches still raise (see module doc)."""
     wp.init()
     original_get = wp.get_device
     original_set = wp.set_device

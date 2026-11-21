@@ -20,7 +20,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx.utils import tree_flatten
 
 from .config import ModelSpec
 
@@ -43,7 +43,8 @@ def read_checkpoints(checkpoint_dir: str | Path, spec: ModelSpec) -> tuple[dict[
     for kind, rel in spec.checkpoint_files.items():
         path = root / rel
         if not path.is_file():
-            raise FileNotFoundError(f"Missing checkpoint {path}. Run sandbox/setup.sh or `hf download nvidia/MotionBricks`.")
+            raise FileNotFoundError(f"Missing checkpoint {path}. Run `motionbricks-mlx download` (pinned revision, "
+                                    "SHA-256 verified) or model-rs/scripts/download_weights.sh.")
         prefix = spec.state_prefixes[kind]
         target = {"pose": "pose.", "root": "root.", "vqvae": "vqvae."}[kind]
         for name, value in mx.load(str(path)).items():
@@ -96,4 +97,8 @@ def read_converted(path: str | Path) -> tuple[str, dict[str, mx.array], np.ndarr
 
 
 def assign(core, params: dict[str, mx.array]) -> None:
-    core.update(tree_unflatten(list(params.items())))
+    """Load ``params`` into ``core`` strictly: no missing, unexpected or misshaped tensors."""
+    try:
+        core.load_weights(list(params.items()), strict=True)
+    except ValueError as error:
+        raise ValueError(f"The weights do not match the {type(core).__name__}: {error}") from None

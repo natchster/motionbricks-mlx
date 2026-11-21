@@ -68,10 +68,7 @@ def test_vqvae_decoder(model_name, case):
     assert rel_err(recon, g["vq_out.recon_state"]) < 1e-4
 
 
-@pytest.mark.parametrize("case", CASES)
-def test_end_to_end(model_name, case):
-    g, model = load_golden(model_name, case), load_model(model_name)
-    out = model.run(golden_inputs(g))
+def check_end_to_end(model_name, model, g, out):
     assert np.array_equal(out["pred_num_tokens"], g["pred_num_tokens"])
     for i, count in enumerate(g["pred_num_tokens"]):
         valid = slice(0, 4 * int(count))
@@ -87,3 +84,17 @@ def test_end_to_end(model_name, case):
             assert np.abs(got[:, root] - want[:, root]).max() < 1e-4
             assert np.abs(got[:, other] - want[:, other]).max() < 1e-3
             assert np.abs(got[:, rot] - want[:, rot]).max() < 3e-3
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_end_to_end(model_name, case):
+    g, model = load_golden(model_name, case), load_model(model_name)
+    check_end_to_end(model_name, model, g, model.run(golden_inputs(g)))
+
+
+def test_end_to_end_on_the_cpu_stream(model_name):
+    """The CPU stream takes the op-based rig instead of the Metal kernels (eager: no compile wait)."""
+    g, model = load_golden(model_name, "trace"), load_model(model_name)
+    with mx.stream(mx.cpu):
+        out = model.run(golden_inputs(g), compiled=False)
+    check_end_to_end(model_name, model, g, out)

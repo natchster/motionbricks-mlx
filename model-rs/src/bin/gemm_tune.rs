@@ -4,25 +4,77 @@
 // Modifications Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
 //! Replay every distinct GEMM launch of the model (real shapes and loader/epilogue flags, synthetic
 //! data) under every tile/split plan, and compare the best plan with the runtime's heuristic.
-//! Usage: gemm-tune <soma|unitree_g1> <float32|float16|bfloat16|int8> [batches...]
+//!
+//!     gemm-tune [--list] <soma|unitree_g1> <float32|float16|bfloat16|int8> [batches...]
+//!
+//! `--list` only lists the GEMM launches of one generation (shape, conv/concat, plan) with
+//! their counts and GFLOP, without timing them. Checkpoints: `$MOTIONBRICKS_CHECKPOINTS` or
+//! `checkpoints/MotionBricks`.
+
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use common::Argv;
+use motionbricks_rs::config::{Precision, checkpoint_dir, get_spec};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::transformer::{GemmCall, GemmParams, Plan, PlanKey, QWeight, TILES, Weight};
 use motionbricks_rs::metal::{Recorder, wait};
 use motionbricks_rs::npy::load_npz;
 
+/// The GEMM launches of one generation of `batch` requests, as the runtime logged them.
+fn launches(m: &MetalModel, batch: usize) -> Result<Vec<(GemmParams, bool)>> {
+    *m.k.log.borrow_mut() = Some(Vec::new());
+    let mut rec = Recorder::new(&m.gpu);
+    m.encode(&mut rec, &m.dims(batch, false));
+    wait(&rec.commit());
+    m.k.log.borrow_mut().take().context("GEMM log was not recorded")
+}
+
+/// `--list`: distinct launches with counts and GFLOP, largest first.
+fn list(log: &[(GemmParams, bool)]) {
+    let mut counts: BTreeMap<String, (usize, f64)> = BTreeMap::new();
+    for (p, q8) in log {
+        let key = format!(
+            "M={:<5} N={:<5} K={:<5} taps={} up={} concat={} mask={} arelu={} act={} q8={} splits={}",
+            p.m, p.n, p.k, p.conv_taps, p.conv_up, p.k1 > 0, p.has_mask, p.a_relu, p.act, q8, p.splits
+        );
+        let e = counts.entry(key).or_default();
+        e.0 += 1;
+        e.1 += 2.0 * p.m as f64 * p.n as f64 * p.k as f64 / 1e9;
+    }
+    let mut v: Vec<_> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+    for (k, (c, gf)) in v {
+        println!("{c:>3}x  {gf:7.2} GFLOP  {k}");
+    }
+}
+
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let name = args.get(1).cloned().unwrap_or("soma".into());
-    let prec = args.get(2).cloned().unwrap_or("float32".into());
-    let batches: Vec<usize> = args.iter().skip(3).map(|v| v.parse().unwrap()).collect();
+    let mut argv = Argv::from_env();
+    let mut positional = Vec::new();
+    let mut list_only = false;
+    while let Some(a) = argv.next() {
+        if a == "--list" { list_only = true } else { positional.push(a) }
+    }
+    let mut positional = positional.into_iter();
+    let name = get_spec(&positional.next().unwrap_or("soma".into()))?.name;
+    let prec = positional.next().unwrap_or("float32".into()).parse::<Precision>()?.name();
+    let batches = positional.map(|v| common::parse(&v, "batch size")).collect::<Result<Vec<usize>>>()?;
     let batches = if batches.is_empty() { vec![1, 2, 4, 8, 16, 32] } else { batches };
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let folder = if name == "soma" { "soma" } else { "g1" };
-    let mut m = MetalModel::from_checkpoints_with(&name, here.join("../checkpoints/MotionBricks").join(folder), 64, &prec)?;
+    let mut m = MetalModel::from_checkpoints_with(name, checkpoint_dir(name), 64, prec)?;
+    if list_only {
+        for &batch in &batches {
+            let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
+            m.run(&req)?;
+            println!("{name} {prec} N={batch}: GEMM launches of one generation");
+            list(&launches(&m, batch)?);
+        }
+        return Ok(());
+    }
     let gpu = m.gpu.clone();
     // TUNE_JSON=path: also write every (shape, plan, time) measurement, for fitting the heuristic offline.
     let mut dump = Vec::new();
@@ -31,11 +83,7 @@ fn main() -> Result<()> {
     for batch in batches {
         let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
         m.run(&req)?;
-        *m.k.log.borrow_mut() = Some(Vec::new());
-        let mut rec = Recorder::new(&gpu);
-        m.encode(&mut rec, &m.dims(batch, false));
-        wait(&rec.commit());
-        let log = m.k.log.borrow_mut().take().unwrap();
+        let log = launches(&m, batch)?;
         // Distinct launches (plan fields cleared) with their counts.
         let mut uniq: BTreeMap<String, (GemmParams, bool, usize)> = BTreeMap::new();
         for (mut p, q8) in log {
@@ -92,7 +140,7 @@ fn main() -> Result<()> {
             let mut all: Vec<(f64, Plan)> = Vec::new();
             for t in TILES {
                 for splits in [1, 2, 4, 8] {
-                    if (splits > 1 && k / splits < t.bk * 2) || (splits > 1 && splits * mm * n > m.k.partial.len) {
+                    if (splits > 1 && k / splits < t.bk * 2) || (splits > 1 && splits * mm * n > m.k.partial.len()) {
                         continue;
                     }
                     let plan = Plan { tile: t, splits };
@@ -100,15 +148,15 @@ fn main() -> Result<()> {
                 }
             }
             // Re-time the four fastest twice more; keep each plan's minimum.
-            all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            all.sort_by(|a, b| a.0.total_cmp(&b.0));
             for c in all.iter_mut().take(4) {
                 for _ in 0..2 {
                     c.0 = c.0.min(time(&mut m, Some(c.1)));
                 }
             }
-            all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            all.sort_by(|a, b| a.0.total_cmp(&b.0));
             m.k.force = None;
-            let best = all[0];
+            let best = *all.first().context("no GEMM plan applies to this launch")?;
             dump.push(format!(
                 "{{\"batch\":{batch},\"count\":{count},\"m\":{mm},\"n\":{n},\"k\":{k},\"conv\":{},\"up\":{},\"concat\":{},\"q8\":{q8},\"plans\":[{}]}}",
                 p.conv_taps,
@@ -132,7 +180,7 @@ fn main() -> Result<()> {
             "{name} {prec} N={batch}: GEMM total current {:.2} ms, heuristic {:.2} ms, best plans {:.2} ms",
             tot_c / 1e3, tot_h / 1e3, tot_b / 1e3
         );
-        rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (_, r) in rows.iter().take(if std::env::var_os("TUNE_ALL").is_some() { usize::MAX } else { 12 }) {
             println!("{r}");
         }

@@ -3,15 +3,15 @@ Apple GPU through the shim and agrees with the CPU golden fixtures."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
 
 import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
 from cudashim import reference, torch_cuda  # noqa: E402
+from cudashim.paths import GOLDEN  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[2]
 pytestmark = [
     pytest.mark.reference,
     pytest.mark.skipif(not reference.available(), reason="run sandbox/setup.sh"),
@@ -21,9 +21,12 @@ pytestmark = [
 
 @pytest.mark.parametrize("name", ["unitree_g1", "soma"])
 def test_upstream_model_on_cuda_alias(name):
-    golden_path = ROOT / f"sandbox/golden/{name}/random.npz"
+    golden_path = GOLDEN / name / "random.npz"
     if not golden_path.is_file() or not any(reference.checkpoint_dir(name).rglob("*.safetensors")):
         pytest.skip("needs checkpoints + golden fixtures")
+    meta = golden_path.with_name("meta.json")
+    if meta.is_file():  # fixtures from before meta.json existed were all made on the CPU
+        assert json.loads(meta.read_text())["device"] == "cpu", "MPS vs MPS would prove nothing"
     golden = dict(np.load(golden_path))
     request = {k[3:]: v for k, v in golden.items() if k.startswith("in.")}
     with torch_cuda.enabled():

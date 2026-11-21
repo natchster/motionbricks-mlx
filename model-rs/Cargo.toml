@@ -2,8 +2,9 @@
 name = "motionbricks-rs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
-description = "Rust port of motionbricks_mlx (NVIDIA MotionBricks on MLX) using mlx-rs"
+description = "NVIDIA MotionBricks in Rust: an op-for-op mlx-rs port of motionbricks_mlx, a model-specific Metal runtime, and the Runtime API"
 publish = false
 
 [dependencies]
@@ -19,6 +20,10 @@ objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
 
+[features]
+# Development binaries (metal-stages, metal-precision): `cargo run --release --features dev-tools --bin ...`.
+dev-tools = []
+
 [profile.release]
 debug = 1
 
@@ -27,29 +32,15 @@ name = "mbrs-bench"
 path = "src/bin/bench.rs"
 
 [[bin]]
-name = "proto-transformer"
-path = "src/bin/proto_transformer.rs"
-
-[[bin]]
-name = "gemm-sweep"
-path = "src/bin/gemm_sweep.rs"
-
-[[bin]]
-name = "metal-debug"
-path = "src/bin/metal_debug.rs"
+name = "gemm-tune"
+path = "src/bin/gemm_tune.rs"
 
 [[bin]]
 name = "metal-stages"
 path = "src/bin/metal_stages.rs"
+required-features = ["dev-tools"]
 
 [[bin]]
 name = "metal-precision"
 path = "src/bin/metal_precision.rs"
-
-[[bin]]
-name = "gemm-shapes"
-path = "src/bin/gemm_shapes.rs"
-
-[[bin]]
-name = "gemm-tune"
-path = "src/bin/gemm_tune.rs"
+required-features = ["dev-tools"]

@@ -36,9 +36,9 @@ The models don't need the sandbox. Each path downloads the weights (about 1.6 GB
 
 The model test suites also run on the first two paths. Without the sandbox, the parity tests
 against NVIDIA's code have no fixtures and are skipped:
-- **Python:** 36 of the 109 model tests run with the checkpoints, and 16 run without them.
-- **Rust:** tests without their inputs print `SKIPPED` and pass, because Rust's test harness has
-  no skip state.
+- **Python:** 95 of the 181 model tests run with the checkpoints, and 69 run without them.
+- **Rust:** tests without their inputs print `SKIPPED` (on stderr) and pass, because Rust's test
+  harness has no skip state. `MOTIONBRICKS_REQUIRE_FIXTURES=1` makes them fail instead.
 
 ### Sample clips
 
@@ -76,13 +76,16 @@ the sandbox tests that this table equals upstream's `tools/onnx/checksums.py`.
 uv sync --package motionbricks-mlx                      # only mlx + numpy (or: pip install ./model)
 uv run --package motionbricks-mlx motionbricks-mlx download             # both models; --model soma|unitree_g1, --clips
 uv run --package motionbricks-mlx motionbricks-mlx generate --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 4
-uv run --package motionbricks-mlx --extra test pytest model/tests       # 109 tests; 36 run without the sandbox
+uv run --package motionbricks-mlx --extra test pytest model/tests       # 181 tests; 95 run without the sandbox
 ```
 
 How `download` works:
 - **Source:** the checkpoints come over plain HTTPS from the revision this port was tested with.
 - **Verification:** it checks each file's size and SHA-256 against upstream's own checksum table
   (`model/motionbricks_mlx/assets/checkpoints.sha256`) and skips files that are already verified.
+- **Interruptions:** each file streams into a `.part` file and is renamed only once its size and
+  SHA-256 match, so a partial file never looks complete. A stalled connection fails after 60 s, and
+  errors name the file. Rerun to retry; `download_weights.sh` also resumes from its `.part` file.
 - **Environment:** `--package motionbricks-mlx` keeps the sandbox's PyTorch, ONNX Runtime and Warp
   out of the environment. If you already ran `sandbox/setup.sh` ([section 7](#7-the-development-sandbox-sandbox)),
   the weights and the full environment are in place, and `uv run motionbricks-mlx ...` works too.
@@ -101,6 +104,9 @@ g1 = mb.load("weights/g1.safetensors").quantize(bits=8)  # INT8 transformer weig
 
 The tensor interface is identical to upstream's ONNX models: the same names, shapes and INT32
 masks. Code written against ONNX Runtime or TensorRT can switch by swapping the session object.
+`run` checks every input's shape on the host and raises `ValueError` naming the input. An
+unsupported dtype string, or `mb.load("soma")` without the checkpoint folder, fails with a message
+that says what to pass.
 The CLI also has `convert` and `bench` subcommands. The architecture, tensor shapes and design
 notes are in [model/README.md](../model/README.md).
 
@@ -111,7 +117,24 @@ notes are in [model/README.md](../model/README.md).
 | exact reference behaviour | FP32 (default) | matches PyTorch FP32 to ≤ 1.2e-5 per sub-network |
 | single requests, lowest latency in Python | **INT8** (7.9 ms) or **BF16** (8.1 ms) | batch 1 is bound by streaming the ~800 MB of FP32 weights; smaller weights help directly |
 | many characters at once | **BF16 with batching** | N=32 costs about 38 ms, which is 848 generations/s |
-| a stream of single requests | `mx.async_eval` pipelining | encode request i+1 while the GPU runs request i: 94 → 150 req/s in FP32 |
+| a stream of single requests | `mx.async_eval` pipelining (below) | encode request i+1 while the GPU runs request i: about 98 → 155 req/s in FP32, 125 → 200 in BF16 |
+
+`run` waits for each result. To pipeline a stream, queue request i on the GPU and read request
+i-1 while it runs:
+
+```python
+import mlx.core as mx
+import numpy as np
+
+pending = None
+for request in requests:                                        # dicts of ONNX-named arrays, batch 1
+    outputs = model.forward_compiled(*model.prepare(request))
+    mx.async_eval(outputs)                                      # starts on the GPU, returns at once
+    if pending is not None:
+        handle(dict(zip(model.output_names, map(np.array, pending))))   # waits only for request i-1
+    pending = outputs
+handle(dict(zip(model.output_names, map(np.array, pending))))
+```
 
 INT8 and BF16 chose the same durations as FP32 on every test request; check agreement for your
 own inputs. Two Python optimizations were applied in the second release:
@@ -124,19 +147,24 @@ own inputs. Two Python optimizations were applied in the second release:
 
 ### Correctness
 
-`model/tests` has 109 tests:
-- **10 weight-free unit tests** (every block against NumPy derivations);
-- **20 behavioural tests** that need the checkpoints;
-- **40 parity tests** against NVIDIA's PyTorch model, which need the sandbox's golden fixtures;
-- **39 Runtime API tests** (`test_runtime.py`): 6 weight-free, 25 step-by-step parity checks with
-  upstream's own runtime code, and 8 end-to-end generations.
+`model/tests` has 181 tests:
+- **18 weight-free unit tests** (every block against NumPy derivations, the rig kernels against
+  the op-based rig, multi-step re-masking against a port of upstream's sampler);
+- **21 weight-free API tests** (input validation, dtype and loading errors, strict weight loading);
+- **26 behavioural tests** that need the checkpoints;
+- **42 parity tests** against NVIDIA's PyTorch model, which need the sandbox's golden fixtures
+  (2 of them run end to end on the CPU stream);
+- **66 Runtime API tests** (`test_runtime.py`): 22 weight-free, 36 step-by-step parity checks with
+  upstream's own runtime code, and 8 end-to-end generations;
+- **8 offline download tests** (`test_hub.py`: verification, size and checksum errors, cleanup).
 
 Every sub-network is teacher-forced with PyTorch's exact inputs from the golden fixtures:
 - **Sub-networks:** root ≤ 4e-6, pose logits ≤ 8e-6 with identical argmax tokens, VQ-VAE
   ≤ 1.2e-5 relative.
 - **End to end:** durations are identical on all 5 request families per model.
 
-The per-stage table is in [model/README.md](../model/README.md#verification).
+`MOTIONBRICKS_REQUIRE_FIXTURES=1` turns every skip into a failure, so a complete run cannot pass
+by skipping. The per-stage table is in [model/README.md](../model/README.md#verification).
 
 ---
 
@@ -190,7 +218,7 @@ cd model-rs
 cargo build --release      # first build compiles MLX from source (~6 min); needs Xcode + Metal toolchain
 cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16   # batch 8, synthetic request
 cargo run --release --example generate -- soma ../checkpoints/MotionBricks/soma 8 int8                 # the mlx-rs port
-cargo test --release -- --test-threads=1  # 88 tests; parity tests print SKIPPED without the sandbox's fixtures
+cargo test --release -- --test-threads=1  # 126 tests; parity tests print SKIPPED without the sandbox's fixtures
 ```
 
 The examples take either of two inputs:
@@ -206,7 +234,12 @@ let fast = MetalModel::from_checkpoints_with("soma", "checkpoints/MotionBricks/s
 let forced = model.run_with_durations(&inputs, Some(&[8, 12]))?;   // one fixed duration (6..=16 tokens) per request
 motionbricks_rs::convert("soma", "checkpoints/MotionBricks/soma", "weights/soma.safetensors", mlx_rs::Dtype::Float32)?;
 let from_file = MetalModel::from_converted("weights/soma.safetensors", 64, "float32")?;  // same file format as Python's convert
+let mlx = motionbricks_rs::MotionBricks::load("soma", "checkpoints/MotionBricks/soma", "int8")?; // the mlx-rs port: float32 | float16 | bfloat16 | int8
 ```
+
+`motionbricks_rs::Precision` names the four precisions; both runtimes accept it or its name. The
+mlx-rs port checks the input count and shapes before it builds a graph, and
+`forward_with_durations` checks forced durations (6..=16 tokens).
 
 Build setup:
 - **Xcode:** `model-rs/.cargo/config.toml` points `DEVELOPER_DIR` at Xcode, so `xcode-select` can
@@ -226,11 +259,12 @@ runtimes, with the same requests, checks and tolerances:
 | Python (`model/tests`) | mlx-rs port (`model-rs/tests`) | Metal runtime (`model-rs/tests`) |
 |---|---|---|
 | `test_parity.py`: root, pose, VQ-VAE, end to end × 5 cases × 2 models | `parity.rs`: the same 4 stages × 2 models, each test over all 5 cases (end to end eager and compiled) | `metal_parity.rs`: the same, each stage teacher-forced through the runtime's buffers |
-| `test_model.py`: ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16, converted files, multi-step decoding, INT8 | `model.rs`: all 9, for both models | `metal_model.rs`: the same, except compiled = eager becomes "chunked commits = one command buffer" and multi-step decoding (not in the release-only plan) becomes refusing oversized batches |
-| `test_layers.py`: 10 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels |
+| `test_model.py`: ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16, converted files, multi-step decoding, INT8 | `model.rs`: all 9 (compiled = eager also bitwise), plus malformed inputs being errors, for both models | `metal_model.rs`: the same, except compiled = eager becomes "chunked commits = one command buffer" and multi-step decoding (not in the release-only plan) becomes refusing oversized batches, plus malformed inputs and runtime-only checks (re-encoding, untuned batch sizes, plan rule) |
+| `test_layers.py`: 18 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels |
 | `test_runtime.py`: the Runtime API ([section 4](#4-the-runtime-api)) | `runtime.rs`: the same checks; the end-to-end generations run on both backends | (shared with mlx-rs in `runtime.rs`) |
 
-That gives 88 Rust tests.
+That gives 126 Rust tests, including 15 unit tests inside the crate (NPY parsing, the model
+contract, ops, bench statistics), plus one ignored CPU benchmark of the runtime.
 
 Porting `compiled = eager` found a real bug: compiled mlx-rs runs could flip pose tokens. MLX 0.32.2
 (the version mlx-rs links) writes scalar constants into compiled kernels with too few digits, which
@@ -270,9 +304,11 @@ What it covers:
 - **Tokens and animation buffers:** four-pose context and target tokens, and buffers with time
   sampling, root offsets and foot contacts.
 - **Chaining:** `MotionRecorder` keeps the poses you showed, and `GeneratedMotionPlayer` /
-  `GeneratedDOFMotionPlayer` play generated motion and chain the next generation.
+  `GeneratedDOFMotionPlayer` play generated motion and chain the next generation. A generation that
+  fails leaves the player on its previous motion.
 - **Targets:** placement on the ground with a facing direction, speed scaling, and SOMA IK pins
-  that ease hands and feet onto the target.
+  that ease hands and feet onto the target. Your app applies the pins each frame, as upstream's demo
+  apps do ([how](../model/docs/runtime_api.md#target-pose-ik)).
 - **Clips:** BVH (SOMA) and CSV (G1) loading, and model-space conventions (`model_to_runtime`).
 
 Each generation takes four context poses and one to four target poses. The model chooses 6 to 16
@@ -408,8 +444,8 @@ What changed since the first Rust release, which was FP32 only and 0.97× Python
 |---|---|---|
 | Python MLX at chosen batch sizes | the Python model | `uv run --package motionbricks-mlx motionbricks-mlx bench --model soma --checkpoints checkpoints/MotionBricks/soma --batch 1 8 32` |
 | both Rust runtimes (mlx-rs and Metal) | the Rust model | `cd model-rs && cargo run --release --bin mbrs-bench -- --model soma --dtype bfloat16 --batches 1 8 32` |
-| Python vs Rust, interleaved rounds on byte-identical requests | both models; runs Python through the full uv workspace (`uv run --all-packages`), but no sandbox assets | `OUT=$PWD/model-rs/bench/results/raw model-rs/bench/run_all.sh 3 "float32 bfloat16 float16 int8"`, then `python3 model-rs/bench/report_metal.py model-rs/bench/results/raw` |
-| one quick paired pass | the same | `python3 model-rs/bench/quick_compare.py --dtypes float32 bfloat16 --batches 1 8 32` |
+| Python vs Rust, interleaved rounds on byte-identical requests | both models; the Python side needs only the model package, synced once before the first round (`uv sync --inexact --package motionbricks-mlx`, which leaves an installed sandbox alone) | `model-rs/bench/run_all.sh 3 "float32 bfloat16 float16 int8"` (raw JSON in `model-rs/bench/results/raw`, or `OUT=...`), then `python3 model-rs/bench/report.py model-rs/bench/results/raw --table metal` (or `--table mlx-rs`) |
+| one quick paired pass | the same; the runtime that goes first alternates from row to row | `python3 model-rs/bench/quick_compare.py --dtypes float32 bfloat16 --batches 1 8 32` |
 | every backend: MLX, PyTorch MPS and CPU, ONNX Runtime | the sandbox | `uv run --all-packages python model/benchmarks/bench.py` (JSON in `model/benchmarks/results/`), then `model/benchmarks/report.py` for the tables |
 
 **At large batches, compare only interleaved pairs.** Sustained GPU load raises the M4 Pro's GPU
@@ -423,8 +459,8 @@ the reports pair runs within a round.
 
 ### Tuning the Metal runtime for another Mac
 
-The GEMM plan table (`model-rs/src/metal/plans/apple_m4_pro.txt`) is used only on an M4 Pro.
-Other Macs use a fitted rule, which on the M4 Pro makes GEMMs 1–7% slower than the table. To
+The GEMM plan table (`model-rs/src/metal/plans/apple_m4_pro.txt`) is used only on GPUs named
+"Apple M4 Pro" (it was measured on the 20-core GPU). Other Macs use a fitted rule, which on the M4 Pro makes GEMMs 1–7% slower than the table. To
 measure a table for your own GPU:
 
 ```sh
@@ -440,22 +476,27 @@ How the tuning works:
 - **Measurement:** `gemm-tune` replays every distinct GEMM launch of a generation, with its real
   shapes and fused loaders, under all tile and split plans. It prints the best plans next to the
   table's and the rule's choices.
-- **The table:** with `TUNE_TABLE`, each run appends its best plans to the file.
+- **The table:** with `TUNE_TABLE`, each run appends its best plans to the file. When a launch
+  appears more than once, its last line wins, so re-tuning into the same file overrides older plans.
 - **Using it:** `MB_PLAN_TABLE=<file>` makes the runtime use that file, and `MB_PLAN_TABLE=0`
-  turns tuned plans off.
+  turns tuned plans off (an empty value counts as unset). Loading checks every line (16 fields,
+  a compiled tile, at least one split) and fails with the line number of a malformed one.
 
 To make a table the default for a GPU, add it next to `apple_m4_pro.txt` and select it in
 `plan_table` (`src/metal/transformer.rs`).
 
 ### Profiling tools
 
-In `model-rs` (`cargo run --release --bin <tool> -- ...`):
-- `metal-stages <precision> [N...]`: GPU time per stage of the Metal runtime;
-- `gemm-tune <model> <precision> [N...]`: the GEMM plans, as above;
-- `gemm-shapes`, `gemm-sweep`: the GEMM launches of a generation, and a synthetic sweep;
-- `metal-precision`: an FP16/BF16/INT8 run against FP32, stage by stage;
-- `proto-transformer <precision>`: the pose transformer against MLX;
-- `bench/stage_profile.py` and `bench/python_overhead.py`: MLX-side profiles.
+In `model-rs` (`cargo run --release --bin <tool> -- ...`; the two development tools also need
+`--features dev-tools`):
+- `gemm-tune <model> <precision> [N...]`: the GEMM plans, as above; `gemm-tune --list ...` only
+  lists the GEMM launches of a generation;
+- `metal-stages <precision> [N...]` (dev-tools): GPU time per stage of the Metal runtime;
+- `metal-precision <model> <precision>` (dev-tools): an FP16/BF16/INT8 run against FP32, stage by
+  stage, on the sandbox's `random` golden case;
+- `bench/stage_profile.py`: GPU time per stage of the MLX graph (reads the golden fixture files);
+- `bench/bench_python.py`: each Python MLX call split into input prep, graph build, `mx.eval`
+  (wall and CPU time) and host copy; `--op-cost` measures Python's cost to build one lazy MLX op.
 
 ### Lessons from profiling
 
@@ -496,14 +537,17 @@ Research notes, sources and limits are in [sandbox/README.md](../sandbox/README.
 ### Development workflow
 
 ```sh
-sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden + runtime fixtures
-uv run --all-packages pytest                  # Python: 128 tests (109 model, 19 sandbox incl. 3 CuMetal)
-(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 88 tests, both runtimes vs the fixtures
+sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden + runtime fixtures (rerun-safe; --force regenerates)
+uv run --all-packages pytest                  # Python: 210 tests (181 model, 29 sandbox incl. 3 CuMetal)
+(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 126 tests, both runtimes vs the fixtures
 ```
 
 - **Golden fixtures:** `sandbox/scripts/make_golden.py` records the inputs and outputs of every
-  sub-network from NVIDIA's PyTorch model, for 5 request families per model. Both test suites
-  teacher-force each stage with them, so an error localizes to one module.
+  sub-network from NVIDIA's PyTorch model on the CPU, for 5 request families per model. Both test
+  suites teacher-force each stage with them, so an error localizes to one module. `meta.json`
+  records the device and versions that produced them. `--device mps` writes to
+  `sandbox/golden-mps/`, and `--out DIR` (in both fixture scripts) writes elsewhere, for example to
+  check that a generator change keeps every array bit-identical.
 - **Runtime fixtures:** `sandbox/scripts/make_runtime_golden.py` runs upstream's own Runtime API
   code on Warp's CPU backend: engine encode/decode/correction methods, recorder, target helpers,
   IK and clip loaders. NVIDIA's PyTorch model stands in for TensorRT. Both ports' runtime tests

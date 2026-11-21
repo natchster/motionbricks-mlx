@@ -8,28 +8,26 @@
   by the model package's own downloader (``motionbricks_mlx.hub``, also usable without the
   sandbox). Its size/SHA-256 manifest is first checked against upstream ``tools/onnx/checksums.py``.
 
-Usage (from the repo root):  uv run python sandbox/scripts/fetch_assets.py [--onnx] [--motions]
+Downloads use ``motionbricks_mlx.hub.fetch``: a unique ``.part`` file, hashed while it streams,
+renamed into place only when size and SHA-256 match.
+
+Usage (from the repo root):  uv run --all-packages python sandbox/scripts/fetch_assets.py [--onnx] [--motions]
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
-UPSTREAM_REPO = "https://github.com/NVlabs/motionbricks.git"
-UPSTREAM_COMMIT = "54fc563aeaaf819a753d72cc9fdc6713989cdd43"  # v0.2.0
-MEDIA_URL = "https://media.githubusercontent.com/media/NVlabs/motionbricks/{commit}/{path}"
+from cudashim.paths import CHECKPOINTS, UPSTREAM
+from motionbricks_mlx import hub
 
-ROOT = Path(__file__).resolve().parents[2]
-UPSTREAM = ROOT / "sandbox" / "upstream"
-CHECKPOINTS = ROOT / "checkpoints" / "MotionBricks"
+UPSTREAM_REPO = "https://github.com/NVlabs/motionbricks.git"
+UPSTREAM_COMMIT = hub.UPSTREAM_COMMIT  # v0.2.0, the commit the package's manifests come from
 
 # LFS files the reference oracle and tests need. The rig archives are tiny and required.
 RIG_FILES = ["tools/onnx/assets/g1_model_rig.npz", "tools/onnx/assets/soma_model_rig.npz"]
@@ -38,11 +36,6 @@ ONNX_FILES = [
     "motionbricks/assets/onnx/soma/mmm_v6_soma_fp32.onnx",
 ]
 MOTION_GLOBS = ["assets/motions/unitree_g1/**/*.csv", "assets/motions/soma/**/*.bvh"]
-
-
-def sha256(path: Path) -> str:
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def clone_upstream() -> None:
@@ -73,21 +66,16 @@ def parse_pointer(path: Path) -> tuple[str, int] | None:
 
 
 def fetch_lfs(relpath: str) -> None:
+    """Replace the Git LFS pointer at ``relpath`` with the file it points to, verified against its oid."""
     target = UPSTREAM / relpath
     pointer = parse_pointer(target)
     if pointer is None:
         print(f"lfs: {relpath} (present)")
         return
     oid, size = pointer
-    url = MEDIA_URL.format(commit=UPSTREAM_COMMIT, path=relpath)
-    staged = target.with_suffix(target.suffix + ".part")
+    entry = hub.Entry(oid, size, relpath)
     print(f"lfs: {relpath} ({size / 1e6:.1f} MB)")
-    with urllib.request.urlopen(url) as response, staged.open("wb") as out:
-        shutil.copyfileobj(response, out, length=1 << 20)
-    if staged.stat().st_size != size or sha256(staged) != oid:
-        staged.unlink()
-        raise SystemExit(f"checksum mismatch for {relpath}")
-    staged.replace(target)
+    hub.fetch(entry, UPSTREAM, quiet=True, url=hub.clip_url(entry))
 
 
 def upstream_checksums() -> set[tuple[str, int, str]]:
@@ -119,18 +107,21 @@ def main() -> None:
     parser.add_argument("--no-checkpoints", action="store_true", help="skip the Hugging Face checkpoints")
     args = parser.parse_args()
 
-    clone_upstream()
-    for rel in RIG_FILES:
-        fetch_lfs(rel)
-    if args.motions:
-        for pattern in MOTION_GLOBS:
-            for path in sorted(UPSTREAM.glob(pattern)):
-                fetch_lfs(str(path.relative_to(UPSTREAM)))
-    if args.onnx:
-        for rel in ONNX_FILES:
+    try:
+        clone_upstream()
+        for rel in RIG_FILES:
             fetch_lfs(rel)
-    if not args.no_checkpoints:
-        fetch_checkpoints()
+        if args.motions:
+            for pattern in MOTION_GLOBS:
+                for path in sorted(UPSTREAM.glob(pattern)):
+                    fetch_lfs(str(path.relative_to(UPSTREAM)))
+        if args.onnx:
+            for rel in ONNX_FILES:
+                fetch_lfs(rel)
+        if not args.no_checkpoints:
+            fetch_checkpoints()
+    except RuntimeError as exc:  # download / verification failures from motionbricks_mlx.hub
+        raise SystemExit(f"error: {exc}") from exc
     print("done.")
 
 

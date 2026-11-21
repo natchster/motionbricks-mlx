@@ -190,10 +190,7 @@ class Encoder(nn.Module):
 
     def __call__(self, x):
         for layer in self.model:
-            if isinstance(layer, list):
-                x = layer[1](layer[0](x))
-            else:
-                x = layer(x)
+            x = layer[1](layer[0](x)) if isinstance(layer, list) else layer(x)
         return x
 
 

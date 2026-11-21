@@ -45,7 +45,7 @@ class Layout:
     root_dim: int
 
     @staticmethod
-    def build(root: dict[str, int], body: dict[str, int]) -> "Layout":
+    def build(root: dict[str, int], body: dict[str, int]) -> Layout:
         indices, offset = {}, 0
         for key, size in (root | body).items():
             indices[key] = np.arange(offset, offset + size)

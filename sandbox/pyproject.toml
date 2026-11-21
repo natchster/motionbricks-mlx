@@ -5,14 +5,16 @@ description = "CUDA-emulation sandbox for Apple silicon: torch.cuda->MPS, Tensor
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.12"
+# Floors are the tested versions: the golden fixtures are only bit-reproducible with the oracle
+# stack they were made with (the lockfile pins it exactly; meta.json next to the fixtures records it).
 dependencies = [
-    "torch>=2.6",
+    "torch>=2.15",
     "numpy>=1.26",
-    "onnx>=1.17",
-    "onnxruntime>=1.20",
-    "safetensors>=0.4",
-    "warp-lang>=1.8",
-    "scipy>=1.11",  # upstream's CSV clip loader (reference for the runtime API's)
+    "onnx>=1.23",
+    "onnxruntime>=1.32",
+    "safetensors>=0.8",
+    "warp-lang>=1.19",
+    "scipy>=1.18",  # upstream's CSV clip loader (reference for the runtime API's)
     "motionbricks-mlx",
 ]
 

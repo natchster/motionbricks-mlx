@@ -117,3 +117,8 @@ def get_spec(name: str) -> ModelSpec:
         return SPECS[name]
     except KeyError:
         raise ValueError(f"Unknown model {name!r}; choose 'soma' or 'unitree_g1'.") from None
+
+
+def canonical_name(name: str) -> str:
+    """``"soma"`` or ``"unitree_g1"`` for any accepted model name (``"g1"`` too); ValueError otherwise."""
+    return get_spec(name).name

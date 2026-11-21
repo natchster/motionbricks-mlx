@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import math
+import re
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
 
-from motionbricks_mlx import layers, rig
+from motionbricks_mlx import kernels, layers, rig
 from motionbricks_mlx.config import SOMA
+from motionbricks_mlx.inference import MotionBricksCore
+from motionbricks_mlx.model import load_rig_arrays
 from motionbricks_mlx.networks import MultiHeadQuantizer
-from motionbricks_mlx.representation import MotionRepresentation
+from motionbricks_mlx.representation import GLOBAL_ROOT_KEYS, Layout, MotionRepresentation, body_keys
+from motionbricks_mlx.rig import G1Rig, SomaRetarget
 
 RNG = np.random.default_rng(0)
 
@@ -158,30 +163,89 @@ def test_low_precision_attention_is_finite(dtype):
     assert y.dtype == dtype and np.isfinite(np.array(y.astype(mx.float32))).all()
 
 
+def np_remask(tokens, prob, num_tokens, step, steps, mask_id):
+    """Upstream ``_sample_tokens_with_highest_prob`` (sort, then scatter the mask id) in NumPy."""
+    b, p, h = tokens.shape
+    ratio = np.float32(math.cos(step / steps * math.pi * 0.5))
+    count = np.maximum((ratio * num_tokens.astype(np.float32) * np.float32(h)).astype(np.int32), 1)
+    prob = np.where(np.arange(p)[None, :, None] < num_tokens[:, None, None], prob, np.inf).reshape(b, -1)
+    order = np.argsort(prob, axis=-1, kind="stable")
+    flat = tokens.reshape(b, -1).copy()
+    for i in range(b):
+        flat[i, order[i, :count[i]]] = mask_id
+    return flat.reshape(b, p, h)
+
+
+@pytest.mark.parametrize("step", [0, 1, 2])
+def test_remask_matches_upstream_sampling(step):
+    """Multi-step MaskGIT: re-mask the lowest-confidence valid tokens like upstream."""
+    rng = np.random.default_rng(step)
+    batch, positions, heads, codes = 5, 16, 5, 16
+    tokens = rng.integers(0, codes, size=(batch, positions, heads)).astype(np.int32)
+    prob = rng.uniform(size=(batch, positions, heads)).astype(np.float32)  # distinct: no sort ties
+    num_tokens = rng.integers(6, 17, size=batch).astype(np.int32)
+    core = SimpleNamespace(pose=SimpleNamespace(mask_id=codes))
+    got = MotionBricksCore._remask(core, mx.array(tokens), mx.array(prob), mx.array(num_tokens), step, 3)
+    assert np.array_equal(np.array(got), np_remask(tokens, prob, num_tokens, step, 3, codes))
+
+
 # --- custom Metal rig kernels vs the op-based reference --------------------------------------
-import pytest as _pytest  # noqa: E402
+def g1_rig() -> G1Rig:
+    return G1Rig(load_rig_arrays("unitree_g1"), Layout.build(GLOBAL_ROOT_KEYS, body_keys(34)).indices)
 
-from motionbricks_mlx import kernels as _kernels  # noqa: E402
+
+def test_metal_offsets_match_the_packed_rig():
+    """The F_* / I_* constants in rig_kernels.metal follow kernels.G1_RF_LAYOUT / G1_RI_LAYOUT."""
+    constants = {name: int(value) for name, value in re.findall(r"\b([FI]_[A-Z0-9]+) = (\d+)", kernels.HEADER)}
+    expected = {}
+    for prefix, layout in (("F_", kernels.G1_RF_LAYOUT), ("I_", kernels.G1_RI_LAYOUT)):
+        offset = 0
+        for name, size in layout:
+            expected[prefix + name] = offset
+            offset += size
+    assert constants == expected
+    rig = g1_rig()
+    assert rig.rf.size == sum(size for _, size in kernels.G1_RF_LAYOUT)
+    assert rig.ri.size == sum(size for _, size in kernels.G1_RI_LAYOUT)
 
 
-@_pytest.mark.skipif(not _kernels.available(), reason="needs the Metal GPU")
-def test_rig_kernels_match_ops():
-    from motionbricks_mlx.model import load_rig_arrays
-    from motionbricks_mlx.representation import Layout, GLOBAL_ROOT_KEYS, body_keys
-    from motionbricks_mlx.rig import G1Rig, SomaRetarget
+def test_g1_rig_refuses_a_layout_the_kernels_do_not_know():
+    arrays = load_rig_arrays("unitree_g1")
+    arrays["neutral_joints"] = arrays["neutral_joints"][:-1]
+    with pytest.raises(ValueError, match="layout of the Metal kernels"):
+        G1Rig(arrays, Layout.build(GLOBAL_ROOT_KEYS, body_keys(34)).indices)
+    with pytest.raises(ValueError, match="layout of the Metal kernels"):
+        G1Rig(load_rig_arrays("unitree_g1"), Layout.build(GLOBAL_ROOT_KEYS, body_keys(30)).indices)
 
+
+@pytest.mark.skipif(not kernels.available(), reason="needs the Metal GPU")
+@pytest.mark.parametrize("batch", [1, 3, 33])  # 33: not a multiple of the 32-thread groups
+def test_rig_kernels_match_ops(batch):
     rng = np.random.default_rng(3)
-    rig = G1Rig(load_rig_arrays("unitree_g1"), Layout.build(GLOBAL_ROOT_KEYS, body_keys(34)).indices)
-    qpos = rng.normal(0, 0.4, size=(3, 8, 36)).astype(np.float32)
+    rig = g1_rig()
+    qpos = rng.normal(0, 0.4, size=(batch, 8, 36)).astype(np.float32)
     qpos[..., 2] += 0.75
     ctx, tgt = mx.array(qpos[:, :4]), mx.array(qpos[:, 4:])
     for got, want in zip(rig.preprocess(ctx, tgt), rig.preprocess_ops(ctx, tgt)):
         np.testing.assert_allclose(np.array(got), np.array(want), atol=2e-5, rtol=1e-5)
-    feats = rng.normal(0, 1, size=(2, 64, 414)).astype(np.float32)
+    feats = rng.normal(0, 1, size=(batch, 64, 414)).astype(np.float32)
     for got, want in zip(rig.postprocess(mx.array(feats)), rig.postprocess_ops(mx.array(feats))):
         np.testing.assert_allclose(np.array(got), np.array(want), atol=2e-5, rtol=1e-5)
 
     soma = SomaRetarget(load_rig_arrays("soma"), 30)
-    six = mx.array(rng.normal(0, 1, size=(2, 64, 180)).astype(np.float32))
+    six = mx.array(rng.normal(0, 1, size=(batch, 64, 180)).astype(np.float32))
     np.testing.assert_allclose(np.array(soma.capture_to_standard(six)),
                                np.array(soma.apply_ops(six, soma.capture, soma.standard)), atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not kernels.available(), reason="needs the Metal GPU")
+def test_rig_kernels_reject_shapes_they_would_read_out_of_bounds():
+    rig, ok = g1_rig(), mx.zeros((2, 4, 36))
+    for ctx, tgt in ((mx.zeros((2, 2, 36)), mx.zeros((2, 2, 36))), (ok, mx.zeros((1, 4, 36))), (mx.zeros((2, 4, 35)), ok)):
+        with pytest.raises(ValueError, match="G1 rig kernel"):
+            rig.preprocess(ctx, tgt)
+    with pytest.raises(ValueError, match="G1 rig kernel"):
+        rig.postprocess(mx.zeros((1, 64, 413)))
+    soma = SomaRetarget(load_rig_arrays("soma"), 30)
+    with pytest.raises(ValueError, match="SOMA retarget kernel"):
+        soma.capture_to_standard(mx.zeros((1, 64, 179)))

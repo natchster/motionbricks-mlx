@@ -16,7 +16,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import FRAMES_PER_TOKEN, MAX_FRAMES, MAX_TOKENS, ModelSpec
-from .networks import PoseNetwork, RootNetwork, VQVAE
+from .networks import VQVAE, PoseNetwork, RootNetwork, dense_conditions, target_frame_masks
 from .representation import MotionRepresentation
 
 HEIGHT_ERROR_THRESHOLD = 0.05  # metres, SOMA "from_height_constraint_violation"
@@ -60,13 +60,11 @@ class MotionBricksCore(nn.Module):
         """Context poses at frames 0..3, target poses at the last token's 4 frames."""
         f = FRAMES_PER_TOKEN
         batch, _, dim = poses.shape
-        cond = mx.concatenate([poses[:, :f], mx.zeros((batch, MAX_FRAMES - f, dim), dtype=poses.dtype)], axis=1)
+        at = target_frame_masks(num_tokens)
+        cond = dense_conditions(poses, mx.zeros((batch, MAX_FRAMES - f, dim), dtype=poses.dtype), at)
         has = mx.concatenate([has_poses[:, :f], mx.zeros((batch, MAX_FRAMES - f), dtype=mx.bool_)], axis=1)
-        frames = mx.arange(MAX_FRAMES)[None, :]
-        for i in range(f):
-            at = frames == (num_tokens * f - f + i)[:, None]
-            cond = mx.where(at[..., None], poses[:, f + i][:, None], cond)
-            has = has | (at & has_poses[:, f + i][:, None])
+        for i, mask in enumerate(at):  # a union like upstream's numeric_mask_union, not an overwrite
+            has = has | (mask & has_poses[:, f + i][:, None])
         return cond, has
 
     # -- the generation -------------------------------------------------------------------

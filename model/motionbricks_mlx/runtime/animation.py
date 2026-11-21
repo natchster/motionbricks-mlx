@@ -37,9 +37,13 @@ class Skeleton:
         self.joint_names = list(joint_names)
         if not self.joint_names:
             raise ValueError("A skeleton needs at least one joint.")
-        self.parent_indices = np.asarray(parent_indices, dtype=np.int32)
-        if self.parent_indices.shape != (len(self.joint_names),):
-            raise ValueError(f"Expected {len(self.joint_names)} parent indices, got {self.parent_indices.size}.")
+        parents = np.array(parent_indices, dtype=np.int32)  # a copy: engines cache mappings built from it
+        if parents.shape != (len(self.joint_names),):
+            raise ValueError(f"Expected {len(self.joint_names)} parent indices, got {parents.size}.")
+        # Parents first, joint 0 the only root: what world-transform composition relies on.
+        self._levels = T.hierarchy_levels(parents)
+        parents.setflags(write=False)
+        self.parent_indices = parents
         local = np.asarray(local_transforms, dtype=F)
         if local.shape != (len(self.joint_names), 7):
             raise ValueError(f"Expected {len(self.joint_names)} local transforms.")
@@ -84,7 +88,7 @@ class Skeleton:
 
     def compute_world_transforms(self, local_transforms, root_tx=T.IDENTITY) -> np.ndarray:
         """World transforms of one pose ``[J, 7]`` (or several ``[N, J, 7]``)."""
-        return T.compute_world_poses(local_transforms, self.parent_indices, root_tx)
+        return T.compute_world_poses(local_transforms, self.parent_indices, root_tx, self._levels)
 
 
 def _validate_foot_contacts(foot_contacts, capacity: int):
@@ -102,9 +106,11 @@ def sample_foot_contacts(buffer, time: float, output: np.ndarray | None = None) 
         raise ValueError("Cannot sample foot contacts from an animation buffer that has none.")
     if buffer.num_frames == 0:
         raise ValueError("Cannot sample an empty animation buffer.")
+    if output is not None and output.shape != (FOOT_CONTACT_COUNT,):
+        raise ValueError(f"output must be an array of {FOOT_CONTACT_COUNT} foot contacts.")
     frame, nxt, blend = frame_index_from_time(time, buffer.sample_rate, buffer.num_frames)
     c = buffer.foot_contacts
-    value = (c[frame] + (c[nxt] - c[frame]) * F(blend)).astype(F)
+    value = c[frame] + (c[nxt] - c[frame]) * F(blend)  # float32 already
     if output is not None:
         output[...] = value
         return output
@@ -151,8 +157,8 @@ class AnimationBuffer(_Buffer):
     def __init__(self, skeleton: Skeleton, sample_rate: float, poses, *, num_frames: int | None = None, foot_contacts=None):
         self.skeleton = skeleton
         self.sample_rate = float(sample_rate)
-        if self.sample_rate <= 0.0:
-            raise ValueError("sample_rate must be positive.")
+        if not (self.sample_rate > 0.0 and math.isfinite(self.sample_rate)):
+            raise ValueError(f"sample_rate must be positive and finite, got {self.sample_rate}.")
         self.poses = np.asarray(poses, dtype=F)
         if self.poses.ndim != 3 or self.poses.shape[1:] != (skeleton.num_joints, 7):
             raise ValueError("poses must have shape [capacity, num_joints, 7].")
@@ -171,12 +177,12 @@ class AnimationBuffer(_Buffer):
         """
         if self.num_frames == 0:
             raise ValueError("Cannot sample an empty animation buffer.")
+        if output_pose is not None and output_pose.shape != (self.skeleton.num_joints, 7):
+            raise ValueError("output_pose must contain one transform per joint.")
         frame, nxt, blend = frame_index_from_time(time, self.sample_rate, self.num_frames)
         pose = T.blend_transform(self.poses[frame], self.poses[nxt], np.full(self.skeleton.num_joints, blend, F))
         pose[0] = T.transform_mul(root_offset, pose[0])
         if output_pose is not None:
-            if output_pose.shape != (self.skeleton.num_joints, 7):
-                raise ValueError("output_pose must contain one transform per joint.")
             output_pose[...] = pose
             return output_pose
         return pose
@@ -189,14 +195,13 @@ class AnimationBuffer(_Buffer):
         """Adjust the frames in use so the first and last poses match (correction grows linearly)."""
         if self.num_frames < 2:
             return
-        last = self.num_frames - 1
+        n, last = self.num_frames, self.num_frames - 1
         p = self.poses
         root_delta = T.compute_root_endpoint_delta(p[last, 0], p[0, 0])
         deltas = T.compute_delta_transform(p[last, 1:], p[0, 1:])
-        for frame in range(self.num_frames):
-            w = F(frame / last)
-            p[frame, 0] = T.apply_root_endpoint_correction(p[frame, 0], T.IDENTITY, root_delta, w)
-            p[frame, 1:] = T.apply_delta_transform(p[frame, 1:], deltas, np.full(len(deltas), w, F))
+        w = _loop_weights(n)
+        p[:n, 0] = T.apply_root_endpoint_correction(p[:n, 0], T.IDENTITY, root_delta, w)
+        p[:n, 1:] = T.apply_delta_transform(p[:n, 1:], deltas, np.broadcast_to(w[:, None], (n, len(deltas))))
 
 
 def create_animation_buffer_for_skeleton(animation: AnimationBuffer, new_skeleton: Skeleton) -> AnimationBuffer:
@@ -223,8 +228,8 @@ class DOFAnimationBuffer(_Buffer):
         self.num_dofs = len(self.joint_names)
         self.num_coordinates = ROOT_COORDINATE_COUNT + self.num_dofs
         self.sample_rate = float(sample_rate)
-        if self.sample_rate <= 0.0:
-            raise ValueError("sample_rate must be positive.")
+        if not (self.sample_rate > 0.0 and math.isfinite(self.sample_rate)):
+            raise ValueError(f"sample_rate must be positive and finite, got {self.sample_rate}.")
         self.poses = np.asarray(poses, dtype=F)
         if self.poses.ndim != 2 or self.poses.shape[1] != self.num_coordinates:
             raise ValueError(f"poses must have shape [capacity, {self.num_coordinates}].")
@@ -238,14 +243,14 @@ class DOFAnimationBuffer(_Buffer):
         """Joint coordinates at a time; the root rotation is renormalized like upstream."""
         if self.num_frames == 0:
             raise ValueError("Cannot sample an empty animation buffer.")
+        if output_pose is not None and output_pose.shape != (self.num_coordinates,):
+            raise ValueError(f"output_pose must be a vector of {self.num_coordinates} coordinates.")
         frame, nxt, blend = frame_index_from_time(time, self.sample_rate, self.num_frames)
         a, b = self.poses[frame], self.poses[nxt]
         out = (a + (b - a) * F(blend)).astype(F)  # joint angles lerp, also across +-pi
         root = T.blend_transform(read_root(a), read_root(b), F(blend))
         write_root(T.transform_mul(root_offset, root), out)
         if output_pose is not None:
-            if output_pose.shape != (self.num_coordinates,):
-                raise ValueError(f"output_pose must be a vector of {self.num_coordinates} coordinates.")
             output_pose[...] = out
             return output_pose
         return out
@@ -257,14 +262,18 @@ class DOFAnimationBuffer(_Buffer):
     def make_loopable(self, stream=None) -> None:
         if self.num_frames < 2:
             return
-        last = self.num_frames - 1
+        n, last = self.num_frames, self.num_frames - 1
         p = self.poses
         root_delta = T.compute_root_endpoint_delta(read_root(p[last]), read_root(p[0]))
         angle_deltas = p[0, ROOT_COORDINATE_COUNT:] - p[last, ROOT_COORDINATE_COUNT:]
-        for frame in range(self.num_frames):
-            w = F(frame / last)
-            write_root(T.apply_root_endpoint_correction(read_root(p[frame]), T.IDENTITY, root_delta, w), p[frame])
-            p[frame, ROOT_COORDINATE_COUNT:] += angle_deltas * w
+        w = _loop_weights(n)
+        write_root(T.apply_root_endpoint_correction(read_root(p[:n]), T.IDENTITY, root_delta, w), p[:n])
+        p[:n, ROOT_COORDINATE_COUNT:] += angle_deltas * w[:, None]
+
+
+def _loop_weights(num_frames: int) -> np.ndarray:
+    """``frame / last`` per frame in float32 (upstream's ``float32(frame) / float32(last)``)."""
+    return np.arange(num_frames, dtype=F) / F(num_frames - 1)
 
 
 def read_root(joint_q) -> np.ndarray:

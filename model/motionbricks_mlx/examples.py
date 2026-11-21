@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthetic but well-formed requests, for smoke tests and benchmarks.
 
-The trace inputs mirror upstream ``tools/onnx/export.py::example_inputs``; ``random_request``
-builds plausible varied requests (a standing pose moving forward with a turn) so that
-benchmarks do not just replay one degenerate input.
+``g1_request`` and ``soma_request`` build plausible varied requests (a standing pose moving
+forward, with a turn for G1), seeded, so that benchmarks do not just replay one degenerate
+input. ``request`` picks the one for a model name. Upstream's ONNX trace inputs are among the
+golden fixtures of the test-suite, not here.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from .config import CONTEXT_AND_TARGET, NUM_TOKEN_CHOICES
+from .config import CONTEXT_AND_TARGET, NUM_TOKEN_CHOICES, canonical_name
 
 
 def _masks(batch, num_targets=4):
@@ -75,4 +76,5 @@ def soma_request(batch: int = 1, seed: int = 0, distance: float = 1.5) -> dict[s
 
 
 def request(name: str, batch: int = 1, seed: int = 0) -> dict[str, np.ndarray]:
-    return g1_request(batch, seed) if name in ("unitree_g1", "g1") else soma_request(batch, seed)
+    """A request for model ``name`` (``"soma"``, ``"unitree_g1"`` or ``"g1"``); ValueError otherwise."""
+    return g1_request(batch, seed) if canonical_name(name) == "unitree_g1" else soma_request(batch, seed)

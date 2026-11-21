@@ -85,6 +85,10 @@ impl Core {
         &self, global_root: &Array, has_global: &Array, local_root: &Array, has_local: &Array, local_poses: &Array,
         has_poses: &Array, allowed: &Array, num_inference_steps: usize, num_tokens: Option<&Array>,
     ) -> R<(Array, Array)> {
+        if num_inference_steps == 0 {
+            // Zero steps would decode the mask token, which has no codebook entry.
+            return Err(mlx_rs::error::Exception::custom("num_inference_steps must be at least 1"));
+        }
         let (rep, dt, f32t) = (&self.rep, self.dtype, Dtype::Float32);
         let f = FRAMES_PER_TOKEN;
         let batch = global_root.dim(0);

@@ -168,9 +168,24 @@ fn to_vec<T: Copy>(a: &Array, data: unsafe extern "C" fn(mlx_sys::mlx_array) -> 
     a.eval()?;
     let shape: Vec<usize> = a.shape().iter().map(|&d| d as usize).collect();
     let n: usize = shape.iter().product();
+    // Empty arrays may have no buffer, and 0-d arrays have no strides (MLX can return null for
+    // both); `slice::from_raw_parts` needs non-null pointers even for zero lengths.
+    if n == 0 {
+        return Ok(Vec::new());
+    }
     unsafe {
         let ptr = data(a.as_ptr());
-        let strides = std::slice::from_raw_parts(mlx_sys::mlx_array_strides(a.as_ptr()), shape.len());
+        if ptr.is_null() {
+            return Err(Exception::custom("to_vec: array has no data"));
+        }
+        if shape.is_empty() {
+            return Ok(vec![*ptr]);
+        }
+        let strides_ptr = mlx_sys::mlx_array_strides(a.as_ptr());
+        if strides_ptr.is_null() {
+            return Err(Exception::custom("to_vec: array has no strides"));
+        }
+        let strides = std::slice::from_raw_parts(strides_ptr, shape.len());
         let mut expected = 1;
         let contiguous = shape.iter().zip(strides).rev().all(|(&d, &s)| {
             let ok = d == 1 || s == expected;
@@ -202,4 +217,43 @@ pub fn to_vec_f32(a: &Array) -> R<Vec<f32>> {
 
 pub fn to_vec_i32(a: &Array) -> R<Vec<i32>> {
     to_vec(&a.as_dtype(Dtype::Int32)?, mlx_sys::mlx_array_data_int32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid() -> Array {
+        Array::from_slice(&(0..6).map(|v| v as f32).collect::<Vec<_>>(), &[2, 3])
+    }
+
+    #[test]
+    fn to_vec_follows_strides() {
+        assert_eq!(to_vec_f32(&grid()).unwrap(), vec![0., 1., 2., 3., 4., 5.]);
+        assert_eq!(to_vec_f32(&grid().t()).unwrap(), vec![0., 3., 1., 4., 2., 5.]);
+        let row = Array::from_slice(&[1.0f32, 2.0], &[1, 2]);
+        assert_eq!(to_vec_f32(&ops::broadcast_to(&row, &[3, 2]).unwrap()).unwrap(), vec![1., 2., 1., 2., 1., 2.]);
+        assert_eq!(to_vec_i32(&slice(&grid(), 1, 1, END).unwrap()).unwrap(), vec![1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn to_vec_scalars_and_empty_arrays() {
+        assert_eq!(to_vec_f32(&Array::from_f32(2.5)).unwrap(), vec![2.5]);
+        assert_eq!(to_vec_i32(&i(-4)).unwrap(), vec![-4]);
+        assert!(to_vec_f32(&ops::zeros::<f32>(&[0, 3]).unwrap()).unwrap().is_empty());
+        assert!(to_vec_f32(&slice(&grid(), 1, 2, 2).unwrap()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn python_style_indexing() {
+        assert_eq!(to_vec_f32(&slice(&grid(), -1, -2, END).unwrap()).unwrap(), vec![1., 2., 4., 5.]);
+        assert_eq!(to_vec_f32(&slice(&grid(), 0, 0, -1).unwrap()).unwrap(), vec![0., 1., 2.]);
+        assert_eq!(to_vec_f32(&slice(&grid(), 1, 5, 99).unwrap()).unwrap(), Vec::<f32>::new());
+        assert_eq!(to_vec_f32(&index(&grid(), -1, -1).unwrap()).unwrap(), vec![2., 5.]);
+        assert_eq!(index(&grid(), 0, 1).unwrap().shape(), &[3]);
+        assert_eq!(to_vec_f32(&index2(&grid(), 1, 2).unwrap()).unwrap(), vec![5.]);
+        let x = scalar(0.1, Dtype::Bfloat16);
+        assert_eq!((x.dtype(), x.ndim()), (Dtype::Bfloat16, 0));
+        assert_eq!(full(&[2], &i(3)).unwrap().dtype(), Dtype::Int32);
+    }
 }

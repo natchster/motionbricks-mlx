@@ -10,16 +10,21 @@ each sub-network's inputs and outputs so the MLX port can be checked stage by st
 from __future__ import annotations
 
 import importlib.util
+import json
+import platform
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
+from motionbricks_mlx import hub
+from motionbricks_mlx.config import canonical_name
 
-ROOT = Path(__file__).resolve().parents[2]
-UPSTREAM = ROOT / "sandbox" / "upstream"
-CHECKPOINTS = ROOT / "checkpoints" / "MotionBricks"
-HF_FOLDERS = {"soma": "soma", "unitree_g1": "g1"}
+from .paths import CHECKPOINTS, UPSTREAM
+
+__all__ = ["CHECKPOINTS", "UPSTREAM", "available", "build", "capture", "checkpoint_dir", "fixture_meta", "import_exporter",
+           "kind", "require_checkpoints", "run", "torch_inputs", "upstream_commit", "write_meta"]
 
 
 def available() -> bool:
@@ -30,8 +35,52 @@ def available() -> bool:
     return (UPSTREAM / "tools" / "onnx" / "models").is_dir()
 
 
+def kind(name: str) -> str:
+    """Upstream's short model name (``"g1"`` / ``"soma"``); ValueError for an unknown model."""
+    return "g1" if canonical_name(name) == "unitree_g1" else "soma"
+
+
 def checkpoint_dir(name: str) -> Path:
-    return CHECKPOINTS / HF_FOLDERS[name]
+    return hub.checkpoint_dir(name, CHECKPOINTS)
+
+
+def require_checkpoints(name: str) -> None:
+    """Fail early, with the fix, when a model's checkpoint files are missing."""
+    missing = [e.path for e in hub.files_for(name) if not (CHECKPOINTS / e.path).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{len(missing)} {canonical_name(name)} checkpoint file(s) missing under {CHECKPOINTS} "
+            f"(e.g. {missing[0]}): run `motionbricks-mlx download --dir {CHECKPOINTS}` or sandbox/setup.sh")
+
+
+def upstream_commit() -> str | None:
+    """The commit the upstream checkout is at (None without a checkout)."""
+    try:
+        return subprocess.run(["git", "-C", str(UPSTREAM), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def fixture_meta(generator: str, device: str, **extra) -> dict:
+    """What produced a set of golden fixtures: the oracle's device and versions. Fixtures are only
+    bit-reproducible with the same versions, and only CPU fixtures are the FP32 reference."""
+    import torch
+
+    meta = {"generator": generator, "device": device, "upstream_commit": upstream_commit(),
+            "torch": torch.__version__, "numpy": np.__version__, "python": platform.python_version(),
+            "machine": platform.machine()}
+    for module in ("warp", "onnxruntime"):
+        if module in sys.modules:
+            meta[module] = sys.modules[module].__version__
+    meta.update(extra)
+    return meta
+
+
+def write_meta(directory: Path, meta: dict) -> Path:
+    path = Path(directory) / "meta.json"
+    path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    return path
 
 
 def import_exporter():
@@ -54,13 +103,14 @@ def build(name: str, device: str = "cpu"):
     """Build the upstream batched model (``BatchedG1`` / ``BatchedSOMA``) in eval mode."""
     import torch
 
+    short = kind(name)
     import_exporter()
+    require_checkpoints(name)
     from motionbricks_onnx.checkpoints import checkpoint_root, load_sources
     from motionbricks_onnx.checksums import CHECKPOINTS as SUMS
 
-    kind = "g1" if name == "unitree_g1" else "soma"
-    sources = load_sources(checkpoint_root(checkpoint_dir(name), SUMS[kind]), SUMS[kind])
-    if kind == "g1":
+    sources = load_sources(checkpoint_root(checkpoint_dir(name), SUMS[short]), SUMS[short])
+    if short == "g1":
         from motionbricks_onnx.models.g1 import build_g1 as builder
     else:
         from motionbricks_onnx.models.soma import build_soma as builder
@@ -74,8 +124,9 @@ def build(name: str, device: str = "cpu"):
 def torch_inputs(name: str, request: dict[str, np.ndarray], device: str = "cpu"):
     import torch
 
+    short = kind(name)
     import_exporter()
-    if name == "unitree_g1":
+    if short == "g1":
         from motionbricks_onnx.models.g1 import INPUT_NAMES
     else:
         from motionbricks_onnx.models.soma import INPUT_NAMES
@@ -84,9 +135,10 @@ def torch_inputs(name: str, request: dict[str, np.ndarray], device: str = "cpu")
 
 def _networks(model, name):
     """(root backbone, pose backbone, vqvae) modules of an upstream batched model."""
-    inferencer = model.core.inferencer if name == "unitree_g1" else model.model
-    if name == "unitree_g1":
+    if kind(name) == "g1":
+        inferencer = model.core.inferencer
         return inferencer._root_model.backbone_net, inferencer._pose_model.backbone_net, inferencer._vqvae_pose_model
+    inferencer = model.model
     return inferencer._mmm_root_model.mmm_net, inferencer._mmm_pose_model.mmm_net, inferencer._vqvae_pose_model
 
 
@@ -145,7 +197,7 @@ def run(model, name: str, request: dict[str, np.ndarray], device: str = "cpu", i
     """Run one request through the upstream model; return ONNX-named outputs (+ captures)."""
     import torch
 
-    output_names = ("pred_qpos", "pred_num_tokens", "pred_foot_contacts") if name == "unitree_g1" else (
+    output_names = ("pred_qpos", "pred_num_tokens", "pred_foot_contacts") if kind(name) == "g1" else (
         "pred_global_motions", "pred_num_tokens")
     with torch.inference_mode():
         if intermediates:

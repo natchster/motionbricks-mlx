@@ -53,9 +53,10 @@ def load_rig(model: str, clip_name: str = WALK, dtype: str = "float32") -> Rig:
         engine = rt.MotionBricksSOMAEngine.from_checkpoints(folder, dtype=dtype, model_to_runtime=to_runtime)
         return Rig(engine, clip, skeleton, skeleton.reference_local_transforms, to_runtime)
     clip = rt.load_csv(CLIPS / "unitree_g1" / f"{clip_name}.csv")
-    # G1 model space and CSV clips are already Z up.
-    engine = rt.MotionBricksUnitreeG1Engine.from_checkpoints(folder, dtype=dtype)
-    return Rig(engine, clip, None, clip.sample(0.0), rt.transforms.IDENTITY.copy())
+    # G1 model space and CSV clips are already Z up: the transform is the identity.
+    to_runtime = rt.model_to_runtime("unitree_g1")
+    engine = rt.MotionBricksUnitreeG1Engine.from_checkpoints(folder, dtype=dtype, model_to_runtime=to_runtime)
+    return Rig(engine, clip, None, clip.sample(0.0), to_runtime)
 
 
 def sample_window(rig: Rig, start_time: float, root_offset=None) -> np.ndarray:
