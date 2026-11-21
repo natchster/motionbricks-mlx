@@ -12,6 +12,7 @@ dependencies = [
     "onnxruntime>=1.20",
     "safetensors>=0.4",
     "warp-lang>=1.8",
+    "scipy>=1.11",  # upstream's CSV clip loader (reference for the runtime API's)
     "motionbricks-mlx",
 ]
 

@@ -12,8 +12,8 @@ Rust implementation with a model-specific Metal runtime.
 
 | Folder | What it is |
 |---|---|
-| [`model/`](model/README.md) | **`motionbricks_mlx`** (Python), a native MLX port of the complete SOMA and Unitree G1 inference graphs. It has the same tensor interface as the upstream ONNX models, supports FP32, FP16, BF16 and INT8, and depends only on `mlx` + `numpy`. |
-| [`model-rs/`](model-rs/README.md) | **`motionbricks-rs`** (Rust). It contains an op-for-op port on mlx-rs and a **model-specific Metal runtime** (FP32, FP16, BF16, INT8), the fastest way to run MotionBricks at every batch size. |
+| [`model/`](model/README.md) | **`motionbricks_mlx`** (Python), a native MLX port of the complete SOMA and Unitree G1 inference graphs. It has the same tensor interface as the upstream ONNX models, supports FP32, FP16, BF16 and INT8, and depends only on `mlx` + `numpy`. It also includes upstream's **Runtime API**: engines, motion players, recorders, target poses and clips. |
+| [`model-rs/`](model-rs/README.md) | **`motionbricks-rs`** (Rust). It contains an op-for-op port on mlx-rs and a **model-specific Metal runtime** (FP32, FP16, BF16, INT8), the fastest way to run MotionBricks at every batch size. It also includes the **Runtime API**, running on either backend. |
 | [`sandbox/`](sandbox/README.md) | **`cudashim`**, a layered CUDA-emulation sandbox for M-series Macs. It maps `torch.cuda`→MPS, TensorRT→ONNX Runtime and Warp kernels→CPU, and optionally compiles CUDA C++→Metal through CuMetal. It also runs NVIDIA's upstream model as the reference oracle for both versions. |
 
 ### Quick start: three independent paths
@@ -28,8 +28,19 @@ The models don't need the sandbox. Pick the path you need; each one downloads th
 | **Full sandbox** ([Part 3](#part-3--benchmarking-and-development-sandbox)): NVIDIA's reference, golden fixtures, every test, benchmarks | uv; about 5 GB of disk | `sandbox/setup.sh`<br>`uv run --all-packages pytest`<br>`(cd model-rs && cargo test --release -- --test-threads=1)` |
 
 The model test suites run on the first two paths too. Without the sandbox they run every test
-except the parity tests against NVIDIA's PyTorch model, which need the sandbox's golden fixtures
-and report themselves as skipped.
+except the parity tests against NVIDIA's code, which need the sandbox's golden fixtures and report
+themselves as skipped.
+
+**Runtime API.** Both ports also carry upstream's Runtime API, which turns generations into
+continuous character motion:
+- engines that generate from four context poses and one to four target poses;
+- motion players and recorders that chain generations;
+- target placement, speed scaling and SOMA IK pins;
+- BVH/CSV clip loading.
+
+The guides are [model/docs/runtime_api.md](model/docs/runtime_api.md) (Python) and
+[model-rs/docs/runtime_api.md](model-rs/docs/runtime_api.md) (Rust). Add `--clips` to `download`, or
+run `download_weights.sh clips`, for the sample clips its examples use.
 
 ### Ported and tested version
 
@@ -123,6 +134,26 @@ g1 = mb.load("weights/g1.safetensors").quantize(bits=8)  # INT8 transformer weig
 The CLI also has `convert` and `bench` subcommands. See [model/README.md](model/README.md) for
 the architecture and design notes.
 
+### Runtime API
+
+`motionbricks_mlx.runtime` is upstream's Runtime API on MLX, with upstream's names and behavior:
+engines, tokens, animation buffers, `MotionRecorder`, motion players, target placement, IK pins and
+clip loading. Poses are NumPy arrays and inference is the MLX model in any precision:
+
+```python
+from motionbricks_mlx import runtime as rt
+
+with rt.MotionBricksUnitreeG1Engine.from_checkpoints("checkpoints/MotionBricks/g1", dtype="bfloat16") as engine:
+    context, target, output = engine.create_input(), engine.create_input(), engine.create_output()
+    context.update_from_poses(context_joint_q)          # four poses of 36 joint coordinates
+    target.update_from_poses(target_joint_q)            # one to four poses
+    engine.generate_animation(context, target, output)  # output.num_frames valid frames at 30 Hz
+    pose = output.sample(0.5)
+```
+
+`model/examples/generate_once.py` and `locomotion_loop.py` are the ports of upstream's two examples.
+The guide is [model/docs/runtime_api.md](model/docs/runtime_api.md).
+
 ### Choosing precision and batching
 
 | Goal | Use | Why |
@@ -143,10 +174,12 @@ own inputs. Two Python optimizations were applied for this release:
 
 ### Correctness
 
-`model/tests` has 70 tests:
+`model/tests` has 109 tests:
 - **10 weight-free unit tests** (every block against NumPy derivations);
 - **20 behavioural tests** that need the checkpoints;
-- **40 parity tests** against NVIDIA's PyTorch model, which need the sandbox's golden fixtures.
+- **40 parity tests** against NVIDIA's PyTorch model, which need the sandbox's golden fixtures;
+- **39 Runtime API tests** (`test_runtime.py`): weight-free unit tests, step-by-step parity with
+  upstream's own runtime kernels, and end-to-end generation.
 
 Every sub-network is teacher-forced with PyTorch's exact inputs from golden fixtures:
 - **Sub-networks:** root ≤ 4e-6, pose logits ≤ 8e-6 with identical argmax tokens, VQ-VAE
@@ -241,6 +274,25 @@ cargo test --release -- --test-threads=1  # 64 tests; parity tests skip without 
 The examples take a batch size (a synthetic request from `motionbricks_rs::examples`, the Rust
 version of the Python generator) or a request `.npz` with the ONNX input names.
 
+**Runtime API.** `motionbricks_rs::runtime` provides the same engines, motion players, recorders,
+target helpers and clip loaders as the Python port. Each engine runs on a `Backend`, either the
+Metal runtime (any precision) or the mlx-rs port:
+
+```rust
+use motionbricks_rs::{metal::model::MetalModel, runtime::*};
+let model = MetalModel::from_checkpoints_with("unitree_g1", "checkpoints/MotionBricks/g1", 1, "bfloat16")?;
+let mut engine = MotionBricksUnitreeG1Engine::new(Some(model), Transform::IDENTITY)?;
+let (mut context, mut target, mut output) = (engine.create_input(), engine.create_input(), engine.create_output());
+context.update_from_poses(&context_joint_q)?;
+target.update_from_poses(&target_joint_q)?;
+engine.generate_animation(&context, &target, &mut output, &MotionBricksInferenceConfig::default())?;
+```
+
+On the Metal runtime, a whole generation, including encoding, decoding and endpoint correction,
+takes about 7 ms in FP32 and 5 ms in BF16. `cargo run --release --example locomotion_loop`
+and `generate_once` are the ports of upstream's examples. The guide is
+[model-rs/docs/runtime_api.md](model-rs/docs/runtime_api.md).
+
 ```rust
 use motionbricks_rs::metal::model::MetalModel;
 let model = MetalModel::from_checkpoints("unitree_g1", "checkpoints/MotionBricks/g1", 64)?; // FP32, max batch 64
@@ -268,8 +320,9 @@ runtimes, with the same requests, checks and tolerances:
 | `test_model.py`: ONNX contract, compiled = eager, batch independence, allowed durations, forced durations, FP16/BF16, converted files, multi-step decoding, INT8 | `model.rs`: all 9, for both models | `metal_model.rs`: the same, except compiled = eager becomes "chunked commits = one command buffer" and multi-step decoding (not in the release-only plan) becomes refusing oversized batches |
 | `test_layers.py`: 10 weight-free unit tests of the building blocks and the rig kernels | `layers.rs`: the same blocks against float64 references, plus the attention path MLX's fused kernels don't cover | `metal_kernels.rs`: every GEMM loader and epilogue under all 33 tile/split plans (442 launches), half-precision GEMMs, and a full transformer layer in every precision with both attention kernels |
 
-That gives 64 Rust tests: 12 weight-free, 36 behavioural and 16 parity tests. Rust's test
-harness has no skip state, so tests without their checkpoints or fixtures print `SKIPPED` and pass.
+`tests/runtime.rs` mirrors `test_runtime.py` (23 tests) and runs the end-to-end generations on both
+backends. Altogether that gives 88 Rust tests. Rust's test harness has no skip state, so tests
+without their checkpoints or fixtures print `SKIPPED` and pass.
 
 Porting `compiled = eager` found a real bug: compiled mlx-rs runs could flip pose tokens. MLX 0.32.2
 (the version mlx-rs links) writes scalar constants into compiled kernels with too few digits, which
@@ -311,13 +364,17 @@ and limits are in [sandbox/README.md](sandbox/README.md).
 
 ```sh
 sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden fixtures
-uv run --all-packages pytest                  # Python: 88 tests (70 model, 18 sandbox incl. 3 CuMetal)
-(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 64 tests, both runtimes vs the golden fixtures
+uv run --all-packages pytest                  # Python: 128 tests (109 model, 19 sandbox incl. 3 CuMetal)
+(cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 88 tests, both runtimes vs the golden fixtures
 ```
 
 - **Golden fixtures:** `sandbox/scripts/make_golden.py` records the inputs and outputs of every
   sub-network from NVIDIA's PyTorch model, for 5 request families per model. Both test suites
   teacher-force each stage with them, so an error localizes to one module.
+- **Runtime fixtures:** `sandbox/scripts/make_runtime_golden.py` runs upstream's own Runtime API
+  code on Warp's CPU backend: engine encode/decode/correction methods, recorder, target helpers,
+  IK and clip loaders. NVIDIA's PyTorch model stands in for TensorRT. Both ports' runtime tests
+  check each step against these fixtures.
 - **Python benchmarks:** `uv run --all-packages python model/benchmarks/bench.py` times MLX at
   each precision, PyTorch on MPS and CPU, and ONNX Runtime. It writes JSON to
   `model/benchmarks/results/`, and `report.py` renders the tables.

@@ -1,0 +1,8 @@
+# Sample motion clips used by the Runtime API examples, from NVlabs/motionbricks at commit
+# 54fc563aeaaf819a753d72cc9fdc6713989cdd43 (Git LFS objects): sha256, size in bytes, path in the
+# upstream repository. They are NVIDIA sample data under the NVIDIA Sample Data Evaluation License
+# (upstream assets/motions/LICENSE.txt). They are downloaded from upstream, not redistributed here.
+c0f4e63cec94c58196105a6d9f03a2ed1c94c8ff4fba15dd0a33cc512877904a     2587387  assets/motions/soma/locomotion/bs_1d_linear/Neutral_walk_forward_002__A057.bvh
+321883221739a6bad5f786bdcc8edc5ff6c7d7a443d47b08d1dac03036840e2a     1568243  assets/motions/soma/locomotion/bs_1d_linear/neutral_jog_ff_180_R_001__A534.bvh
+45fb2407adffee1cd7cca30adae662368f7f63361688fc8e14737f0787fe0565      447511  assets/motions/unitree_g1/locomotion/bs_1d_linear/Neutral_walk_forward_002__A057.csv
+2c203a9814c503989cbedfbd3dc92dd01256bcc2ac1351f708d2bb9e7ec491e8      270580  assets/motions/unitree_g1/locomotion/bs_1d_linear/neutral_jog_ff_180_R_001__A534.csv

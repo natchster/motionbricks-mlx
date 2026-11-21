@@ -25,6 +25,23 @@ MLX is MIT-licensed, Copyright © 2023 Apple Inc., and is not redistributed here
 model/motionbricks_mlx/assets/rig_kernels.metal holds Metal transcriptions of the
 upstream rig geometry, shared by both ports.
 
+model/motionbricks_mlx/runtime/ and model-rs/src/runtime/ port upstream's Runtime
+API (motionbricks/model/, motionbricks/runtime/, motionbricks/animation/,
+motionbricks/io/, motionbricks/utils/ at the same commit), with the same
+Copyright and license. The Warp kernels were rewritten as NumPy and Rust code with
+Warp's math conventions. TensorRT inference was replaced by the MLX model, the Metal
+runtime or the mlx-rs port, and a BVH-based skeleton loader replaced the USD one.
+model/examples/{_rig,generate_once,locomotion_loop}.py and model-rs/examples/
+{support/runtime_rig,generate_once,locomotion_loop}.rs are ports of upstream
+docs/examples/.
+
+model/docs/runtime_api.md and model-rs/docs/runtime_api.md are adapted from
+upstream docs/runtime_api.md, Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES,
+licensed under Creative Commons Attribution 4.0 International (CC BY 4.0,
+https://creativecommons.org/licenses/by/4.0/). Changes: rewritten for the MLX and
+Rust ports, demo-runtime sections removed, setup, differences and verification
+sections added. Each page carries this attribution.
+
 MotionBricks paper: T. Wang et al., "MotionBricks: Scalable Real-Time Motions with
 Modular Latent Generative Model and Smart Primitives", ACM TOG 45(4), 2026.
 
@@ -37,6 +54,9 @@ Third-party code inherited through upstream
   - licenses/MotionGPT-LICENSE.txt
 * vector-quantize-pytorch (multi-head codebook lookup), Copyright (c) 2020 Phil Wang,
   MIT License - licenses/vector-quantize-pytorch-LICENSE.txt
+* Two-bone IK (TargetPoseIKCorrector in runtime/target_pose.py and
+  src/runtime/target_pose.rs), derived through upstream from code by Daniel Holden,
+  Copyright (c) 2021 Daniel Holden, MIT License - licenses/Daniel-Holden-MIT-LICENSE.txt
 
 -------------------------------------------------------------------------------
 Bundled assets
@@ -51,13 +71,19 @@ files with their sizes and SHA-256 digests, copied from upstream
 tools/onnx/checksums.py (Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES,
 Apache-2.0). It is used to verify downloads; it contains no weights.
 
+model/motionbricks_mlx/assets/clips.sha256 lists four upstream sample clips with the
+sizes and SHA-256 digests of their Git LFS pointers. It is used to verify downloads;
+it contains no motion data.
+
 -------------------------------------------------------------------------------
 Not included, and not covered by this repository's license
 -------------------------------------------------------------------------------
 * MotionBricks model weights (huggingface.co/nvidia/MotionBricks) and the upstream
   ONNX models: NVIDIA Open Model Agreement. Users download them; this repository
   does not redistribute weights, converted weights, or ONNX files.
-* Upstream sample motion clips: NVIDIA Sample Data Evaluation License.
+* Upstream sample motion clips: NVIDIA Sample Data Evaluation License. The
+  download commands (motionbricks-mlx download --clips, download_weights.sh clips)
+  fetch them from upstream into checkpoints/motions; they are not redistributed.
 * Upstream robot assets: their respective licenses (e.g. Unitree, BSD-3-Clause).
 * Optional CuMetal toolchain (github.com/Lulzx/cuda-metal, Apache-2.0), built
   locally by sandbox/native/install_cumetal.sh from a pinned source release.

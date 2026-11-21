@@ -12,6 +12,10 @@ golden parity tests against NVIDIA's PyTorch model as the Python port.
 The repository README explains when to use which. The Metal runtime is tied to this model
 implementation and to Apple-silicon GPUs, in exchange for the lowest latency.
 
+Both also run upstream's **Runtime API** (`motionbricks_rs::runtime`). It provides engines,
+endpoint correction, tokens, animation buffers, the motion recorder, motion players, target
+placement, IK pins, and BVH/CSV clips. See [Runtime API](#runtime-api).
+
 ## Build, test, run
 
 Neither runtime needs Python or the sandbox:
@@ -21,12 +25,16 @@ scripts/download_weights.sh                # checkpoints into ../checkpoints/Mot
 cargo build --release                      # first build compiles MLX (~6 min); needs Xcode + its Metal toolchain
 cargo run --release --example generate_metal -- unitree_g1 ../checkpoints/MotionBricks/g1 8 bfloat16
 cargo run --release --example generate       -- soma ../checkpoints/MotionBricks/soma 8 int8
-cargo test --release -- --test-threads=1   # 64 tests; the 16 parity tests also need the sandbox's golden fixtures
+cargo test --release -- --test-threads=1   # 88 tests; the parity tests also need the sandbox's fixtures
 ```
 
 - **Weights:** `download_weights.sh [all|soma|unitree_g1] [dir]` reads the same checksum table as
   the Python port's `motionbricks-mlx download`
   (`../model/motionbricks_mlx/assets/checkpoints.sha256`).
+- **Clips:** `download_weights.sh clips [dir]` fetches the Runtime API examples' four sample clips
+  into `../checkpoints/motions`. They come from upstream's Git LFS at the pinned commit and are
+  verified against `../model/motionbricks_mlx/assets/clips.sha256`. They are NVIDIA sample data
+  under the NVIDIA Sample Data Evaluation License.
 - **Requests:** the examples take a batch size, which builds a synthetic request with
   `motionbricks_rs::examples` (the Rust version of the Python generator), or a request `.npz`.
 - **Benchmarks** compare against Python on byte-identical `.npz` requests, so they need the Python
@@ -50,6 +58,33 @@ motionbricks_rs::convert("soma", "checkpoints/MotionBricks/soma", "weights/soma.
 which the mlx-rs port needs, in `target/mlx-metal/`. The Metal runtime compiles its own kernels
 when a model is loaded and needs nothing from MLX at run time. It still loads the checkpoints and
 quantizes INT8 weights with mlx-rs.
+
+## Runtime API
+
+`motionbricks_rs::runtime` ports upstream's Runtime API with the same behavior as the Python port's
+`motionbricks_mlx.runtime`. Its engines run on a `Backend`: `MetalModel` (any precision),
+`runtime::MlxBackend` (the mlx-rs port), or your own implementation.
+
+```rust
+use motionbricks_rs::{metal::model::MetalModel, runtime::*};
+let model = MetalModel::from_checkpoints_with("unitree_g1", "../checkpoints/MotionBricks/g1", 1, "bfloat16")?;
+let engine = MotionBricksUnitreeG1Engine::new(Some(model), model_to_runtime(ModelRig::UnitreeG1))?;
+let mut player = GeneratedDofMotionPlayer::new(engine, reference_joint_q, 32)?;
+player.seed_history_from_pose(&start_joint_q)?;
+player.generate(&place_target_dof(ground, direction, &jog), &TargetPoseInferenceParams::new(4, 4), None)?;
+let (joint_q, foot_contacts) = player.sample(1.0 / 60.0)?;   // each update: sample, change, record
+player.record_pose(1.0 / 60.0, &joint_q)?;
+```
+
+```sh
+scripts/download_weights.sh clips
+cargo run --release --example generate_once   -- soma bfloat16
+cargo run --release --example locomotion_loop -- unitree_g1 float32
+```
+
+On the Metal runtime, a whole generation (encode, inference, decode, endpoint correction) takes
+about 7 ms in FP32 and 5 ms in BF16 at batch 1. `locomotion_loop` makes 13 generations in 9 s of
+steered motion. The guide is [docs/runtime_api.md](docs/runtime_api.md).
 
 ## 1. How MLX and mlx-c execute one generation
 
@@ -204,8 +239,10 @@ same requests, checks and tolerances:
 | `tests/metal_model.rs` (Metal) | `test_model.py` | the same, with "chunked commits = one command buffer, runs repeat bitwise" for compiled = eager and "oversized batches are refused" for multi-step decoding, which the release-only plan doesn't run; × 2 models | checkpoints |
 | `tests/layers.rs` (mlx-rs) | `test_layers.py` | sincos table, transformer layer vs float64 PyTorch semantics (fused and fallback attention), ResConv masking and residual, decoder shapes and target override, codebook lookup and digits, rotation round trips, root integration, FP16/BF16 attention, rig kernels vs ops | nothing |
 | `tests/metal_kernels.rs` (Metal) | none (Python runs MLX's kernels) | every `gemm_mma` loader and epilogue under all 33 tile/split plans (442 launches) vs a CPU reference; FP16/BF16 GEMMs; a transformer layer in all 4 precisions with both attention kernels vs float64 | nothing |
+| `tests/runtime.rs` (Runtime API) | `test_runtime.py` | 6 weight-free (transforms, tokens, recorder resampling, buffer sampling, config, player timing with a fixed backend); 13 parity with upstream's runtime code (encode, decode + endpoint correction, clips, recorder, target placement and speed, buffer sampling and looping, × 2 models, plus IK pins); 4 end to end (Metal and mlx-rs × 2 models), each over all 4 recorded generations | weight-free: nothing; parity: the runtime fixtures and clips; end to end: also checkpoints |
 
-`MOTIONBRICKS_CHECKPOINTS` and `MOTIONBRICKS_GOLDEN` override the locations. Tests whose inputs
+`MOTIONBRICKS_CHECKPOINTS`, `MOTIONBRICKS_GOLDEN`, `MOTIONBRICKS_RUNTIME_GOLDEN` and
+`MOTIONBRICKS_CLIPS` override the locations. Tests whose inputs
 are missing print `SKIPPED` and pass, because Rust's harness has no skip state.
 
 Porting `test_compiled_equals_eager` exposed a real difference: in the mlx-rs port (and only
@@ -305,10 +342,12 @@ and the paired speedup. Per-round ranges, GPU times and the mlx-rs port are in
 | `src/metal/transformer.rs` | GEMM planning (tuned table, fitted rule, split-K, kernel specialization), INT8 weights, transformer stack |
 | `src/metal/plans/apple_m4_pro.txt` | tuned GEMM plans for the M4 Pro |
 | `src/metal/model.rs` | weights, buffers, and the per-stage encoders of a generation |
+| `src/runtime/` | the Runtime API: `math` (Warp-convention transforms), `contract`, `animation`, `tokens`, `engine` (`Backend`, both engines), `player`, `target_pose` (incl. two-bone IK), `io` (BVH, CSV, spaces) |
 | `src/*.rs` | the mlx-rs port (`config`, `weights` incl. `save_converted`, `layers` incl. INT8 `Linear`, `networks`, `representation`, `inference`, `rig`, `model`); `kernels.rs` runs the shared rig kernels; `examples.rs` builds synthetic requests |
-| `tests/` | see [Correctness](#4-correctness): `parity.rs`, `model.rs`, `layers.rs` (mlx-rs port); `metal_parity.rs`, `metal_model.rs`, `metal_kernels.rs` (Metal runtime); `common/` (shared helpers, float64 references) |
-| `scripts/download_weights.sh` | checkpoint download + SHA-256 verification without Python |
-| `examples/` | `generate_metal.rs`, `generate.rs`: one generation from a batch size or a request `.npz` |
+| `tests/` | see [Correctness](#4-correctness): `parity.rs`, `model.rs`, `layers.rs` (mlx-rs port); `metal_parity.rs`, `metal_model.rs`, `metal_kernels.rs` (Metal runtime); `runtime.rs` (Runtime API); `common/` (shared helpers, float64 references) |
+| `scripts/download_weights.sh` | checkpoint and sample-clip download + SHA-256 verification without Python |
+| `examples/` | `generate_metal.rs`, `generate.rs`: one generation from a batch size or a request `.npz`; `generate_once.rs`, `locomotion_loop.rs` (+ `support/runtime_rig.rs`): upstream's Runtime API examples |
+| `docs/runtime_api.md` | the Runtime API guide |
 | `src/bin/` | `mbrs-bench` (benchmark); development tools: `gemm-tune` (replay and tune every GEMM launch, write plan tables), `gemm-shapes` (list a generation's GEMMs), `gemm-sweep`, `metal-stages`, `metal-precision` (FP16/BF16/INT8 vs FP32 per stage), `proto-transformer`, `metal-debug` |
 | `bench/` | interleaved Python-vs-Rust harness (`run_all.sh`, `report_metal.py`), `quick_compare.py` (one paired pass), reports and raw results |
 
@@ -322,5 +361,6 @@ and the paired speedup. Per-round ranges, GPU times and the mlx-rs port are in
 - [Kernel fusion in MLX: what `mx.compile` and `mx.fast.*` do](https://nipunbatra.github.io/blog/posts/2026-04-25-mlx-kernel-fusion.html)
 
 License: Apache-2.0, like the repository. The rig assets embedded with `include_bytes!` are
-NVIDIA's (Apache-2.0). `gemm_mma` follows the tiling scheme of MLX's steel GEMM (MIT). mlx-rs is
+NVIDIA's (Apache-2.0). The two-bone IK in `src/runtime/target_pose.rs` derives, through upstream,
+from Daniel Holden's MIT-licensed code (`../licenses/Daniel-Holden-MIT-LICENSE.txt`). `gemm_mma` follows the tiling scheme of MLX's steel GEMM (MIT). mlx-rs is
 MIT or Apache-2.0.

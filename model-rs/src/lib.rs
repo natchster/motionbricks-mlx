@@ -22,6 +22,7 @@ pub mod npy;
 pub mod ops;
 pub mod representation;
 pub mod rig;
+pub mod runtime;
 pub mod weights;
 
 pub use model::{MotionBricks, compiled, convert, parse_dtype};

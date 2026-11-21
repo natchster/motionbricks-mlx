@@ -20,8 +20,11 @@ context + target poses ──► [G1: forward kinematics | SOMA: T-pose retarget
 
 The tensor interface is **identical to the ONNX models** (same names, shapes and INT32 masks),
 so code written against ONNX Runtime or TensorRT can switch by swapping the session object.
-The Warp/TensorRT *runtime* is not ported: the playback engines, Newton viewer, editors and
-endpoint correction are application code built around this graph.
+
+Upstream's **Runtime API** is ported too, as `motionbricks_mlx.runtime`. It is the library that
+turns single generations into continuous character motion: engines, endpoint correction, tokens,
+animation buffers, the motion recorder, motion players, target placement, IK pins and clip loading.
+The viewer, editors and demo apps are not ported. See [Runtime API](#runtime-api).
 
 | | SOMA | Unitree G1 |
 |---|---|---|
@@ -64,6 +67,42 @@ uv run --package motionbricks-mlx motionbricks-mlx convert  --model soma --check
 checks every file against upstream's size and SHA-256 table (`assets/checkpoints.sha256`) and skips
 files that are already verified. `--model soma|unitree_g1` and `--dir PATH` narrow or move it. The
 weights are licensed under the NVIDIA Open Model Agreement and are not part of this repository.
+`--clips` (or `--only-clips`) also fetches the four sample clips used by the Runtime API examples
+into `checkpoints/motions`. They come from upstream's Git LFS at the pinned commit, are verified
+against `assets/clips.sha256`, and are NVIDIA sample data under the NVIDIA Sample Data Evaluation
+License.
+
+## Runtime API
+
+`motionbricks_mlx.runtime` keeps upstream's names and behavior, with NumPy poses and MLX inference
+in place of Warp arrays and TensorRT:
+
+```python
+import motionbricks_mlx as mb
+from motionbricks_mlx import runtime as rt
+
+clip_path = "checkpoints/motions/soma/locomotion/bs_1d_linear/Neutral_walk_forward_002__A057.bvh"
+skeleton = rt.load_skeleton_from_bvh(clip_path, remove_root=True)   # Hips-rooted, no USD needed
+clip = rt.load_bvh(clip_path, skeleton)
+with rt.MotionBricksSOMAEngine(mb.load("soma", "checkpoints/MotionBricks/soma", dtype="bfloat16"),
+                               model_to_runtime=rt.model_to_runtime("soma")) as engine:
+    player = rt.GeneratedMotionPlayer(engine, skeleton)
+    player.seed_history_from_pose(start_pose)
+    player.generate(target_poses, rt.TargetPoseInferenceParams(transition_early_by_frames=4))
+    player.sample(1 / 60, pose, foot_contacts)      # writes the next pose in place
+    player.record_pose(1 / 60, pose)                # record what you show, then chain
+```
+
+```sh
+uv run --package motionbricks-mlx motionbricks-mlx download --clips
+uv run --package motionbricks-mlx python model/examples/generate_once.py --model unitree_g1
+uv run --package motionbricks-mlx python model/examples/locomotion_loop.py --model soma --dtype bfloat16
+```
+
+The guide, adapted from upstream's `docs/runtime_api.md`, is
+[docs/runtime_api.md](docs/runtime_api.md). It covers engines, spaces, generation settings,
+chaining, players and the differences from upstream. The Rust port has the same API on its Metal
+runtime ([model-rs/docs/runtime_api.md](../model-rs/docs/runtime_api.md)).
 
 ## Design notes
 
@@ -99,8 +138,10 @@ weights are licensed under the NVIDIA Open Model Agreement and are not part of t
 | 10 weight-free unit tests (`test_layers.py`) | nothing | always run |
 | 20 behavioural tests (`test_model.py`) | the checkpoints (`motionbricks-mlx download`) | skipped |
 | 40 parity tests (`test_parity.py`) | the golden fixtures from NVIDIA's PyTorch model (`sandbox/setup.sh`) | skipped |
+| 39 Runtime API tests (`test_runtime.py`): 6 weight-free, 25 parity with upstream's runtime, 8 end to end | weight-free: nothing; parity: the runtime fixtures (`sandbox/setup.sh`) and the clips (`download --clips`); end to end: also the checkpoints | skipped |
 
-`MOTIONBRICKS_CHECKPOINTS` and `MOTIONBRICKS_GOLDEN` point the tests at other locations. The parity
+`MOTIONBRICKS_CHECKPOINTS`, `MOTIONBRICKS_GOLDEN`, `MOTIONBRICKS_RUNTIME_GOLDEN` and
+`MOTIONBRICKS_CLIPS` point the tests at other locations. The parity
 tests compare against NVIDIA's own PyTorch implementation, using golden fixtures recorded by
 `sandbox/scripts/make_golden.py`. Every sub-network is **teacher-forced** with the exact tensors the
 PyTorch run produced, so an error localizes to one module.
@@ -126,6 +167,14 @@ Other tests cover:
 - converted-file round trips and multi-step MaskGIT decoding;
 - FP16, BF16 and INT8 durations against FP32;
 - the custom rig kernels against the op-based reference implementation.
+
+The Runtime API tests compare with upstream's own runtime code.
+`sandbox/scripts/make_runtime_golden.py` runs upstream's engine methods, recorder, target helpers,
+IK corrector and clip loaders on Warp's CPU backend, with NVIDIA's PyTorch model in place of
+TensorRT, for four generations per rig. Results:
+- Encoding, decoding, endpoint correction, clip loading, recorder resampling, target placement and
+  speed scaling, and buffer sampling and looping match within 2e-5, and IK pins within 5e-5.
+- End to end, every generation picks upstream's duration, and its poses stay within 3e-3.
 
 ## Performance (Mac mini 2024, Apple M4 Pro: 14-core CPU, 20-core GPU, 64 GB)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot bootstrap of the CUDA-emulation sandbox + reference oracle. Idempotent.
 #
-#   sandbox/setup.sh            # env, upstream @ pinned commit, checkpoints, ONNX export, golden fixtures
+#   sandbox/setup.sh            # env, upstream @ pinned commit, checkpoints, ONNX export, golden + runtime fixtures
 #   sandbox/setup.sh --no-golden --no-onnx
 #
 # Everything lands inside the repo (.venv/, sandbox/upstream/, sandbox/assets/,
@@ -34,6 +34,8 @@ fi
 if (( golden )); then
   echo "==> golden fixtures from the upstream PyTorch model"
   uv run --all-packages python sandbox/scripts/make_golden.py
+  echo "==> Runtime API fixtures from upstream's Warp kernels (CPU) and the PyTorch model"
+  uv run --all-packages python sandbox/scripts/make_runtime_golden.py
 fi
 
 echo "==> doctor"

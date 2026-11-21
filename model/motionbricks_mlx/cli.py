@@ -25,9 +25,12 @@ def _load(args):
 
 def cmd_download(args):
     models = ("soma", "unitree_g1") if args.model == "all" else (args.model,)
-    dest = hub.download(models, args.dir)
-    for model in models:
-        print(f"{model}: {hub.checkpoint_dir(model, dest)}")
+    if not args.only_clips:
+        dest = hub.download(models, args.dir)
+        for model in models:
+            print(f"{model}: {hub.checkpoint_dir(model, dest)}")
+    if args.clips or args.only_clips:
+        print(f"clips: {hub.download_clips(args.clips_dir)}")
 
 
 def cmd_convert(args):
@@ -77,6 +80,9 @@ def main(argv=None):
     p = sub.add_parser("download", help=f"download and verify the checkpoints ({hub.REPO} @ {hub.REVISION[:7]})")
     p.add_argument("--model", choices=("all", "soma", "unitree_g1"), default="all")
     p.add_argument("--dir", default="checkpoints/MotionBricks", help="destination (default: checkpoints/MotionBricks)")
+    p.add_argument("--clips", action="store_true", help="also fetch the sample clips the Runtime API examples use (~5 MB)")
+    p.add_argument("--only-clips", action="store_true", help="fetch only the sample clips")
+    p.add_argument("--clips-dir", default="checkpoints/motions", help="clip destination (default: checkpoints/motions)")
     p.set_defaults(func=cmd_download)
 
     p = sub.add_parser("convert", help="convert HF checkpoints into one MLX .safetensors file")
