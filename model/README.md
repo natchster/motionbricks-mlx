@@ -47,14 +47,16 @@ g1.quantize(bits=8)                                             # experimental: 
 From the command line:
 
 ```sh
-uv run motionbricks-mlx generate --model soma --checkpoints checkpoints/MotionBricks/soma --batch 4
-uv run motionbricks-mlx bench    --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 1 8 32
-uv run motionbricks-mlx convert  --model soma --checkpoints checkpoints/MotionBricks/soma --output weights/soma.safetensors
+uv run --package motionbricks-mlx motionbricks-mlx generate --model soma --checkpoints checkpoints/MotionBricks/soma --batch 4
+uv run --package motionbricks-mlx motionbricks-mlx bench    --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 1 8 32
+uv run --package motionbricks-mlx motionbricks-mlx convert  --model soma --checkpoints checkpoints/MotionBricks/soma --output weights/soma.safetensors
 ```
 
-Get the weights with `sandbox/setup.sh`, or `hf download nvidia/MotionBricks --local-dir
-checkpoints/MotionBricks`. They are licensed under the NVIDIA Open Model Agreement and are not
-part of this repository.
+`--package motionbricks-mlx` installs only this package (MLX + NumPy), not the sandbox. Get the
+weights with `sandbox/setup.sh`, or with `uv run --package motionbricks-mlx --extra hub hf download
+nvidia/MotionBricks --local-dir checkpoints/MotionBricks --revision
+3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`. They are licensed under the NVIDIA Open Model Agreement
+and are not part of this repository.
 
 ## Design notes
 

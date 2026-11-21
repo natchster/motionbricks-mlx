@@ -75,7 +75,7 @@ uv run --all-packages cudashim-doctor
 
 `setup.sh` does the following:
 
-1. `uv sync`, which installs Python 3.12, MLX, PyTorch (MPS), ONNX Runtime and Warp.
+1. `uv sync --all-packages`, which installs Python 3.12, MLX, PyTorch (MPS), ONNX Runtime and Warp.
 2. Clones NVlabs/motionbricks at the pinned v0.2.0 commit into `sandbox/upstream/`.
 3. Fetches the Git-LFS rig assets through GitHub's media endpoint and checks each one against
    its LFS pointer's SHA-256, so git-lfs isn't needed.

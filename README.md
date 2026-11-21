@@ -84,9 +84,11 @@ sandbox/setup.sh                                   # uv env, pinned upstream, ve
 uv run motionbricks-mlx generate --model unitree_g1 --checkpoints checkpoints/MotionBricks/g1 --batch 4
 ```
 
-Only the weights are required for inference: `uv sync`, then `hf download nvidia/MotionBricks
---local-dir checkpoints/MotionBricks --revision 3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`. The
-rest of `setup.sh` is for the tests and benchmarks (Part 3).
+Only the weights are required for inference. Without the sandbox (no PyTorch), that is
+`uv sync --package motionbricks-mlx --extra hub`, then `uv run --package motionbricks-mlx hf download
+nvidia/MotionBricks --local-dir checkpoints/MotionBricks --revision
+3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`. The rest of `setup.sh` is for the tests and benchmarks
+(Part 3).
 
 ```python
 import motionbricks_mlx as mb
