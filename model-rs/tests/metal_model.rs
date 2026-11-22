@@ -201,8 +201,8 @@ fn low_precision_tracks_fp32(name: &str) {
 fn converted_weights_round_trip(name: &str) {
     let _gpu = gpu_lock();
     let Some(original) = load(name, "float32") else { return };
-    let dir = TempDir::new(&format!("metal-test-{name}"));
-    let path = convert(name, checkpoints(name).unwrap(), dir.0.join("w.safetensors"), mlx_rs::Dtype::Float32).unwrap();
+    let dir = temp_dir(&format!("metal-test-{name}"));
+    let path = convert(name, checkpoints(name).unwrap(), dir.path().join("w.safetensors"), mlx_rs::Dtype::Float32).unwrap();
     let reloaded = MetalModel::from_converted(&path, 32, "float32").unwrap();
     drop(dir);
     let request = request(name, 2, 4);

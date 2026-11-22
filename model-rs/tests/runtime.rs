@@ -392,7 +392,7 @@ fn skeletons_and_buffers_validate_their_layout() {
 }
 
 fn write_file(dir: &TempDir, name: &str, text: &str) -> PathBuf {
-    let path = dir.0.join(name);
+    let path = dir.path().join(name);
     std::fs::write(&path, text).unwrap();
     path
 }
@@ -421,7 +421,7 @@ Frame Time: 0.0333333
 
 #[test]
 fn bvh_loading_rejects_malformed_files() {
-    let dir = TempDir::new("runtime-bvh");
+    let dir = temp_dir("runtime-bvh");
     let path = write_file(&dir, "ok.bvh", SMALL_BVH);
     let clip = load_bvh(&path, None, true).unwrap();
     assert_eq!((clip.num_frames(), clip.sample_rate(), clip.skeleton().num_joints()), (2, 30.0, 2));
@@ -458,8 +458,8 @@ fn csv_round_trip_and_malformed_files() {
         }
     }
     let clip = DofAnimationBuffer::new(names.clone(), 120.0, poses, None, None).unwrap();
-    let dir = TempDir::new("runtime-csv");
-    let path = dir.0.join("round.csv");
+    let dir = temp_dir("runtime-csv");
+    let path = dir.path().join("round.csv");
     save_csv(&path, &clip).unwrap();
     let back = load_csv(&path, CSV_SAMPLE_RATE).unwrap();
     assert_eq!(back.joint_names(), names.as_slice());
@@ -478,6 +478,12 @@ fn csv_round_trip_and_malformed_files() {
     {
         assert!(load_csv(write_file(&dir, &format!("bad{k}.csv"), text), CSV_SAMPLE_RATE).is_err(), "case {k}");
     }
+    // Accepted formatting: a UTF-8 BOM, a quoted header field, padded fields, blank and whitespace lines.
+    let quoted = header.replacen("root_translateX", "\"root_translateX\"", 1);
+    let text = format!("\u{feff}{quoted}\n\n{}\n   \n{}\n", row(" 1 "), row("2"));
+    let loose = load_csv(write_file(&dir, "loose.csv", &text), CSV_SAMPLE_RATE).unwrap();
+    assert_eq!(loose.num_frames(), 2);
+    assert!(loose.joint_names().iter().eq(UNITREE_G1_JOINT_NAMES.iter()));
 }
 
 /// A backend of either rig that predicts `tokens` tokens of a still pose (no weights needed).

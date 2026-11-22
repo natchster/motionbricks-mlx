@@ -231,22 +231,32 @@ fn euler_xyz_extrinsic_from_quat(q: Quat) -> [f64; 3] {
 }
 
 /// Load a robot motion CSV (cm, extrinsic XYZ degrees, joint degrees) as joint coordinates
-/// (m, XYZW quaternion, radians), keeping the file's joint column order.
+/// (m, XYZW quaternion, radians), keeping the file's joint column order. Fields are trimmed;
+/// blank lines and a UTF-8 BOM are skipped.
 pub fn load_csv(path: impl AsRef<Path>, sample_rate: f32) -> Result<DofAnimationBuffer> {
     let path = path.as_ref();
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let mut lines = text.trim_start_matches('\u{feff}').lines().filter(|l| !l.trim().is_empty());
-    let header = split_csv_header(lines.next().context("empty CSV")?);
+    let mut reader = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_path(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let header: Vec<String> = reader.headers().with_context(|| format!("reading {}", path.display()))?.iter().map(str::to_string).collect();
     if header.len() <= CSV_ROOT_TITLE.len() || header[..CSV_ROOT_TITLE.len()] != CSV_ROOT_TITLE {
         bail!("{}: expected the columns Frame and root_translateX to root_rotateZ, then one column per joint angle", path.display());
     }
     let names: Vec<String> = header[CSV_ROOT_TITLE.len()..].to_vec();
     let nc = ROOT_COORDINATE_COUNT + names.len();
     let mut poses = Vec::new();
-    for (row_index, line) in lines.enumerate() {
-        let row: Vec<f64> = line
-            .split(',')
-            .map(|v| v.trim().parse::<f64>().with_context(|| format!("{}: motion row {}: {v:?} is not a number", path.display(), row_index + 1)))
+    let mut record = csv::StringRecord::new();
+    let mut row_index = 0;
+    while reader.read_record(&mut record).with_context(|| format!("reading {}", path.display()))? {
+        if record.len() == 1 && record[0].is_empty() {
+            continue; // a line of whitespace
+        }
+        row_index += 1;
+        let row: Vec<f64> = record
+            .iter()
+            .map(|v| v.parse::<f64>().with_context(|| format!("{}: motion row {row_index}: {v:?} is not a number", path.display())))
             .collect::<Result<_>>()?;
         if row.len() != header.len() {
             bail!("{}: row width does not match the CSV header", path.display());
@@ -271,49 +281,26 @@ pub fn load_csv(path: impl AsRef<Path>, sample_rate: f32) -> Result<DofAnimation
     DofAnimationBuffer::new(names, sample_rate, poses, None, None)
 }
 
-/// The fields of a CSV header line, trimmed, with double-quoted fields unquoted (as Python's `csv`).
-fn split_csv_header(line: &str) -> Vec<String> {
-    let (mut fields, mut field, mut quoted) = (Vec::new(), String::new(), false);
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' if quoted && chars.peek() == Some(&'"') => {
-                field.push('"');
-                chars.next();
-            }
-            '"' => quoted = !quoted,
-            ',' if !quoted => fields.push(std::mem::take(&mut field).trim().to_string()),
-            _ => field.push(ch),
-        }
-    }
-    fields.push(field.trim().to_string());
-    fields
-}
-
-/// A CSV field, quoted when it holds a comma, quote or line break (as Python's `csv`).
-fn csv_field(s: &str) -> String {
-    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
-}
-
-/// Write the frames in use of `buffer` as a robot motion CSV.
+/// Write the frames in use of `buffer` as a robot motion CSV (fields quoted only when needed).
 pub fn save_csv(path: impl AsRef<Path>, buffer: &DofAnimationBuffer) -> Result<()> {
     if buffer.num_frames() == 0 {
         bail!("buffer must contain at least one frame in use");
     }
-    let mut out = String::new();
-    out.push_str(&CSV_ROOT_TITLE.iter().copied().chain(buffer.joint_names().iter().map(String::as_str)).map(csv_field).collect::<Vec<_>>().join(","));
-    out.push('\n');
+    let path = path.as_ref();
+    let mut out = csv::Writer::from_path(path).with_context(|| format!("writing {}", path.display()))?;
+    out.write_record(CSV_ROOT_TITLE.iter().copied().chain(buffer.joint_names().iter().map(String::as_str)))?;
+    let mut row = Vec::new();
     for f in 0..buffer.num_frames() {
         let q = buffer.frame(f);
         let e = euler_xyz_extrinsic_from_quat([q[3], q[4], q[5], q[6]]);
-        let mut row = vec![f.to_string()];
+        row.clear();
+        row.push(f.to_string());
         row.extend(q[..3].iter().map(|v| (v * 100.0).to_string()));
         row.extend(e.iter().map(|v| v.to_degrees().to_string()));
         row.extend(q[ROOT_COORDINATE_COUNT..].iter().map(|v| v.to_degrees().to_string()));
-        out.push_str(&row.join(","));
-        out.push('\n');
+        out.write_record(&row)?;
     }
-    std::fs::write(path, out)?;
+    out.flush().with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

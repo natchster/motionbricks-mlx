@@ -156,8 +156,9 @@ impl Buf {
         unsafe { std::ptr::copy_nonoverlapping(self.ptr(), out.as_mut_ptr(), out.len()) };
         out
     }
-    /// Copy of the first `n` 4-byte elements (bounds-checked; one allocation, one copy).
-    fn read_words<W: Copy>(&self, n: usize) -> Vec<W> {
+    /// Copy of the first `n` 4-byte elements (bounds-checked; one allocation, one copy). `W: Pod`
+    /// makes any bit pattern the GPU wrote a valid `W`.
+    fn read_words<W: bytemuck::Pod>(&self, n: usize) -> Vec<W> {
         assert!(n <= self.len, "read past buffer end ({n} > {} elements)", self.len);
         assert_eq!(std::mem::size_of::<W>(), self.elem);
         let mut out = Vec::<W>::with_capacity(n);
@@ -192,8 +193,7 @@ impl Buf {
             k => panic!("write_f32 on a {k:?} buffer"),
         };
         if p == Precision::F32 {
-            let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
-            self.write_bytes(offset * 4, bytes);
+            self.write_bytes(offset * 4, bytemuck::cast_slice(data));
         } else {
             self.write_bytes(offset * self.elem, &p.encode(data));
         }
@@ -214,8 +214,7 @@ impl Buf {
     /// Write int32 values at the start of an int32 buffer.
     pub fn write_i32(&self, data: &[i32]) {
         assert_eq!(self.kind, Elem::I32, "write_i32 on a {:?} buffer", self.kind);
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
-        self.write_bytes(0, bytes);
+        self.write_bytes(0, bytemuck::cast_slice(data));
     }
 }
 
@@ -267,7 +266,7 @@ impl GpuInfo {
                 anyhow::ensure!(n > 0, "MB_GPU_CORES must be a positive integer, got {v:?}");
                 (n, "MB_GPU_CORES")
             }
-            _ => match iokit::gpu_core_count() {
+            _ => match ioregistry_gpu_core_count() {
                 Some(n) => (n, "IORegistry"),
                 None => (REFERENCE_GPU_CORES, "default"),
             },
@@ -284,58 +283,25 @@ impl GpuInfo {
 }
 
 /// The GPU core count from the IORegistry (`AGXAccelerator` service, `gpu-core-count` property).
-mod iokit {
-    use std::ffi::{c_char, c_void};
+fn ioregistry_gpu_core_count() -> Option<usize> {
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFRetained, CFString};
+    use objc2_io_kit::{IOObjectRelease, IORegistryEntryCreateCFProperty, IOServiceGetMatchingService, IOServiceMatching, kIOMainPortDefault};
 
-    type CFTypeRef = *const c_void;
-
-    #[link(name = "IOKit", kind = "framework")]
-    unsafe extern "C" {
-        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
-        fn IOServiceGetMatchingService(main_port: u32, matching: *mut c_void) -> u32;
-        fn IORegistryEntryCreateCFProperty(entry: u32, key: CFTypeRef, allocator: CFTypeRef, options: u32) -> CFTypeRef;
-        fn IOObjectRelease(object: u32) -> i32;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFStringCreateWithCString(allocator: CFTypeRef, string: *const c_char, encoding: u32) -> CFTypeRef;
-        fn CFGetTypeID(cf: CFTypeRef) -> usize;
-        fn CFNumberGetTypeID() -> usize;
-        fn CFNumberGetValue(number: CFTypeRef, number_type: isize, value: *mut c_void) -> bool;
-        fn CFRelease(cf: CFTypeRef);
-    }
-
-    const UTF8: u32 = 0x0800_0100; // kCFStringEncodingUTF8
-    const SINT64: isize = 4; // kCFNumberSInt64Type
-
-    pub fn gpu_core_count() -> Option<usize> {
-        // SAFETY: plain IOKit/CoreFoundation calls; every object created here is released here.
-        // IOServiceGetMatchingService consumes the matching dictionary. Main port 0 is the default.
-        unsafe {
-            let matching = IOServiceMatching(c"AGXAccelerator".as_ptr());
-            if matching.is_null() {
-                return None;
-            }
-            let service = IOServiceGetMatchingService(0, matching);
-            if service == 0 {
-                return None;
-            }
-            let key = CFStringCreateWithCString(std::ptr::null(), c"gpu-core-count".as_ptr(), UTF8);
-            let value = if key.is_null() { std::ptr::null() } else { IORegistryEntryCreateCFProperty(service, key, std::ptr::null(), 0) };
-            if !key.is_null() {
-                CFRelease(key);
-            }
-            IOObjectRelease(service);
-            if value.is_null() {
-                return None;
-            }
-            let mut n: i64 = 0;
-            let ok = CFGetTypeID(value) == CFNumberGetTypeID() && CFNumberGetValue(value, SINT64, (&mut n as *mut i64).cast());
-            CFRelease(value);
-            (ok && n > 0).then_some(n as usize)
+    // SAFETY: IOServiceMatching gets a NUL-terminated name; IOServiceGetMatchingService consumes a
+    // reference to the matching dictionary; the service is released below and the CF objects
+    // release themselves.
+    let value = unsafe {
+        let matching = IOServiceMatching(c"AGXAccelerator".as_ptr())?;
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, Some(CFRetained::<CFDictionary>::from(&*matching)));
+        if service == 0 {
+            return None;
         }
-    }
+        let value = IORegistryEntryCreateCFProperty(service, Some(&CFString::from_static_str("gpu-core-count")), None, 0);
+        IOObjectRelease(service);
+        value?
+    };
+    let n = value.downcast::<CFNumber>().ok()?.as_i64()?;
+    usize::try_from(n).ok().filter(|&n| n > 0)
 }
 
 /// Device, queue, kernel libraries and a pipeline cache. Cheap to clone (shared handles).
@@ -455,8 +421,7 @@ impl Gpu {
     /// A raw 32-bit buffer (packed INT8 weights).
     pub fn upload_u32(&self, data: &[u32]) -> Buf {
         let b = self.alloc(data.len(), Elem::U32);
-        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) };
-        b.write_bytes(0, bytes);
+        b.write_bytes(0, bytemuck::cast_slice(data));
         b
     }
 
@@ -504,20 +469,6 @@ pub enum Arg<'a> {
     /// Buffer and *element* offset.
     Buf(&'a Buf, usize),
     Bytes(&'a [u8]),
-}
-
-/// Plain-old-data kernel parameters: `Copy`, no padding, no pointers, so every byte is initialized.
-///
-/// # Safety
-/// Implement only for types whose every byte is initialized (no padding) and that hold no references.
-pub(crate) unsafe trait Pod: Copy + 'static {}
-unsafe impl Pod for i32 {}
-unsafe impl Pod for u32 {}
-unsafe impl Pod for f32 {}
-unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
-
-pub(crate) fn as_bytes<T: Pod>(v: &T) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
 impl Recorder {

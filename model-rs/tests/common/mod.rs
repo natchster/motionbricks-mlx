@@ -113,21 +113,11 @@ pub fn tracks_fp32(fp32_tokens: &[i32], low_tokens: &[i32], fp32_motion: &[f32],
     }
 }
 
-/// A fresh temporary directory, removed when dropped (also when the test panics).
-pub struct TempDir(pub PathBuf);
+pub use tempfile::TempDir;
 
-impl TempDir {
-    pub fn new(label: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("motionbricks-rs-{label}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).ok();
-    }
+/// A fresh, uniquely named temporary directory, removed when dropped (also when the test panics).
+pub fn temp_dir(label: &str) -> TempDir {
+    tempfile::Builder::new().prefix(&format!("motionbricks-rs-{label}-")).tempdir().expect("create temp dir")
 }
 
 /// One `#[test]` per function and model: `mod unitree_g1 { fn t() }` and `mod soma { fn t() }`.
@@ -228,16 +218,15 @@ pub fn check_end_to_end(
     }
 }
 
-/// Seeded uniform values in [-scale, scale) for weight-free tests.
-pub struct Rand(u64);
+/// Seeded uniform values in [-scale, scale) for weight-free tests (the requests' PCG32 generator).
+pub struct Rand(examples::Rng);
 
 impl Rand {
     pub fn new(seed: u64) -> Self {
-        Rand(seed.wrapping_mul(0x9E3779B97F4A7C15) | 1)
+        Rand(examples::Rng::new(seed))
     }
     pub fn next(&mut self) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        ((self.0 >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        self.0.uniform(-1.0, 1.0)
     }
     pub fn vec(&mut self, n: usize, scale: f32) -> Vec<f32> {
         (0..n).map(|_| self.next() * scale).collect()

@@ -141,8 +141,8 @@ fn converted_weights_round_trip(name: &str) {
     let _gpu = gpu_lock();
     let Some(original) = load(name, "float32") else { return };
     let original = Rc::new(original);
-    let dir = TempDir::new(&format!("test-{name}"));
-    let path = convert(name, checkpoints(name).unwrap(), dir.0.join("w.safetensors"), Dtype::Float32).unwrap();
+    let dir = temp_dir(&format!("test-{name}"));
+    let path = convert(name, checkpoints(name).unwrap(), dir.path().join("w.safetensors"), Dtype::Float32).unwrap();
     let reloaded = Rc::new(MotionBricks::from_converted(&path, Dtype::Float32).unwrap());
     drop(dir);
     let request = request(name, 2, 4);

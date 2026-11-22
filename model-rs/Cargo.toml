@@ -15,10 +15,21 @@ half = "2"
 anyhow = "1"
 libc = "0.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+csv = "1"
+rand_pcg = "0.10"
+# Benchmark and development binaries: argument parsing and JSON reports.
+lexopt = "0.3"
+serde_json = "1"
 # Custom Metal runtime (src/metal): direct bindings, no MLX in the hot path.
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-metal = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBase", "CFDictionary", "CFNumber", "CFString"] }
+objc2-io-kit = { version = "0.3", default-features = false, features = ["std", "libc"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }
 
 [features]
 # Development binaries (metal-stages, metal-precision): `cargo run --release --features dev-tools --bin ...`.

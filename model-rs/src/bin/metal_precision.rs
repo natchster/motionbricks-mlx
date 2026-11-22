@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use common::{Argv, median};
+use common::{median, positionals};
 use motionbricks_rs::config::{Precision, checkpoint_dir, get_spec};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::{Buf, Recorder, wait};
@@ -30,9 +30,9 @@ fn stats(a: &[f32], b: &[f32]) -> (f64, f64) {
 }
 
 fn main() -> Result<()> {
-    let mut argv = Argv::from_env();
-    let name = get_spec(&argv.next().unwrap_or("soma".into()))?.name;
-    let prec = argv.next().unwrap_or("float16".into()).parse::<Precision>()?.name();
+    let mut args = positionals()?.into_iter();
+    let name = get_spec(&args.next().unwrap_or("soma".into()))?.name;
+    let prec = args.next().unwrap_or("float16".into()).parse::<Precision>()?.name();
     let golden = std::env::var_os("MOTIONBRICKS_GOLDEN").map(PathBuf::from).unwrap_or_else(|| {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../sandbox/golden")
     });

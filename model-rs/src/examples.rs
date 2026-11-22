@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use rand_pcg::Pcg32;
+use rand_pcg::rand_core::Rng as _;
 
 use crate::config::{self, Kind, get_spec};
 use crate::npy::{Npy, NpyData};
@@ -21,20 +23,17 @@ const CONTEXT_AND_TARGET: usize = config::CONTEXT_AND_TARGET as usize;
 const NUM_TOKEN_CHOICES: usize = config::NUM_TOKEN_CHOICES as usize;
 const QPOS: usize = config::G1_QPOS_DIM as usize;
 
-/// Seeded PCG32 with uniform and normal samples.
-pub struct Rng(u64);
+/// Seeded PCG32 ([`rand_pcg::Pcg32`]) with uniform and normal samples.
+pub struct Rng(Pcg32);
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        let mut r = Rng(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407));
-        r.next_u32();
-        r
+        // PCG's default stream, and the seeding of this generator's earlier hand-written version,
+        // so every seed keeps its values (pinned in `rng_is_pinned`).
+        Rng(Pcg32::new(seed.wrapping_mul(6364136223846793005), 0x0a02_bdbf_7bb3_c0a7))
     }
     pub fn next_u32(&mut self) -> u32 {
-        let old = self.0;
-        self.0 = old.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let xorshifted = (((old >> 18) ^ old) >> 27) as u32;
-        xorshifted.rotate_right((old >> 59) as u32)
+        self.0.next_u32()
     }
     /// Uniform in `[lo, hi)`.
     pub fn uniform(&mut self, lo: f32, hi: f32) -> f32 {

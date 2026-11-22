@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 The motionbricks-mlx Authors (see NOTICE).
 //! Helpers shared by the benchmark and the development binaries: order statistics and argument
-//! parsing that report bad input as errors instead of panicking.
+//! handling that report bad input as errors instead of panicking.
 #![allow(dead_code)]
 
 use std::fmt::Display;
 use std::str::FromStr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+use lexopt::ValueExt;
 
 /// Median (the mean of the two middle values for even lengths; NaN when empty). Sorts `v`.
 pub fn median(v: &mut [f64]) -> f64 {
@@ -36,54 +37,15 @@ where
     value.parse().map_err(|e| anyhow::anyhow!("invalid {what} {value:?}: {e}"))
 }
 
-/// Command-line arguments after the program name.
-pub struct Argv {
-    args: std::iter::Peekable<std::vec::IntoIter<String>>,
-}
-
-impl Argv {
-    pub fn from_env() -> Self {
-        Argv { args: std::env::args().skip(1).collect::<Vec<_>>().into_iter().peekable() }
-    }
-
-    pub fn next(&mut self) -> Option<String> {
-        self.args.next()
-    }
-
-    /// The value after `flag`.
-    pub fn value(&mut self, flag: &str) -> Result<String> {
-        self.args.next().with_context(|| format!("{flag} needs a value"))
-    }
-
-    pub fn parsed<T: FromStr>(&mut self, flag: &str) -> Result<T>
-    where
-        T::Err: Display,
-    {
-        let v = self.value(flag)?;
-        parse(&v, flag)
-    }
-
-    /// Every value after `flag` up to the next `--option` (at least one).
-    pub fn values<T: FromStr>(&mut self, flag: &str) -> Result<Vec<T>>
-    where
-        T::Err: Display,
-    {
-        let mut out = Vec::new();
-        while let Some(v) = self.args.next_if(|a| !a.starts_with("--")) {
-            out.push(parse(&v, flag)?);
+/// The positional arguments (an option is an error), for the tools that take no options.
+pub fn positionals() -> Result<Vec<String>> {
+    let mut parser = lexopt::Parser::from_env();
+    let mut out = Vec::new();
+    while let Some(arg) = parser.next()? {
+        match arg {
+            lexopt::Arg::Value(v) => out.push(v.string()?),
+            other => return Err(other.unexpected().into()),
         }
-        if out.is_empty() {
-            bail!("{flag} needs at least one value");
-        }
-        Ok(out)
     }
-
-    /// The remaining positional arguments parsed as `T` (`default` when there are none).
-    pub fn rest<T: FromStr + Clone>(&mut self, what: &str, default: &[T]) -> Result<Vec<T>>
-    where
-        T::Err: Display,
-    {
-        let out = self.args.by_ref().map(|v| parse(&v, what)).collect::<Result<Vec<T>>>()?;
-        Ok(if out.is_empty() { default.to_vec() } else { out })
-    }
+    Ok(out)
 }

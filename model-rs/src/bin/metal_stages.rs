@@ -14,7 +14,7 @@ mod common;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use common::{Argv, median};
+use common::{median, positionals};
 use motionbricks_rs::config::{Precision, checkpoint_dir};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::{Recorder, wait};
@@ -22,9 +22,10 @@ use motionbricks_rs::npy::load_npz;
 
 fn main() -> Result<()> {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut argv = Argv::from_env();
-    let prec = argv.next().unwrap_or("float32".into()).parse::<Precision>()?.name();
-    let batches: Vec<usize> = argv.rest("batch size", &[1, 32])?;
+    let mut args = positionals()?.into_iter();
+    let prec = args.next().unwrap_or("float32".into()).parse::<Precision>()?.name();
+    let batches = args.map(|v| common::parse(&v, "batch size")).collect::<Result<Vec<usize>>>()?;
+    let batches = if batches.is_empty() { vec![1, 32] } else { batches };
     for name in ["soma", "unitree_g1"] {
         let m = MetalModel::from_checkpoints_with(name, checkpoint_dir(name), 64, prec)?;
         for &batch in &batches {

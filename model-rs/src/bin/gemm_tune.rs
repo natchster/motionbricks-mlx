@@ -17,12 +17,13 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use common::Argv;
+use lexopt::ValueExt;
 use motionbricks_rs::config::{Precision, checkpoint_dir, get_spec};
 use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::transformer::{GemmCall, GemmParams, Plan, PlanKey, QWeight, TILES, Weight};
 use motionbricks_rs::metal::{Recorder, wait};
 use motionbricks_rs::npy::load_npz;
+use serde_json::json;
 
 /// The GEMM launches of one generation of `batch` requests, as the runtime logged them.
 fn launches(m: &MetalModel, batch: usize) -> Result<Vec<(GemmParams, bool)>> {
@@ -53,11 +54,14 @@ fn list(log: &[(GemmParams, bool)]) {
 }
 
 fn main() -> Result<()> {
-    let mut argv = Argv::from_env();
-    let mut positional = Vec::new();
-    let mut list_only = false;
-    while let Some(a) = argv.next() {
-        if a == "--list" { list_only = true } else { positional.push(a) }
+    let mut parser = lexopt::Parser::from_env();
+    let (mut list_only, mut positional) = (false, Vec::new());
+    while let Some(arg) = parser.next()? {
+        match arg {
+            lexopt::Arg::Long("list") => list_only = true,
+            lexopt::Arg::Value(v) => positional.push(v.string()?),
+            other => return Err(other.unexpected().into()),
+        }
     }
     let mut positional = positional.into_iter();
     let name = get_spec(&positional.next().unwrap_or("soma".into()))?.name;
@@ -158,13 +162,11 @@ fn main() -> Result<()> {
             all.sort_by(|a, b| a.0.total_cmp(&b.0));
             m.k.force = None;
             let best = *all.first().context("no GEMM plan applies to this launch")?;
-            dump.push(format!(
-                "{{\"batch\":{batch},\"count\":{count},\"m\":{mm},\"n\":{n},\"k\":{k},\"conv\":{},\"up\":{},\"concat\":{},\"q8\":{q8},\"plans\":[{}]}}",
-                p.conv_taps,
-                p.conv_up,
-                p.k1 > 0,
-                all.iter().map(|(v, pl)| format!("[{},{},{},{},{},{},{v:.2}]", pl.tile.bm, pl.tile.bn, pl.tile.bk, pl.tile.wm, pl.tile.wn, pl.splits)).collect::<Vec<_>>().join(",")
-            ));
+            let plans: Vec<_> = all.iter().map(|(v, pl)| json!([pl.tile.bm, pl.tile.bn, pl.tile.bk, pl.tile.wm, pl.tile.wn, pl.splits, v])).collect();
+            dump.push(json!({
+                "batch": batch, "count": count, "m": mm, "n": n, "k": k,
+                "conv": p.conv_taps, "up": p.conv_up, "concat": p.k1 > 0, "q8": q8, "plans": plans,
+            }));
             let key = PlanKey::of(&p, q8);
             table.push(format!("{}  # {:.1} us (heuristic {:.1} us)", key.line(gpu.prec, &best.1), best.0, heuristic));
             let c = count as f64;
@@ -196,7 +198,7 @@ fn main() -> Result<()> {
         }
     }
     if let Ok(path) = std::env::var("TUNE_JSON") {
-        std::fs::write(path, format!("[{}]", dump.join(",\n")))?;
+        std::fs::write(path, serde_json::to_string(&dump)?)?;
     }
     Ok(())
 }

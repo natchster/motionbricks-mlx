@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
-use common::{Argv, median, percentile};
+use common::{median, parse, percentile};
 use mlx_rs::Array;
 use mlx_rs::transforms::{async_eval, eval};
 use motionbricks_rs::config::{Precision, checkpoint_dir, get_spec};
@@ -73,19 +73,20 @@ fn parse_args() -> Result<Args> {
         json: None,
         runtime: "both".into(),
     };
-    let mut argv = Argv::from_env();
-    while let Some(flag) = argv.next() {
-        match flag.as_str() {
-            "--model" => a.model = argv.value(&flag)?,
-            "--checkpoints" => a.checkpoints = Some(argv.value(&flag)?.into()),
-            "--dtype" => a.dtype = argv.value(&flag)?,
-            "--iters" => a.iters = argv.parsed(&flag)?,
-            "--warmup" => a.warmup = argv.parsed(&flag)?,
-            "--stream" => a.stream = argv.parsed(&flag)?,
-            "--json" => a.json = Some(argv.value(&flag)?.into()),
-            "--batches" => a.batches = argv.values(&flag)?,
-            "--runtime" => a.runtime = argv.value(&flag)?,
-            other => bail!("unknown argument {other}"),
+    let mut p = lexopt::Parser::from_env();
+    while let Some(arg) = p.next()? {
+        use lexopt::prelude::*;
+        match arg {
+            Long("model") => a.model = p.value()?.string()?,
+            Long("checkpoints") => a.checkpoints = Some(p.value()?.into()),
+            Long("dtype") => a.dtype = p.value()?.string()?,
+            Long("iters") => a.iters = parse(&p.value()?.string()?, "--iters")?,
+            Long("warmup") => a.warmup = parse(&p.value()?.string()?, "--warmup")?,
+            Long("stream") => a.stream = parse(&p.value()?.string()?, "--stream")?,
+            Long("json") => a.json = Some(p.value()?.into()),
+            Long("batches") => a.batches = p.values()?.map(|v| parse(&v.string()?, "--batches")).collect::<Result<_>>()?,
+            Long("runtime") => a.runtime = p.value()?.string()?,
+            _ => return Err(arg.unexpected().into()),
         }
     }
     // Normalized names: "g1" -> "unitree_g1", "bf16" -> "bfloat16" (request files and report keys).
@@ -270,18 +271,8 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = args.json {
-        let mut s = String::from("{\n");
-        s += &format!("  \"runtime\": \"rust\", \"load_s\": {load_s:.3},\n  \"results\": {{\n");
-        let rows: Vec<String> = report
-            .iter()
-            .map(|(k, row)| {
-                let fields: Vec<String> = row.iter().map(|(f, v)| format!("\"{f}\": {v:.4}")).collect();
-                format!("    \"{k}\": {{{}}}", fields.join(", "))
-            })
-            .collect();
-        s += &rows.join(",\n");
-        s += "\n  }\n}\n";
-        std::fs::write(path, s)?;
+        let doc = serde_json::json!({"runtime": "rust", "load_s": load_s, "results": report});
+        std::fs::write(path, serde_json::to_string_pretty(&doc)? + "\n")?;
     }
     Ok(())
 }

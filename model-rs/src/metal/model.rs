@@ -17,10 +17,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use bytemuck::{Pod, Zeroable};
 
 use super::transformer::{ACT_LEAKY, ACT_RELU, GemmCall, GemmParams, Kernels, PARTIAL_MAX, Scratch, Transformer};
 use super::weights::{Conv, Decoder, FcBlock, Lin, Loader, Rig, rig, token_const};
-use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, Recorder, as_bytes};
+use super::{Arg, Buf, Gpu, Pipeline, Precision, Recorder};
 use crate::config::{self, FinalRootMode, Kind, ModelSpec, get_spec};
 use crate::npy::{Npy, NpyData};
 use crate::representation::MotionRepresentation;
@@ -56,7 +57,7 @@ const TF_FFN: usize = 2048;
 pub type Outputs = (Vec<f32>, Vec<i32>, Option<Vec<f32>>);
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Dims {
     pub b: i32,
     pub pd: i32,
@@ -70,8 +71,6 @@ pub struct Dims {
     pub forced: i32,
 }
 
-// SAFETY: all fields are i32 (no padding, no pointers).
-unsafe impl Pod for Dims {}
 
 /// Every intermediate of one generation, sized for `max_batch`.
 pub struct Bufs {
@@ -221,7 +220,7 @@ struct ConvOpts<'a> {
 
 /// Retarget launch parameters (`RetargetParams` in model.metal).
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct RetargetParams {
     rows: i32,
     ld: i32,
@@ -230,8 +229,6 @@ struct RetargetParams {
     copy_pos: i32,
 }
 
-// SAFETY: all fields are i32 (no padding, no pointers).
-unsafe impl Pod for RetargetParams {}
 
 pub struct MetalModel {
     pub gpu: Gpu,
@@ -589,21 +586,21 @@ impl MetalModel {
         let (b, n) = (&self.b, d.b as usize);
         let lp = match self.spec.kind {
             Kind::UnitreeG1 => {
-                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(as_bytes(d))];
+                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(bytemuck::bytes_of(d))];
                 rec.dispatch(&self.glue.g1_preprocess, &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
                 &b.lp_in
             }
             Kind::Soma => {
                 let j = self.spec.num_joints;
                 let p = RetargetParams { rows: (n * 8) as i32, ld: (self.pd - 1) as i32, col0: (j - 1) * 3, joints: j, copy_pos: 1 };
-                let args = [Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Bytes(as_bytes(&p)), Arg::Buf(&b.lp_rt, 0)];
+                let args = [Arg::Buf(&b.lp_in, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Bytes(bytemuck::bytes_of(&p)), Arg::Buf(&b.lp_rt, 0)];
                 self.launch(rec, &self.glue.soma_retarget, &args, n * 8 * j as usize);
                 &b.lp_rt
             }
         };
         let args = [
             Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(lp, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0),
-            Arg::Buf(&b.ln, 0), Arg::Buf(&b.pn, 0), Arg::Buf(&b.info, 0), Arg::Bytes(as_bytes(d)), Arg::Buf(&b.gn_t, 0),
+            Arg::Buf(&b.ln, 0), Arg::Buf(&b.pn, 0), Arg::Buf(&b.info, 0), Arg::Bytes(bytemuck::bytes_of(d)), Arg::Buf(&b.gn_t, 0),
             Arg::Buf(&b.ln_t, 0), Arg::Buf(&b.pn_t, 0),
         ];
         self.launch(rec, &self.glue.prep, &args, n * 8);
@@ -714,21 +711,21 @@ impl MetalModel {
         self.blend_linear(rec, &self.proj_global_root, &b.gn_t, rows, &b.x0, X0[0] + X0[1], X0_W, &b.hg, &self.no_global_root, 1);
         self.fcblock(rec, &self.fc_start, &b.x0, rows, &b.s);
         self.fcblock(rec, &self.fc_end, &b.x0, rows, &b.e);
-        let args = [Arg::Buf(&b.s, 0), Arg::Buf(&b.e, 0), Arg::Buf(&self.input_pos, 0), Arg::Buf(&self.query_emb, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.x1, 0), Arg::Buf(&b.fe, 0), Arg::Bytes(as_bytes(d))];
+        let args = [Arg::Buf(&b.s, 0), Arg::Buf(&b.e, 0), Arg::Buf(&self.input_pos, 0), Arg::Buf(&self.query_emb, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.x1, 0), Arg::Buf(&b.fe, 0), Arg::Bytes(bytemuck::bytes_of(d))];
         self.launch(rec, &self.glue.root_assemble, &args, n * 9 * E);
         self.shared.encode(&self.k, rec, &b.x1, None, n, 9, &b.tf);
         self.k.run(rec, &GemmCall::new(&b.x1, &self.logit_head.w, &self.logit_head.b, &b.log1, GemmParams::new(n * 9, 12, E)));
         let args = [
             Arg::Buf(&b.log1, 0), Arg::Buf(&b.allowed, 0), Arg::Buf(&b.nt_in, 0), Arg::Buf(&b.fe, 0), Arg::Buf(&self.middle_emb, 0),
             Arg::Buf(&self.root_pos, 0), Arg::Buf(&b.x2, 0), Arg::Buf(&b.pad2, 0), Arg::Buf(&b.nt, 0), Arg::Buf(&b.m16, 0),
-            Arg::Buf(&b.logits, 0), Arg::Bytes(as_bytes(d)), Arg::Buf(&b.m32, 0), Arg::Buf(&b.m64, 0), Arg::Buf(&b.ppad, 0),
+            Arg::Buf(&b.logits, 0), Arg::Bytes(bytemuck::bytes_of(d)), Arg::Buf(&b.m32, 0), Arg::Buf(&b.m64, 0), Arg::Buf(&b.ppad, 0),
             Arg::Buf(&self.input_pos, 0),
         ];
         self.launch(rec, &self.glue.root_second_input, &args, n * 25 * E);
         let args = [
             Arg::Buf(&b.fe, 0), Arg::Buf(&b.gn, 0), Arg::Buf(&b.hg, 0), Arg::Buf(&b.hl, 0), Arg::Buf(&b.hp, 0),
             Arg::Buf(&self.no_frame, 0), Arg::Buf(&b.nt, 0), Arg::Buf(&b.dframe, 0), Arg::Buf(&b.droot, 0), Arg::Buf(&b.dhas, 0),
-            Arg::Bytes(as_bytes(d)),
+            Arg::Bytes(bytemuck::bytes_of(d)),
         ];
         self.launch(rec, &self.glue.root_dense_cond, &args, n * 64 * E);
     }
@@ -738,7 +735,7 @@ impl MetalModel {
         let (b, n) = (&self.b, d.b as usize);
         self.root_token.encode(&self.k, rec, &b.x2, Some(&b.pad2), n, 25, &b.tf);
         let (p, w) = ([n as i32, 25, 16, 9], E as i32);
-        let args = [Arg::Buf(&b.x2, 0), Arg::Buf(&b.dec_in, 0), Arg::Bytes(as_bytes(&p)), Arg::Bytes(as_bytes(&w))];
+        let args = [Arg::Buf(&b.x2, 0), Arg::Buf(&b.dec_in, 0), Arg::Bytes(bytemuck::bytes_of(&p)), Arg::Bytes(bytemuck::bytes_of(&w))];
         self.launch(rec, &self.glue.copy_rows, &args, n * 16 * E);
         self.decoder(rec, &self.root_dec, n, &b.dec_in, &b.dframe, E, &b.droot, &b.dhas, &b.pr);
     }
@@ -749,7 +746,7 @@ impl MetalModel {
         let args = [
             Arg::Buf(&b.pr, 0), Arg::Buf(&b.nt, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.ln, 0), Arg::Buf(&b.hl, 0),
             Arg::Buf(&b.pn, 0), Arg::Buf(&b.hp, 0), Arg::Buf(&self.len_emb, 0), Arg::Buf(&b.ext, 0), Arg::Buf(&b.rcond, 0),
-            Arg::Buf(&b.pcond, 0), Arg::Buf(&b.hpc, 0), Arg::Buf(&b.le, 0), Arg::Bytes(as_bytes(d)),
+            Arg::Buf(&b.pcond, 0), Arg::Buf(&b.hpc, 0), Arg::Buf(&b.le, 0), Arg::Bytes(bytemuck::bytes_of(d)),
         ];
         self.launch(rec, &self.glue.root_to_pose, &args, n * 64);
     }
@@ -777,7 +774,7 @@ impl MetalModel {
         self.pose_tf.encode(&self.k, rec, &b.px, Some(&b.ppad), n, 16, &b.tf);
         let nl = self.p_logits.n;
         self.k.run(rec, &GemmCall::new(&b.px, &self.p_logits.w, &self.p_logits.b, &b.plog, GemmParams::new(n * 16, nl, POSE_E)));
-        let args = [Arg::Buf(&b.plog, 0), Arg::Buf(&self.codebook, 0), Arg::Buf(&b.tokens, 0), Arg::Buf(&b.lat, 0), Arg::Bytes(as_bytes(d))];
+        let args = [Arg::Buf(&b.plog, 0), Arg::Buf(&self.codebook, 0), Arg::Buf(&b.tokens, 0), Arg::Buf(&b.lat, 0), Arg::Bytes(bytemuck::bytes_of(d))];
         self.launch(rec, &self.glue.argmax_dequant, &args, n * 16 * self.spec.vq.num_heads as usize);
     }
 
@@ -793,21 +790,21 @@ impl MetalModel {
         let mode: i32 = (self.spec.final_root_mode == FinalRootMode::FromHeightConstraintViolation) as i32;
         let args = [
             Arg::Buf(&b.recon, 0), Arg::Buf(&b.pr, 0), Arg::Buf(&self.stats, 0), Arg::Buf(&b.gn, 0), Arg::Buf(&b.hg, 0),
-            Arg::Buf(&b.nt, 0), Arg::Buf(&b.info, 0), Arg::Buf(&b.out, 0), Arg::Bytes(as_bytes(d)), Arg::Bytes(as_bytes(&mode)),
+            Arg::Buf(&b.nt, 0), Arg::Buf(&b.info, 0), Arg::Buf(&b.out, 0), Arg::Bytes(bytemuck::bytes_of(d)), Arg::Bytes(bytemuck::bytes_of(&mode)),
         ];
         rec.dispatch(&self.glue.finish_root, &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
-        let args = [Arg::Buf(&b.recon, 0), Arg::Buf(&self.body_stats, 0), Arg::Buf(&b.out, 0), Arg::Bytes(as_bytes(d))];
+        let args = [Arg::Buf(&b.recon, 0), Arg::Buf(&self.body_stats, 0), Arg::Buf(&b.out, 0), Arg::Bytes(bytemuck::bytes_of(d))];
         self.launch(rec, &self.glue.body_out, &args, n * 64 * (self.ld - 4));
         match self.spec.kind {
             Kind::Soma => {
                 // In place on the output rows.
                 let j = self.spec.num_joints;
                 let p = RetargetParams { rows: (n * 64) as i32, ld: self.gd as i32, col0: 5 + (j - 1) * 3, joints: j, copy_pos: 0 };
-                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Bytes(as_bytes(&p)), Arg::Buf(&b.out, 0)];
+                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.soma_standard, 0), Arg::Buf(&self.rig.soma_capture, 0), Arg::Bytes(bytemuck::bytes_of(&p)), Arg::Buf(&b.out, 0)];
                 self.launch(rec, &self.glue.soma_retarget, &args, n * 64 * j as usize);
             }
             Kind::UnitreeG1 => {
-                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.qpos, 0), Arg::Buf(&b.contacts, 0), Arg::Bytes(as_bytes(d))];
+                let args = [Arg::Buf(&b.out, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.qpos, 0), Arg::Buf(&b.contacts, 0), Arg::Bytes(bytemuck::bytes_of(d))];
                 self.launch(rec, &self.glue.g1_postprocess, &args, n * 64);
             }
         }

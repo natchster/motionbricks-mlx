@@ -10,15 +10,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use bytemuck::{Pod, Zeroable};
 use mlx_rs::Array;
 use mlx_rs::ops::{QuantizeOptions, quantize};
 use objc2_metal::MTLComputePipelineState;
 
-use super::{Arg, Buf, Gpu, Pipeline, Pod, Precision, REFERENCE_GPU_CORES, Recorder, THREADGROUP_MEMORY, as_bytes};
+use super::{Arg, Buf, Gpu, Pipeline, Precision, REFERENCE_GPU_CORES, Recorder, THREADGROUP_MEMORY};
 use crate::ops::to_vec_f32;
 
 #[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
+#[derive(Clone, Copy, Default, Debug, Pod, Zeroable)]
 pub struct GemmParams {
     pub m: i32,
     pub n: i32,
@@ -48,8 +49,6 @@ pub struct GemmParams {
     pub r_mod: i32,
 }
 
-// SAFETY: all fields are i32 (no padding, no pointers).
-unsafe impl Pod for GemmParams {}
 
 impl GemmParams {
     /// Plain `Y[M, N] = A[M, K] Wᵀ + b` with contiguous rows.
@@ -59,7 +58,7 @@ impl GemmParams {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct AttnParams {
     b: i32,
     l: i32,
@@ -70,18 +69,14 @@ struct AttnParams {
     scale: f32,
 }
 
-// SAFETY: 4-byte fields only (no padding, no pointers).
-unsafe impl Pod for AttnParams {}
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct LnParams {
     d: i32,
     eps: f32,
 }
 
-// SAFETY: 4-byte fields only (no padding, no pointers).
-unsafe impl Pod for LnParams {}
 
 pub const ACT_NONE: i32 = 0;
 pub const ACT_RELU: i32 = 1;
@@ -503,7 +498,7 @@ impl Kernels {
             Arg::Buf(wd, 0),
             Arg::Buf(g.bias, 0),
             Arg::Buf(g.y.0, g.y.1),
-            Arg::Bytes(as_bytes(&p)),
+            Arg::Bytes(bytemuck::bytes_of(&p)),
             Arg::Buf(g.amask.unwrap_or(d), 0),
             Arg::Buf(rb, roff),
             Arg::Buf(g.a2.unwrap_or(dt), 0),
@@ -521,7 +516,7 @@ impl Kernels {
                 Arg::Buf(&self.partial, 0),
                 Arg::Buf(g.bias, 0),
                 Arg::Buf(g.y.0, g.y.1),
-                Arg::Bytes(as_bytes(&p)),
+                Arg::Bytes(bytemuck::bytes_of(&p)),
                 Arg::Buf(rb, roff),
                 Arg::Buf(g.ymask.unwrap_or(d), 0),
                 Arg::Buf(g.missing.unwrap_or(dt), 0),
@@ -540,7 +535,7 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     pub fn add_layernorm(&self, rec: &mut Recorder, x: &Buf, r: &Buf, w: &Buf, b: &Buf, y: &Buf, rows: usize, d: usize) {
         let p = LnParams { d: d as i32, eps: 1e-5 };
-        let args = [Arg::Buf(x, 0), Arg::Buf(r, 0), Arg::Buf(w, 0), Arg::Buf(b, 0), Arg::Buf(y, 0), Arg::Bytes(as_bytes(&p))];
+        let args = [Arg::Buf(x, 0), Arg::Buf(r, 0), Arg::Buf(w, 0), Arg::Buf(b, 0), Arg::Buf(y, 0), Arg::Bytes(bytemuck::bytes_of(&p))];
         rec.dispatch(&self.add_ln, &args, (rows, 1, 1), (256, 1, 1));
     }
 
@@ -561,7 +556,7 @@ impl Kernels {
             has_pad: pad.is_some() as i32,
             scale: (1.0 / (hd as f64).sqrt()) as f32,
         };
-        let args = [Arg::Buf(qkv, 0), Arg::Buf(pad.unwrap_or(&self.dummy), 0), Arg::Buf(out, 0), Arg::Bytes(as_bytes(&p))];
+        let args = [Arg::Buf(qkv, 0), Arg::Buf(pad.unwrap_or(&self.dummy), 0), Arg::Buf(out, 0), Arg::Bytes(bytemuck::bytes_of(&p))];
         let lp = if l <= 16 { 16 } else { 32 };
         if let Some(pso) = self.attention_mma.get(&(lp, hd)).filter(|_| l <= MAX_ATTENTION_LEN && !self.scalar_attention) {
             rec.dispatch(pso, &args, (b * h, 1, 1), (lp * 4, 1, 1));
