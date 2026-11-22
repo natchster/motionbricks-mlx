@@ -25,6 +25,12 @@ MLX is MIT-licensed, Copyright © 2023 Apple Inc., and is not redistributed here
 model/motionbricks_mlx/assets/rig_kernels.metal holds Metal transcriptions of the
 upstream rig geometry, shared by both ports.
 
+tools/onnx/ ports upstream's ONNX exporter (tools/onnx/ at the same commit): it emits
+the same batched FP32 and mixed-FP16 inference graphs from the verified checkpoints,
+without PyTorch. tools/onnx/proto/onnx.proto3 is the ONNX message definition from the
+onnx 1.23.2 release, Copyright ONNX Project Contributors, Apache License 2.0 -
+licenses/onnx-Apache-2.0.txt.
+
 model/motionbricks_mlx/runtime/ and model-rs/src/runtime/ port upstream's Runtime
 API (motionbricks/model/, motionbricks/runtime/, motionbricks/animation/,
 motionbricks/io/, motionbricks/utils/ at the same commit), with the same

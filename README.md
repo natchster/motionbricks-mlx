@@ -22,6 +22,7 @@ This repository runs it on the Apple GPU in three ways:
 | [`model/`](model/README.md) | **`motionbricks_mlx`**, the Python MLX port of both inference graphs plus the Runtime API. It has the same tensor interface as upstream's ONNX models, runs in FP32, FP16, BF16 or INT8, and depends only on `mlx` and `numpy`. |
 | [`model-rs/`](model-rs/README.md) | **`motionbricks-rs`**: an op-for-op mlx-rs port and a **model-specific Metal runtime** (FP32, FP16, BF16, INT8), plus the Runtime API on either one. |
 | [`sandbox/`](sandbox/README.md) | **`cudashim`**, a CUDA-emulation layer that runs NVIDIA's original PyTorch, TensorRT and Warp code on a Mac. It is the reference both ports are tested against, and it is only needed for development. |
+| [`tools/onnx/`](tools/onnx/README.md) | **`motionbricks-onnx`**, NVIDIA's ONNX exporter in Rust: emits the same FP32/mixed-FP16 batched graphs as the torch-tracing original, from the verified checkpoints, without PyTorch — and with ~4× fewer nodes. |
 
 It is ported from upstream v0.2.0 (commit `54fc563`) with the weights at revision `3cb362d`.
 
@@ -157,7 +158,7 @@ MB_PLAN_TABLE=$PWD/my_mac.txt cargo run --release --bin mbrs-bench -- --model so
 
 ```sh
 sandbox/setup.sh                                            # NVIDIA's reference model, fixtures (~5 GB)
-uv run --all-packages pytest                                # 210 Python tests
+uv run --all-packages pytest                                # 219 Python tests
 (cd model-rs && cargo test --release -- --test-threads=1)   # 128 Rust tests
 ```
 
@@ -174,6 +175,7 @@ The guide covers [tuning and the profiling tools](docs/user_guide.md#6-tuning-an
 | [model/README.md](model/README.md) | the MLX port: architecture, tensor interface, design notes, per-stage parity |
 | [model-rs/README.md](model-rs/README.md) | the Metal runtime: MLX analysis, kernel design, per-stage profiles |
 | [sandbox/README.md](sandbox/README.md) | CUDA emulation on Apple silicon: research, setup, limits |
+| [tools/onnx/README.md](tools/onnx/README.md) | the Rust ONNX exporter: usage, design, comparison with the original exporter |
 
 ## License
 

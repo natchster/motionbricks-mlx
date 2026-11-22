@@ -1,0 +1,28 @@
+[package]
+name = "motionbricks-onnx"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Rust port of NVIDIA's MotionBricks ONNX exporter: emits the FP32/mixed-FP16 batched inference graphs directly from the released checkpoints, without PyTorch"
+publish = false
+
+[dependencies]
+prost = "0.13"
+safetensors = "0.6"
+half = "2"
+anyhow = "1"
+lexopt = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+bytemuck = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+tempfile = { version = "3", default-features = false }
+
+[profile.release]
+debug = 1

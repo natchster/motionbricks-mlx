@@ -60,7 +60,7 @@ License, and this repository does not redistribute them.
 | Weights | [nvidia/MotionBricks](https://huggingface.co/nvidia/MotionBricks) on Hugging Face, revision [`3cb362d9b95aa40462abcb4d8cfae9ffb6d97410`](https://huggingface.co/nvidia/MotionBricks/tree/3cb362d9b95aa40462abcb4d8cfae9ffb6d97410) |
 | SOMA checkpoints | MotionBricks v6 release `soma-v6-nova-4n8g-ea43dd8-fp32-v1`: pose, root and VQ-VAE networks at training step 1,500,000 |
 | Unitree G1 checkpoints | release `out/motionbricks_{pose,root,vqvae}/version_1`: pose, root and VQ-VAE networks at training step 2,000,000 |
-| Reference ONNX graphs | `mmm_v6_soma_fp32.onnx` and `mmm_v6_g1_fp32.onnx`, exported from the code and weights above with upstream's own exporter |
+| Reference ONNX graphs | `mmm_v6_soma_fp32.onnx` and `mmm_v6_g1_fp32.onnx`, exported from the code and weights above with upstream's own exporter (or with the Rust port of it, [`tools/onnx`](../tools/onnx/README.md)) |
 
 The download commands and `sandbox/scripts/fetch_assets.py` pin both the commit and the revision.
 They verify every checkpoint file against `model/motionbricks_mlx/assets/checkpoints.sha256`, and
@@ -281,6 +281,28 @@ Results:
   on 15–16 of 16 requests. The median deviation is 1–3e-3 for FP16, 1–2e-2 for BF16 and 0.7–3.5e-3
   for INT8. That matches the Python port at the same precision: on the SOMA `random` request, BF16
   deviates by 4.4e-2 in Rust and 4.5e-2 in Python.
+
+### Exporting the ONNX graphs (`tools/onnx`)
+
+`tools/onnx` ports NVIDIA's ONNX exporter to Rust: it emits the same `mmm_v6_{g1,soma}_fp32`
+graphs (and the mixed-FP16 variants) from the verified checkpoints, without PyTorch or the
+pinned export environment. The exporter builds the graph statically — every dimension except
+the batch size is fixed by the architecture — so it needs no tracing and produces much leaner
+graphs. The CLI mirrors upstream's:
+
+```sh
+(cd tools/onnx && cargo build --release)
+tools/onnx/target/release/motionbricks-onnx --model soma --checkpoints checkpoints/MotionBricks/soma
+```
+
+Against upstream's torch-tracing exporter on this machine: **2.3–2.5 s vs 3.7–3.8 s** per
+export at **2.2–2.3 GB vs 3.4–3.6 GB** peak RSS, emitting **1,726/2,447 nodes instead of
+6,993/8,662** (the traced graphs spend most nodes on run-time shape arithmetic), which also
+makes ONNX Runtime sessions load faster (0.30–0.32 s vs 0.39–0.52 s). ONNX Runtime runs of
+both graphs on identical inputs agree to FP32 accumulation noise (≤ 1.4e-4 on the motion
+outputs, durations exact), and the FP16 conversion halves the same initializers as upstream's
+`precision.py`. Details: [tools/onnx/README.md](../tools/onnx/README.md); correctness:
+`sandbox/tests/test_onnx_rs.py`, benchmark: `tools/onnx/bench_export.py`.
 
 ---
 
@@ -596,7 +618,7 @@ Research notes, sources and limits are in [sandbox/README.md](../sandbox/README.
 
 ```sh
 sandbox/setup.sh                              # env + pinned upstream + verified checkpoints + ONNX + golden + runtime fixtures (rerun-safe; --force regenerates)
-uv run --all-packages pytest                  # Python: 210 tests (181 model, 29 sandbox incl. 3 CuMetal)
+uv run --all-packages pytest                  # Python: 219 tests (181 model, 38 sandbox incl. 3 CuMetal)
 (cd model-rs && cargo test --release -- --test-threads=1)   # Rust: 128 tests, both runtimes vs the fixtures
 ```
 

@@ -95,7 +95,9 @@ outputs are missing (or with `--force`). It does the following:
    size and SHA-256 match. A stalled connection fails after 60 s instead of hanging. Errors name
    the file and leave nothing half-written, so rerunning retries cleanly.
 5. Exports the ONNX graphs with **NVIDIA's own exporter**, including its `onnx.checker` and
-   interface validation. This replaces the slow 760 MB LFS downloads.
+   interface validation. This replaces the slow 760 MB LFS downloads. A Rust port of the
+   exporter, `tools/onnx` (no PyTorch needed), emits equivalent graphs with ~4× fewer nodes;
+   `sandbox/tests/test_onnx_rs.py` checks it against these exports.
 6. Records golden fixtures with the upstream PyTorch model on the CPU (FP32), with `meta.json`
    recording the device and the torch/NumPy/upstream versions that produced them.
    `make_golden.py --device mps` writes to `sandbox/golden-mps/` instead, so an MPS run never
