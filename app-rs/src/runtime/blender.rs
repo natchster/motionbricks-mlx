@@ -220,8 +220,8 @@ impl BlendSpace {
                 Ok(self.sample([a, b, 0], [1.0 - blend, blend, 0.0], 0.0))
             }
             CompiledSpace::Directional { center, angles, sectors } => {
-                if x.abs() > EPSILON || y.abs() > EPSILON {
-                    if !angles.is_empty() {
+                if (x.abs() > EPSILON || y.abs() > EPSILON)
+                    && !angles.is_empty() {
                         let upper = bisect_left(angles, y.atan2(x)) % angles.len();
                         if let Some(sector) = &sectors[upper] {
                             let a = (sector.inverse[0] * x + sector.inverse[1] * y).max(0.0);
@@ -237,7 +237,6 @@ impl BlendSpace {
                             ));
                         }
                     }
-                }
                 if *center >= 0 {
                     return Ok(self.sample([*center as usize, 0, 0], [1.0, 0.0, 0.0], 0.0));
                 }
@@ -354,7 +353,7 @@ fn blend_additive_end_transform(accumulated: (rtm::Vec3, rtm::Quat), default_tra
 /// flattened. Each frame starts with the root position and XYZW quaternion.
 pub fn linear_1d_dof_blend(joint_q: &[Vec<f32>], sample: &BlendSample, output: &mut [Vec<f32>]) -> Result<()> {
     let (frames, nc) = frames_and_joints(joint_q, output)?;
-    if nc < rt::ROOT_COORDINATE_COUNT as usize {
+    if nc < rt::ROOT_COORDINATE_COUNT {
         bail!("joint_q must contain the root position and XYZW quaternion before the joint angles.");
     }
     let first = sample.data_indices[sample.indices[0]];
@@ -369,7 +368,7 @@ pub fn linear_1d_dof_blend(joint_q: &[Vec<f32>], sample: &BlendSample, output: &
             root = rtm::blend_transform(root, rt::read_root(b), blend);
         }
         rt::write_root(root, &mut output[frame]);
-        for coordinate in rt::ROOT_COORDINATE_COUNT as usize..nc {
+        for coordinate in rt::ROOT_COORDINATE_COUNT..nc {
             let mut value = a[coordinate];
             if blend >= 1.0 {
                 value = b[coordinate];
@@ -387,7 +386,7 @@ pub fn linear_1d_dof_blend(joint_q: &[Vec<f32>], sample: &BlendSample, output: &
 /// When the weights add up to less than one, `reference_joint_q` supplies the rest.
 pub fn directional_2d_dof_blend(joint_q: &[Vec<f32>], sample: &BlendSample, reference_joint_q: &[f32], output: &mut [Vec<f32>]) -> Result<()> {
     let (frames, nc) = frames_and_joints(joint_q, output)?;
-    if nc < rt::ROOT_COORDINATE_COUNT as usize || reference_joint_q.len() != nc {
+    if nc < rt::ROOT_COORDINATE_COUNT || reference_joint_q.len() != nc {
         bail!("reference_joint_q must hold the root position, XYZW quaternion, and joint angles.");
     }
     let reference_root = rt::read_root(reference_joint_q);
@@ -403,7 +402,7 @@ pub fn directional_2d_dof_blend(joint_q: &[Vec<f32>], sample: &BlendSample, refe
         }
         let root = blend_additive_end_transform(accumulated, reference_root, weight_sum);
         rt::write_root(root, &mut output[frame]);
-        for coordinate in rt::ROOT_COORDINATE_COUNT as usize..nc {
+        for coordinate in rt::ROOT_COORDINATE_COUNT..nc {
             let mut value = 0.0f32;
             let mut weight_sum = 0.0f32;
             for &(target, weight) in &contributions {

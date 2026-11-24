@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use glam::{Mat4, Vec2, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -169,6 +169,10 @@ pub struct Frame {
     line_verts: Vec<render::LineVertex>,
     /// One entry per `log_mesh` / `log_skinned_mesh` / `log_solid_box` call, for picking.
     mesh_instances: Vec<MeshInstance>,
+    /// Scratch for `log_skinned_mesh`: the skinned positions and normals of the
+    /// last skinned mesh, reused across calls so skinning never allocates.
+    skinned_positions: Vec<Vec3>,
+    skinned_normals: Vec<Vec3>,
     gizmo_state: gizmo::GizmoState,
     /// Set by the gizmo while hovered/dragging; suppresses camera controls next frame.
     gizmo_captured: bool,
@@ -189,6 +193,8 @@ impl Frame {
             mesh_verts: Vec::new(),
             line_verts: Vec::new(),
             mesh_instances: Vec::new(),
+            skinned_positions: Vec::new(),
+            skinned_normals: Vec::new(),
             gizmo_state: gizmo::GizmoState::default(),
             gizmo_captured: false,
             prev_gizmo_captured: false,
@@ -229,37 +235,15 @@ impl Frame {
 
     /// Log a mesh with a world transform and a flat color (drawn double-sided, lambert).
     pub fn log_mesh(&mut self, mesh: &Mesh, transform: Mat4, color: Color) {
-        let start = self.mesh_verts.len();
-        let normal_mat = transform.inverse().transpose();
-        let mut push = |i: u32| {
-            let p = mesh.positions[i as usize];
-            let n = mesh.normals.get(i as usize).copied().unwrap_or(Vec3::Y);
-            let wp = transform.transform_point3(p);
-            let wn = normal_mat.transform_point3(n).normalize_or_zero();
-            self.mesh_verts.push(render::MeshVertex {
-                position: wp.to_array(),
-                normal: wn.to_array(),
-                color,
-            });
-        };
-        if mesh.indices.is_empty() {
-            for i in 0..mesh.positions.len() as u32 {
-                push(i);
-            }
-        } else {
-            for &i in &mesh.indices {
-                push(i);
-            }
-        }
-        let count = self.mesh_verts.len() - start;
-        if count > 0 {
-            self.mesh_instances.push(MeshInstance { start, count });
-        }
+        push_mesh(&mut self.mesh_verts, &mut self.mesh_instances, &mesh.positions, &mesh.normals, &mesh.indices, transform, color);
     }
 
     /// Log a skinned mesh: CPU linear-blend skinning with `bone_transforms` (world-space
     /// joint matrices), then drawn like [`Frame::log_mesh`]. Per vertex,
     /// `P' = sum_k w_k * bone_transforms[j_k] * inverse_bind[j_k] * P`.
+    ///
+    /// The skinned vertices go through the frame's scratch buffers: this call
+    /// performs no heap allocation after warmup.
     pub fn log_skinned_mesh(
         &mut self,
         mesh: &Mesh,
@@ -268,13 +252,35 @@ impl Frame {
         transform: Mat4,
         color: Color,
     ) {
-        let mut skinned = Mesh {
-            positions: mesh.positions.clone(),
-            normals: mesh.normals.clone(),
-            indices: mesh.indices.clone(),
+        self.skinned_positions.clear();
+        self.skinned_positions.extend_from_slice(&mesh.positions);
+        self.skinned_normals.clear();
+        self.skinned_normals.extend_from_slice(&mesh.normals);
+        skin_vertices(&mut self.skinned_positions, &mut self.skinned_normals, skin, bone_transforms);
+        // Transform each vertex once, not once per triangle corner (~6x fewer).
+        let normal_mat = Mat3::from_mat4(transform.inverse().transpose());
+        for position in &mut self.skinned_positions {
+            *position = transform.transform_point3(*position);
+        }
+        for normal in &mut self.skinned_normals {
+            *normal = normal_mat.mul_vec3(*normal).normalize_or_zero();
+        }
+        let start = self.mesh_verts.len();
+        let vertex = |i: usize| render::MeshVertex {
+            position: self.skinned_positions[i].to_array(),
+            normal: self.skinned_normals.get(i).copied().unwrap_or(Vec3::Y).to_array(),
+            color,
         };
-        skin_vertices(&mut skinned, skin, bone_transforms);
-        self.log_mesh(&skinned, transform, color);
+        self.mesh_verts.reserve(if mesh.indices.is_empty() { self.skinned_positions.len() } else { mesh.indices.len() });
+        if mesh.indices.is_empty() {
+            self.mesh_verts.extend((0..self.skinned_positions.len()).map(vertex));
+        } else {
+            self.mesh_verts.extend(mesh.indices.iter().map(|&i| vertex(i as usize)));
+        }
+        let count = self.mesh_verts.len() - start;
+        if count > 0 {
+            self.mesh_instances.push(MeshInstance { start, count });
+        }
     }
 
     /// Log world-space line segments (drawn 1 px wide).
@@ -377,7 +383,7 @@ impl Frame {
 }
 
 /// CPU linear-blend skinning: rewrite `mesh`'s positions and normals in place.
-fn skin_vertices(mesh: &mut Mesh, skin: &Skin, bone_transforms: &[Mat4]) {
+fn skin_vertices(positions: &mut [Vec3], normals: &mut [Vec3], skin: &Skin, bone_transforms: &[Mat4]) {
     let identity = Mat4::IDENTITY;
     let skin_mat = |v: usize| -> Mat4 {
         let mut m = Mat4::ZERO;
@@ -393,13 +399,55 @@ fn skin_vertices(mesh: &mut Mesh, skin: &Skin, bone_transforms: &[Mat4]) {
         }
         m
     };
-    for v in 0..mesh.positions.len() {
+    for (v, position) in positions.iter_mut().enumerate() {
         let m = skin_mat(v);
-        mesh.positions[v] = m.transform_point3(mesh.positions[v]);
-        if let Some(n) = mesh.normals.get_mut(v) {
-            let normal_mat = m.inverse().transpose();
-            *n = normal_mat.transform_point3(*n).normalize_or_zero();
+        *position = m.transform_point3(*position);
+        if let Some(n) = normals.get_mut(v) {
+            // Bone transforms are rigid, so the skin matrix's 3x3 part rotates
+            // normals closely enough for debug lambert shading — much cheaper
+            // than an inverse-transpose per vertex.
+            *n = Mat3::from_mat4(m).mul_vec3(*n).normalize_or_zero();
         }
+    }
+}
+
+/// Transform indexed (or plain, when `indices` is empty) vertex data into the
+/// triangle soup — the shared half of [`Frame::log_mesh`].
+fn push_mesh(
+    soup: &mut Vec<render::MeshVertex>,
+    instances: &mut Vec<MeshInstance>,
+    positions: &[Vec3],
+    normals: &[Vec3],
+    indices: &[u32],
+    transform: Mat4,
+    color: Color,
+) {
+    let start = soup.len();
+    soup.reserve(if indices.is_empty() { positions.len() } else { indices.len() });
+    let normal_mat = transform.inverse().transpose();
+    let mut push = |i: u32| {
+        let p = positions[i as usize];
+        let n = normals.get(i as usize).copied().unwrap_or(Vec3::Y);
+        let wp = transform.transform_point3(p);
+        let wn = normal_mat.transform_point3(n).normalize_or_zero();
+        soup.push(render::MeshVertex {
+            position: wp.to_array(),
+            normal: wn.to_array(),
+            color,
+        });
+    };
+    if indices.is_empty() {
+        for i in 0..positions.len() as u32 {
+            push(i);
+        }
+    } else {
+        for &i in indices {
+            push(i);
+        }
+    }
+    let count = soup.len() - start;
+    if count > 0 {
+        instances.push(MeshInstance { start, count });
     }
 }
 
@@ -655,6 +703,31 @@ impl<H: FnMut(&mut Frame, &mut imgui::Ui)> ApplicationHandler for App<H> {
 }
 
 #[cfg(test)]
+mod bench_timing {
+    #[test]
+    #[ignore = "timing only"]
+    fn time_log_skinned_mesh_soma() {
+        use crate::rig::soma::SomaRig;
+        use crate::viewer::Frame;
+        use std::time::Instant;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let soma = SomaRig::load(root.join("checkpoints/motions")).expect("soma loads");
+        let skin = soma.viewer_skin();
+        let local = soma.skeleton.reference_local_transforms().to_vec();
+        let bones = soma.evaluate(&local, soma.model_to_runtime).expect("bones");
+        let mut frame = Frame::new();
+        let start = Instant::now();
+        let iterations = 200;
+        for _ in 0..iterations {
+            frame.begin_frame(1.0 / 60.0);
+            frame.log_skinned_mesh(&soma.mesh.mesh, &skin, &bones, glam::Mat4::IDENTITY, [1.0; 4]);
+        }
+        let elapsed = start.elapsed();
+        eprintln!("log_skinned_mesh x{iterations}: {:?} ({:?}/call)", elapsed, elapsed / iterations);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use glam::Vec3;
@@ -706,7 +779,7 @@ mod tests {
             normals: vec![Vec3::X],
             indices: vec![],
         };
-        skin_vertices(&mut mesh, &skin, &bone_transforms);
+        skin_vertices(&mut mesh.positions, &mut mesh.normals, &skin, &bone_transforms);
         assert!(mesh.positions[0].abs_diff_eq(Vec3::ZERO, 1e-5), "got {:?}", mesh.positions[0]);
         assert!(mesh.normals[0].abs_diff_eq(Vec3::Y, 1e-5), "got {:?}", mesh.normals[0]);
 
@@ -721,7 +794,7 @@ mod tests {
             weight_values: vec![[0.5, 0.5, 0.0, 0.0]],
             ..skin
         };
-        skin_vertices(&mut mesh, &skin, &bone_transforms);
+        skin_vertices(&mut mesh.positions, &mut mesh.normals, &skin, &bone_transforms);
         assert!(
             mesh.positions[0].abs_diff_eq(Vec3::new(0.5, 0.5, 0.0), 1e-5),
             "got {:?}",

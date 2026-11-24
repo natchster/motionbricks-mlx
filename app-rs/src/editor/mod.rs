@@ -746,13 +746,11 @@ impl EditorShell {
     /// or Enter). The caller then acts on [`PathPrompt::id`] and
     /// [`PathPrompt::text`].
     pub fn draw_path_prompt(&mut self, ui: &Ui) -> Option<PathPrompt> {
-        let (title, first_open) = match self.path_prompt.as_mut() {
-            Some(prompt) => {
-                let first_open = !prompt.opened;
-                prompt.opened = true;
-                (prompt.title.clone(), first_open)
-            }
-            None => return None,
+        let (title, first_open) = {
+            let prompt = self.path_prompt.as_mut()?;
+            let first_open = !prompt.opened;
+            prompt.opened = true;
+            (prompt.title.clone(), first_open)
         };
         if first_open {
             ui.open_popup(&title);

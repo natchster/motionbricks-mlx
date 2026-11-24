@@ -104,9 +104,8 @@ pub(crate) fn gizmo_translate(frame: &mut Frame, id: &str, transform: &mut Mat4)
     let mut hovered: Option<Handle> = None;
 
     // 1. Continue an active drag owned by this id.
-    if st.handle.is_some() && st.active_id == id {
+    if let (Some(handle), true) = (st.handle, st.active_id == id) {
         if left_held {
-            let handle = st.handle.unwrap();
             dragging = Some(handle);
             if let Some(ray) = ray {
                 let delta = match handle {

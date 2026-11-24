@@ -228,7 +228,7 @@ where
             character_ground_position: position,
             actual_velocity: Vec3::ZERO,
             current_pose: reference_pose.to_vec(),
-            current_foot_contacts: [0.0; rt::FOOT_CONTACT_COUNT as usize],
+            current_foot_contacts: [0.0; rt::FOOT_CONTACT_COUNT],
             state_machine,
             interaction_probe,
             probe_box: InteractionBox { transform: Transform::IDENTITY, half_extents: Vec3::ZERO },
@@ -404,8 +404,8 @@ where
         let mut clip = clip;
         let clip_ground_position = self.character_ground_position + self.actual_velocity;
         Self::align_clip(&mut clip, clip_ground_position, self.movement.last_input_facing, self.model_to_runtime);
-        for frame in 0..POSES_PER_TOKEN {
-            clip.animation.sample_into_at(frame as f64 / rt::MODEL_SAMPLE_RATE as f64, clip.root_offset, &mut self.clip_target_poses[frame])?;
+        for (frame, target) in self.clip_target_poses.iter_mut().enumerate().take(POSES_PER_TOKEN) {
+            clip.animation.sample_into_at(frame as f64 / rt::MODEL_SAMPLE_RATE as f64, clip.root_offset, target)?;
         }
         self.current_clip = Some(clip);
         let target_poses = self.clip_target_poses.clone();
@@ -436,7 +436,7 @@ where
         self.clip_loop = loop_;
         self.playback_source = PlaybackSource::Clip;
         clip.animation.sample_into_at(0.0, clip.root_offset, &mut self.current_pose)?;
-        self.current_foot_contacts = [0.0; rt::FOOT_CONTACT_COUNT as usize];
+        self.current_foot_contacts = [0.0; rt::FOOT_CONTACT_COUNT];
         self.update_character_position();
         Ok(())
     }

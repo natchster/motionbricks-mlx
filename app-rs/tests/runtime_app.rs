@@ -383,7 +383,10 @@ fn interaction_box_overlap_matches_upstream_cases() {
         half_extents: Vec3::new(0.19628717, 0.19628717, 0.39257434),
     };
     let probe_at = |half_height: f32| InteractionBox {
-        transform: Transform::new(rtm::Vec3::new(3.0434444, 12.853794, half_height), [0.0, 0.0, -0.7071068, 0.70710677]),
+        transform: Transform::new(
+            rtm::Vec3::new(3.0434444, 12.853794, half_height),
+            [0.0, 0.0, -std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2],
+        ),
         half_extents: Vec3::new(0.395, 0.5872061, half_height),
     };
     assert!(boxes_overlap(&overhead, &probe_at(0.63)));
@@ -494,12 +497,15 @@ fn blend_targets() -> (Vec<Vec<Transform>>, Vec<Transform>) {
     (poses, reference)
 }
 
+/// The stored, blended, and placed poses of an `evaluate_mode` run.
+type EvaluatedMode = (Vec<Vec<Transform>>, Vec<Vec<Transform>>, Vec<Vec<Transform>>);
+
 fn evaluate_mode(
     blend_space_type: BlendSpaceType,
     keys: &[(f32, f32)],
     speed: f32,
     facing: Vec3,
-) -> (Vec<Vec<Transform>>, Vec<Vec<Transform>>, Vec<Vec<Transform>>) {
+) -> EvaluatedMode {
     let (poses, reference) = blend_targets();
     let mut blend_space = BlendSpace::new(blend_space_type);
     for (index, &(x, y)) in keys.iter().enumerate() {
@@ -525,11 +531,11 @@ fn modes_blend_then_scale_speed_and_place_only_the_root() {
     ] {
         let (poses, _blended, target) = evaluate_mode(blend_space_type, &keys, speed, facing);
         let ground = Vec3::new(10.0, 2.0, 0.0) + facing * (speed * 0.9 * 0.8);
-        for frame in 0..4 {
+        for (frame, target_frame) in target.iter().enumerate().take(4) {
             let expected_root = ground + Vec3::new(0.0, 0.0, height) + facing * (speed * 0.9 * frame as f32 / 30.0);
-            let actual_root = motion::to_glam(target[frame][0].p);
+            let actual_root = motion::to_glam(target_frame[0].p);
             assert_vec3_close(actual_root, [expected_root.x, expected_root.y, expected_root.z], 1.0e-5);
-            assert!((target[frame][1].p.x() - child_x).abs() < 1.0e-6, "child x: {}", target[frame][1].p.x());
+            assert!((target_frame[1].p.x() - child_x).abs() < 1.0e-6, "child x: {}", target_frame[1].p.x());
         }
         // The placement turns the roots to face the movement direction.
         let root_forward = motion::to_glam(target[0][0].vector(rtm::Vec3::new(1.0, 0.0, 0.0)));

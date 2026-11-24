@@ -94,7 +94,10 @@ impl Pivot {
         if !component.line_min_offset.is_finite() || !component.line_max_offset.is_finite() || component.line_min_offset > component.line_max_offset {
             bail!("Line offsets must be finite, with Min Offset <= Max Offset.");
         }
-        if !component.cone_half_angle_degrees.is_finite() || !(0.0..=180.0).contains(&component.cone_half_angle_degrees) {
+        if !component.cone_half_angle_degrees.is_finite()
+            || component.cone_half_angle_degrees < 0.0
+            || component.cone_half_angle_degrees > 180.0
+        {
             bail!("Cone Half Angle must be between 0 and 180 degrees.");
         }
         Ok(Pivot {
@@ -407,7 +410,7 @@ impl<E: PoseElem> SmartPrimitiveAsset<E> {
                 PlaybackMode::Frames => component.frame_index as f32 / animation.sample_rate(),
                 PlaybackMode::Time => component.sample_time_seconds,
             };
-            let duration = (animation.num_frames().saturating_sub(1)).max(0) as f32 / animation.sample_rate();
+            let duration = (animation.num_frames().saturating_sub(1)) as f32 / animation.sample_rate();
             sample_time = sample_time.clamp(0.0, duration);
 
             let mut root_offset = Transform::IDENTITY;
@@ -924,8 +927,11 @@ impl<E: PoseElem> SmartPrimitiveBehavior<E> for SittingBehavior<E> {
 /// scene documents use. `sitting_clip` is the rig's looping sitting clip, from the
 /// rig's presets.
 pub struct BehaviorRegistry<E> {
-    factories: HashMap<String, Box<dyn Fn(Rc<SmartPrimitiveAsset<E>>) -> Result<Box<dyn SmartPrimitiveBehavior<E>>>>>,
+    factories: HashMap<String, BehaviorFactory<E>>,
 }
+
+/// Builds a behavior from its asset; one factory per behavior type.
+type BehaviorFactory<E> = Box<dyn Fn(Rc<SmartPrimitiveAsset<E>>) -> Result<Box<dyn SmartPrimitiveBehavior<E>>>>;
 
 impl<E: PoseElem + 'static> BehaviorRegistry<E> {
     /// A registry with the upstream behaviors.

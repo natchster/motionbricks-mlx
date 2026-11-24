@@ -226,16 +226,11 @@ pub fn list_clips(root: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
         bail!("clip root is not a directory: {}", root.display());
     }
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).with_context(|| format!("could not list {}", dir.display()))? {
-            let entry = entry.with_context(|| format!("could not list {}", dir.display()))?;
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(suffix)) {
-                out.push(path);
-            }
+    for entry in walkdir::WalkDir::new(root) {
+        let entry = entry.with_context(|| format!("could not list {}", root.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(suffix)) {
+            out.push(path.to_path_buf());
         }
     }
     out.sort();

@@ -147,18 +147,8 @@ fn parse_args() -> Result<Args> {
 }
 
 fn absolutize(path: &Path) -> PathBuf {
-    let expanded = shellexpand_tilde(path);
+    let expanded: PathBuf = shellexpand::tilde(&path.to_string_lossy()).into_owned().into();
     std::path::absolute(&expanded).unwrap_or(expanded)
-}
-
-fn shellexpand_tilde(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    path.to_path_buf()
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +391,13 @@ fn default_pivot(id: u32) -> PivotComponent {
 }
 
 fn has_component(node: &SceneNode, kind: &str) -> bool {
-    node.components.iter().any(|component| match (component, kind) {
-        (NodeComponent::TargetPose(_), "target_pose") => true,
-        (NodeComponent::InteractionBox(_), "interaction_box") => true,
-        (NodeComponent::Pivot(_), "pivot") => true,
-        _ => false,
+    node.components.iter().any(|component| {
+        matches!(
+            (component, kind),
+            (NodeComponent::TargetPose(_), "target_pose")
+                | (NodeComponent::InteractionBox(_), "interaction_box")
+                | (NodeComponent::Pivot(_), "pivot")
+        )
     })
 }
 
@@ -699,6 +691,20 @@ struct SmartPrimitiveEditor {
     pivot_direction_edit: Option<(u32, [f32; 3])>,
     click_press: Option<Vec2>,
     left_was_held: bool,
+    /// Per-component preview cache: a target pose is resampled only when its
+    /// sampling inputs change, not every frame.
+    previews: HashMap<u32, CachedPreview>,
+}
+
+/// A cached [`TargetSample`] and its trajectory, keyed by the sampling inputs.
+struct CachedPreview {
+    /// Inputs of [`sample_target`]: clip reference, sample time, hips constraint.
+    signature: (Option<String>, f32, bool),
+    /// The clip the sample and trajectory were built from.
+    clip: Option<Clip>,
+    sample: std::rc::Rc<TargetSample>,
+    /// The trajectory and its own input (the spacing scale), sampled lazily.
+    trajectory: Option<(f32, std::rc::Rc<Vec<rt::Transform>>)>,
 }
 
 impl SmartPrimitiveEditor {
@@ -719,6 +725,7 @@ impl SmartPrimitiveEditor {
             pivot_direction_edit: None,
             click_press: None,
             left_was_held: false,
+            previews: HashMap::new(),
         }
     }
 
@@ -765,6 +772,7 @@ impl SmartPrimitiveEditor {
         self.sequence_rename = InlineRename::default();
         self.dragged_sequence_step = None;
         self.pivot_direction_edit = None;
+        self.previews.clear();
         self.shell.set_document_path(None);
     }
 
@@ -792,6 +800,7 @@ impl SmartPrimitiveEditor {
         self.sequence_rename = InlineRename::default();
         self.dragged_sequence_step = None;
         self.pivot_direction_edit = None;
+        self.previews.clear();
         self.shell.set_document_path(Some(path.clone()));
         eprintln!(
             "smart-primitive-editor: opened {} ({} target poses, {} sequences, rig {})",
@@ -901,6 +910,51 @@ impl SmartPrimitiveEditor {
         Some(self.clip_for(&resolved).cloned())
     }
 
+    /// The target pose's preview sample, resampling only when its inputs
+    /// (clip, sample time, hips constraint) changed since the last call.
+    fn preview(&mut self, node_id: u32, component: &TargetPoseComponent) -> Result<std::rc::Rc<TargetSample>> {
+        let signature = (component.clip.clone(), component.sample_time_seconds, component.hips_constrained);
+        if let Some(cached) = self.previews.get(&node_id) {
+            if cached.signature == signature {
+                return Ok(cached.sample.clone());
+            }
+        }
+        let clip = match self.component_clip(component) {
+            Some(result) => Some(result?),
+            None => None,
+        };
+        let rig = self.rig_data.as_ref().context("rig data not loaded")?;
+        let sample = std::rc::Rc::new(sample_target(rig, component, clip.as_ref())?);
+        self.previews.insert(node_id, CachedPreview { signature, clip, sample: sample.clone(), trajectory: None });
+        Ok(sample)
+    }
+
+    /// The trajectory preview, sampled lazily and cached by its scale.
+    fn preview_trajectory(
+        &mut self,
+        node_id: u32,
+        component: &TargetPoseComponent,
+        sample: &TargetSample,
+    ) -> Result<Option<std::rc::Rc<Vec<rt::Transform>>>> {
+        if !sample.has_clip {
+            return Ok(None);
+        }
+        if let Some(cached) = self.previews.get(&node_id) {
+            if let Some((scale, trajectory)) = &cached.trajectory {
+                if *scale == component.trajectory_scale {
+                    return Ok(Some(trajectory.clone()));
+                }
+            }
+        }
+        let clip = self.previews.get(&node_id).and_then(|cached| cached.clip.clone()).context("a trajectory needs a clip")?;
+        let rig = self.rig_data.as_ref().context("rig data not loaded")?;
+        let transforms = std::rc::Rc::new(sample_trajectory(rig, component, &clip, sample.root_offset)?);
+        if let Some(cached) = self.previews.get_mut(&node_id) {
+            cached.trajectory = Some((component.trajectory_scale, transforms.clone()));
+        }
+        Ok(Some(transforms))
+    }
+
     /// Assign a clip to the selected node's target pose (upstream
     /// `_draw_clip_selector`'s `component.set_clip`).
     fn assign_clip(&mut self, path: &Path) {
@@ -946,17 +1000,8 @@ impl SmartPrimitiveEditor {
 /// `path` relative to `directory`, lexically (upstream writes clip paths
 /// relative to the document file).
 fn relative_path(path: &Path, directory: &Path) -> String {
-    let path_parts: Vec<_> = path.components().collect();
-    let dir_parts: Vec<_> = directory.components().collect();
-    let common = path_parts.iter().zip(&dir_parts).take_while(|(a, b)| a == b).count();
-    let mut result = PathBuf::new();
-    for _ in common..dir_parts.len() {
-        result.push("..");
-    }
-    for part in &path_parts[common..] {
-        result.push(part);
-    }
-    result.to_string_lossy().into_owned()
+    // Upstream writes clip paths relative to the document file.
+    pathdiff::diff_paths(path, directory).unwrap_or_else(|| path.to_path_buf()).to_string_lossy().into_owned()
 }
 
 /// Resolve a clip path: as written (relative to the document), or — when that
@@ -1121,26 +1166,17 @@ impl SmartPrimitiveEditor {
         if self.rig_data.is_none() {
             return;
         }
-        let clip = match self.component_clip(component) {
-            Some(Ok(clip)) => Some(clip),
-            Some(Err(error)) => {
+        let sample = match self.preview(node_id, component) {
+            Ok(sample) => sample,
+            Err(error) => {
                 self.shell.set_status(format!("Clip failed: {error:#}"));
-                None
+                return;
             }
-            None => None,
         };
-        let sample = {
+        let (model_to_runtime, is_soma) = {
             let rig = self.rig_data.as_ref().expect("checked above");
-            match sample_target(rig, component, clip.as_ref()) {
-                Ok(sample) => sample,
-                Err(error) => {
-                    self.shell.set_status(format!("Clip failed: {error:#}"));
-                    return;
-                }
-            }
+            (rig.model_to_runtime, rig.rig() == ModelRig::Soma)
         };
-        let rig = self.rig_data.as_ref().expect("checked above");
-        let model_to_runtime = rig.model_to_runtime;
         let root = rt_transform(world) * model_to_runtime;
         let [r, g, b] = component.color;
         let color = [r, g, b, 1.0];
@@ -1164,15 +1200,13 @@ impl SmartPrimitiveEditor {
             }
         }
         if visible && component.show_trajectory && sample.has_clip {
-            if let Some(clip) = &clip {
-                match sample_trajectory(rig, component, clip, sample.root_offset) {
-                    Ok(transforms) => self.draw_trajectory(frame, root, &transforms),
-                    Err(error) => self.shell.set_status(format!("Clip failed: {error:#}")),
-                }
+            match self.preview_trajectory(node_id, component, &sample) {
+                Ok(Some(transforms)) => self.draw_trajectory(frame, root, &transforms),
+                Ok(None) => {}
+                Err(error) => self.shell.set_status(format!("Clip failed: {error:#}")),
             }
         }
-        if visible && component.ik_pin_mask != ik_pin::NONE && rig.rig() == ModelRig::Soma {
-            let _ = node_id;
+        if visible && component.ik_pin_mask != ik_pin::NONE && is_soma {
             self.draw_ik_pins(frame, component.ik_pin_mask, &sample.poses[0], root);
         }
     }
@@ -1292,7 +1326,7 @@ impl SmartPrimitiveEditor {
 
     /// The transform gizmo on the selection (upstream `_draw_selection_gizmo`
     /// + `_apply_selection_gizmo`, fused: this viewer applies the gizmo inside
-    /// the frame). Returns true while the gizmo is dragged.
+    ///   the frame). Returns true while the gizmo is dragged.
     fn draw_gizmo(&mut self, frame: &mut Frame) -> bool {
         let node_id = self.selected_id();
         let Some(world) = self.document.world_transform(node_id) else {
@@ -1362,7 +1396,7 @@ impl SmartPrimitiveEditor {
                 continue;
             }
             let Some(world) = self.document.world_transform(*node_id) else { continue };
-            if let Some(distance) = self.raycast_target(component, &world, ray) {
+            if let Some(distance) = self.raycast_target(*node_id, component, &world, ray) {
                 if distance < nearest {
                     nearest = distance;
                     hit = Some(*node_id);
@@ -1389,14 +1423,12 @@ impl SmartPrimitiveEditor {
     }
 
     /// Raycast one target pose's preview mesh in world space.
-    fn raycast_target(&mut self, component: &TargetPoseComponent, world: &Transform, ray: &Ray) -> Option<f32> {
-        let clip = match self.component_clip(component) {
-            Some(Ok(clip)) => Some(clip),
-            _ => None,
-        };
+    fn raycast_target(&mut self, node_id: u32, component: &TargetPoseComponent, world: &Transform, ray: &Ray) -> Option<f32> {
         let rig = self.rig_data.as_ref()?;
-        let sample = sample_target(rig, component, clip.as_ref()).ok()?;
-        let root = rt_transform(world) * rig.model_to_runtime;
+        let model_to_runtime = rig.model_to_runtime;
+        let sample = self.preview(node_id, component).ok()?;
+        let root = rt_transform(world) * model_to_runtime;
+        let rig = self.rig_data.as_ref()?;
         match (&sample.poses[0], &rig.soma, &rig.g1) {
             (PoseSample::Soma(local), Some(soma), _) => {
                 let bones = soma.evaluate(local, root).ok()?;
@@ -1574,7 +1606,9 @@ impl SmartPrimitiveEditor {
             }
         }
         if !renaming {
-            if !is_root && drag_source(ui, TREE_PAYLOAD, row.id, &row.name) {}
+            if !is_root {
+                let _ = drag_source(ui, TREE_PAYLOAD, row.id, &row.name);
+            }
             if let Some(dragged_id) = accept_drop(ui, TREE_PAYLOAD) {
                 if reparent(&mut self.document, dragged_id, row.id) {
                     self.selected_id = dragged_id;
@@ -2035,12 +2069,10 @@ impl SmartPrimitiveEditor {
         let Some(component) = self.document.find_node(node_id).and_then(|node| node.target_pose()).cloned() else {
             return 0.0;
         };
-        let clip = match self.component_clip(&component) {
-            Some(Ok(clip)) => Some(clip),
-            _ => None,
-        };
-        let Some(rig) = self.rig_data.as_ref() else { return 0.0 };
-        let Ok(sample) = sample_target(rig, &component, clip.as_ref()) else { return 0.0 };
+        if self.rig_data.is_none() {
+            return 0.0;
+        }
+        let Ok(sample) = self.preview(node_id, &component) else { return 0.0 };
         preview_velocity(&sample, component.num_poses_to_use).length()
     }
 
@@ -2718,7 +2750,7 @@ mod tests {
                 Clip::Soma(buffer) => Clip::Soma(buffer.clone()),
                 Clip::G1(buffer) => Clip::G1(buffer.clone()),
             };
-            let sample = sample_target(&rig, &component, Some(&clip)).expect("the target samples");
+            let sample = sample_target(&rig, component, Some(&clip)).expect("the target samples");
             let PoseSample::G1(q) = &sample.poses[0] else { panic!("G1 poses") };
             assert!(q.iter().all(|v| v.is_finite()), "finite joint coordinates");
             let root = rt_transform(&world) * rig.model_to_runtime;
@@ -2727,5 +2759,23 @@ mod tests {
             let links = rig.g1.as_ref().unwrap().link_transforms(&q).expect("link transforms evaluate");
             assert!(links.iter().all(|t| t.p.0.iter().all(|v| v.is_finite())), "finite links");
         }
+    }
+
+    #[test]
+    fn preview_cache_resamples_only_when_inputs_change() {
+        let args = Args { document: None, clips: clips_dir(), assets: assets_dir() };
+        let mut app = SmartPrimitiveEditor::new(&args);
+        app.rig_data = Some(RigData::load(ModelRig::Soma, &clips_dir(), &assets_dir()).expect("the SOMA rig loads"));
+        let node_id = 2;
+        let mut component = default_target_pose(5);
+        let first = app.preview(node_id, &component).expect("samples");
+        let second = app.preview(node_id, &component).expect("samples");
+        assert!(std::rc::Rc::ptr_eq(&first, &second), "unchanged inputs reuse the cached sample");
+        component.sample_time_seconds = 0.5;
+        let third = app.preview(node_id, &component).expect("samples");
+        assert!(!std::rc::Rc::ptr_eq(&first, &third), "a changed sample time resamples");
+        component.hips_constrained = true;
+        let fourth = app.preview(node_id, &component).expect("samples");
+        assert!(!std::rc::Rc::ptr_eq(&third, &fourth), "a changed hips constraint resamples");
     }
 }

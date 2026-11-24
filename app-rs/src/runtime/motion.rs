@@ -42,7 +42,7 @@ pub const DIRECTIONAL_TARGET_VALUES: [(&str, [f32; 2]); 5] = [
 pub const CLIP_FACING_YAW: f32 = -0.5 * std::f32::consts::PI;
 
 /// Poses per generated token (the model contract).
-pub const POSES_PER_TOKEN: usize = rt::MODEL_POSES_PER_TOKEN as usize;
+pub const POSES_PER_TOKEN: usize = rt::MODEL_POSES_PER_TOKEN;
 
 /// One value of a pose: a joint [`Transform`] (SOMA) or a joint coordinate (G1).
 ///
@@ -603,7 +603,7 @@ impl MovementControl {
         let facing_direction = ground_direction(command.facing_direction, self.desired_facing).expect("desired_facing is a valid ground direction");
         let movement_amount = command.movement.map_or(0.0, |movement| movement.truncate().length());
         // Written as "not above", so a NaN input also counts as no movement.
-        if !(movement_amount > MOVEMENT_EPSILON) {
+        if movement_amount.partial_cmp(&MOVEMENT_EPSILON) != Some(std::cmp::Ordering::Greater) {
             if mode.blend_space_type == BlendSpaceType::Directional2D || self.desired_speed <= 0.0 {
                 self.desired_facing = facing_direction;
             }

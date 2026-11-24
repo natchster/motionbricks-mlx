@@ -174,8 +174,7 @@ impl G1Rig {
         }
         let mut world = Vec::with_capacity(self.bodies.len());
         world.push(rt::read_root(q));
-        for i in 1..self.bodies.len() {
-            let b = &self.bodies[i];
+        for b in self.bodies.iter().skip(1) {
             let parent = usize::try_from(b.parent).context("body parent must be a body before it")?;
             let mut w = world[parent] * b.offset;
             if let Some(j) = &b.joint {

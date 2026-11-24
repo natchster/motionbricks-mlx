@@ -416,7 +416,8 @@ impl TokenPoses<f32> for DofToken {
 /// Per-rig drawing assets: what upstream's mesh/skeleton/foot-contact renderers hold.
 enum RigVisual {
     Soma {
-        rig: SomaRig,
+        // Boxed: SomaRig is ~450 bytes (G1Rig is small), so the enum stays compact.
+        rig: Box<SomaRig>,
         skin: Skin,
         outlines: Vec<SoleOutline>,
     },
@@ -803,7 +804,7 @@ fn build_soma_session(cli: &Cli, scene: &SceneDocument, scene_path: &Path) -> Re
         clip_loader,
     )?;
     let session = Session::new(character, scene, behavior_registry, instances);
-    Ok((session, RigVisual::Soma { rig: rig_assets, skin, outlines }))
+    Ok((session, RigVisual::Soma { rig: Box::new(rig_assets), skin, outlines }))
 }
 
 /// Build the Unitree G1 character and its scene session (upstream `load_rig_assets` +

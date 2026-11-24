@@ -209,7 +209,7 @@ impl OffscreenGpu {
     /// 256-byte copy alignment).
     async fn readback(&self) -> Result<RgbaImage> {
         let row_bytes = self.width * 4;
-        let padded = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32);
+        let padded = row_bytes.next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("headless readback"),
             size: (padded * self.height) as u64,

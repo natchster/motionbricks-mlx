@@ -702,7 +702,7 @@ impl SceneEditor {
 }
 
 fn absolutize(path: &Path) -> PathBuf {
-    let expanded = shellexpand_tilde(path);
+    let expanded: PathBuf = shellexpand::tilde(&path.to_string_lossy()).into_owned().into();
     std::path::absolute(&expanded).unwrap_or(expanded)
 }
 
@@ -712,15 +712,6 @@ fn is_smart_primitive_path(path: &Path) -> bool {
     path.to_string_lossy().to_lowercase().ends_with(SMART_PRIMITIVE_SUFFIX)
 }
 
-fn shellexpand_tilde(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    path.to_path_buf()
-}
 
 /// Upstream `_CharacterStartRenderer`'s marker, in the item's local space: a
 /// circle at ground level plus an arrow along +X (the facing direction).
@@ -1095,7 +1086,7 @@ impl SceneEditor {
     /// The Character combo; locked once a reference exists (upstream
     /// `_draw_character_selector`).
     fn draw_character_selector(&mut self, ui: &imgui::Ui) {
-        let locked_reason = self.has_references().then(|| {
+        let locked_reason = self.has_references().then_some({
             "Smart Primitive references lock the Character selector. Delete those Smart Primitives or start a new scene to change it."
         });
         let rig = draw_character_selector(ui, self.scene.rig, locked_reason);

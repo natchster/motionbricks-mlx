@@ -375,7 +375,7 @@ pub fn ellipsize_text(ui: &Ui, text: &str, max_width: f32) -> String {
     // Binary search over the character count (not bytes, so UTF-8 stays intact).
     let (mut lower, mut upper) = (0usize, text.chars().count());
     while lower < upper {
-        let middle = (lower + upper + 1) / 2;
+        let middle = (lower + upper).div_ceil(2);
         let candidate: String = text.chars().take(middle).collect();
         if ui.calc_text_size(format!("{candidate}{ellipsis}"))[0] <= max_width {
             lower = middle;
@@ -516,11 +516,11 @@ fn draw_transform_row(ui: &Ui, label: &str, values: &mut [f32; 3], dpi_scale: f3
     let _group = ui.begin_group();
     let mut changed = draw_transform_reset(ui, label, values, locks);
     ui.same_line_with_pos(110.0 * dpi_scale);
-    for index in 0..3 {
+    for (index, axis_name) in AXIS_NAMES.iter().enumerate() {
         if index > 0 {
             ui.same_line();
         }
-        changed |= draw_transform_axis(ui, label, AXIS_NAMES[index], index, values, locks, dpi_scale);
+        changed |= draw_transform_axis(ui, label, axis_name, index, values, locks, dpi_scale);
     }
     changed
 }
@@ -569,12 +569,12 @@ fn draw_transform_axis(
         }
     }
     ui.same_line();
-    let changed = {
+    
+    {
         let _disabled = ui.begin_disabled(locks[index]);
         ui.set_next_item_width(60.0 * dpi_scale);
         ui.input_float(format!("##{label}{axis_name}"), &mut values[index]).build()
-    };
-    changed
+    }
 }
 
 /// The angle within ±180 degrees of `reference` that equals `angle` modulo 360

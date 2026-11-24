@@ -365,7 +365,8 @@ fn transition_end_frame(num_frames: usize, transition_early_by_frames: usize) ->
 /// Per-rig drawing assets: what upstream's mesh/skeleton/foot-contact renderers hold.
 enum RigVisual {
     Soma {
-        rig: SomaRig,
+        // Boxed: SomaRig is ~450 bytes (G1Rig is small), so the enum stays compact.
+        rig: Box<SomaRig>,
         skin: Skin,
         outlines: Vec<SoleOutline>,
     },
@@ -593,7 +594,7 @@ fn build_rig_state(cli: &Cli, rig: ModelRig) -> Result<RigState> {
             let output = engine.create_output(&rig_assets.skeleton)?;
             Ok(RigState {
                 rig,
-                visual: RigVisual::Soma { rig: rig_assets, skin, outlines },
+                visual: RigVisual::Soma { rig: Box::new(rig_assets), skin, outlines },
                 runtime: RigRuntime::Soma { engine, context, target, output },
                 registry,
                 model_to_runtime,
@@ -1142,7 +1143,7 @@ fn ellipsize_text(ui: &Ui, text: &str, max_width: f32) -> String {
     }
     let (mut lower, mut upper) = (0, text.len());
     while lower < upper {
-        let middle = (lower + upper + 1) / 2;
+        let middle = (lower + upper).div_ceil(2);
         if ui.calc_text_size(format!("{}{ELLIPSIS}", &text[..middle]))[0] <= max_width {
             lower = middle;
         } else {

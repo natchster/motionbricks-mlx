@@ -190,7 +190,7 @@ impl<E: PoseElem> LocomotionState<E> {
         Ok(())
     }
 
-    fn enter<A: EngineAdapter>(&mut self, character: &mut Character<A>) -> Result<()>
+    fn enter<A>(&mut self, character: &mut Character<A>) -> Result<()>
     where
         ElemOf<A>: PoseElem,
         A: EngineAdapter<Buffer: MotionBuffer<Elem = E>>,
@@ -199,7 +199,7 @@ impl<E: PoseElem> LocomotionState<E> {
         self.generate(character)
     }
 
-    fn update<A: EngineAdapter>(&mut self, character: &mut Character<A>, machine: &mut StateMachine<A>, delta_time: f32, deferred: &mut Option<ActiveState>) -> Result<()>
+    fn update<A>(&mut self, character: &mut Character<A>, machine: &mut StateMachine<A>, delta_time: f32, deferred: &mut Option<ActiveState>) -> Result<()>
     where
         ElemOf<A>: PoseElem,
         A: EngineAdapter<Buffer: MotionBuffer<Elem = E>>,
@@ -215,7 +215,7 @@ impl<E: PoseElem> LocomotionState<E> {
     }
 
     /// Blend and place the active mode's targets for generation or debug display.
-    pub fn evaluate_current_target_poses<A: EngineAdapter>(&self, character: &Character<A>, blended_poses: &mut Vec<Vec<ElemOf<A>>>, target_poses: &mut Vec<Vec<ElemOf<A>>>) -> Result<()>
+    pub fn evaluate_current_target_poses<A>(&self, character: &Character<A>, blended_poses: &mut Vec<Vec<ElemOf<A>>>, target_poses: &mut Vec<Vec<ElemOf<A>>>) -> Result<()>
     where
         ElemOf<A>: PoseElem,
         A: EngineAdapter<Buffer: MotionBuffer<Elem = E>>,
@@ -223,7 +223,7 @@ impl<E: PoseElem> LocomotionState<E> {
         character.evaluate_target_poses(self.active_mode_runtime(), blended_poses, target_poses)
     }
 
-    fn generate<A: EngineAdapter>(&mut self, character: &mut Character<A>) -> Result<()>
+    fn generate<A>(&mut self, character: &mut Character<A>) -> Result<()>
     where
         ElemOf<A>: PoseElem,
         A: EngineAdapter<Buffer: MotionBuffer<Elem = E>>,
@@ -356,9 +356,9 @@ where
         for path in primitive.clip_paths() {
             let path = resolve_clip_path(&path);
             for loop_ in [false, true] {
-                if !self.clips.contains_key(&(path.clone(), loop_)) {
+                if let std::collections::hash_map::Entry::Vacant(e) = self.clips.entry((path.clone(), loop_)) {
                     let clip = character.load_clip(&path, loop_)?;
-                    self.clips.insert((path.clone(), loop_), clip);
+                    e.insert(clip);
                 }
             }
         }
