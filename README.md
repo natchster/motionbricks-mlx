@@ -23,6 +23,7 @@ This repository runs it on the Apple GPU in three ways:
 | [`model-rs/`](model-rs/README.md) | **`motionbricks-rs`**: an op-for-op mlx-rs port and a **model-specific Metal runtime** (FP32, FP16, BF16, INT8), plus the Runtime API on either one. |
 | [`sandbox/`](sandbox/README.md) | **`cudashim`**, a CUDA-emulation layer that runs NVIDIA's original PyTorch, TensorRT and Warp code on a Mac. It is the reference both ports are tested against, and it is only needed for development. |
 | [`tools/onnx/`](tools/onnx/README.md) | **`motionbricks-onnx`**, NVIDIA's ONNX exporter in Rust: emits the same FP32/mixed-FP16 batched graphs as the torch-tracing original, from the verified checkpoints, without PyTorch — and with ~4× fewer nodes. |
+| [`app-rs/`](app-rs/README.md) | **`motionbricks-app`**, the four upstream applications in Rust — Inbetweener, Scene Preview, Smart Primitive Editor, Scene Editor — on a small wgpu viewer. They call the Rust model and Runtime API (`model-rs`), never Python or TensorRT. |
 
 It is ported from upstream v0.2.0 (commit `54fc563`) with the weights at revision `3cb362d`.
 

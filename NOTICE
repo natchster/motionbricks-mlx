@@ -31,6 +31,18 @@ without PyTorch. tools/onnx/proto/onnx.proto3 is the ONNX message definition fro
 onnx 1.23.2 release, Copyright ONNX Project Contributors, Apache License 2.0 -
 licenses/onnx-Apache-2.0.txt.
 
+app-rs/ ports upstream's applications (app/ at the same commit: the Inbetweener and
+Scene Preview demos, the Smart Primitive and Scene editors, and app/runtime/**), with
+the same Copyright and license. The Newton/warp viewer was replaced by a wgpu-based
+viewer with the same logging-shaped API, TensorRT by the Metal runtime in model-rs,
+and the Warp kernels by Rust code. The apps call the Rust model and the Rust Runtime
+API (model-rs), never Python. Unitree G1 robot assets (MJCF and STL meshes, rendered
+by the G1 apps) are BSD 3-Clause, Copyright (c) 2016-2022 HangZhou YuShu TECHNOLOGY
+CO.,LTD. (Unitree Robotics) - licenses/unitree-LICENSE.txt. The scene and Smart
+Primitive JSON documents in app-rs/assets/ are NVIDIA-authored, Apache-2.0/CC-BY-4.0
+dual-licensed like upstream's (see LICENSE, section "NVIDIA-AUTHORED DOCUMENTATION
+AND MEDIA").
+
 model/motionbricks_mlx/runtime/ and model-rs/src/runtime/ port upstream's Runtime
 API (motionbricks/model/, motionbricks/runtime/, motionbricks/animation/,
 motionbricks/io/, motionbricks/utils/ at the same commit), with the same

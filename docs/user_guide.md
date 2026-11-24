@@ -304,6 +304,34 @@ outputs, durations exact), and the FP16 conversion halves the same initializers 
 `precision.py`. Details: [tools/onnx/README.md](../tools/onnx/README.md); correctness:
 `sandbox/tests/test_onnx_rs.py`, benchmark: `tools/onnx/bench_export.py`.
 
+### The applications (`app-rs`)
+
+`app-rs` ports the four upstream applications to Rust: the **Inbetweener** and **Scene
+Preview** demos and the **Smart Primitive** and **Scene** editors. They run on a small
+wgpu viewer (`src/viewer/`, with the same logging-shaped API as upstream's Newton
+ViewerGL) and — unlike upstream, which needs an NVIDIA GPU with TensorRT — they call **the
+Rust model and Rust Runtime API** (`model-rs`): the Metal runtime behind
+`motionbricks_rs::runtime::Backend`, plus the Runtime API's engines, motion players,
+target-pose placement and clip IO. No Python, TensorRT, Warp or ONNX Runtime is involved.
+
+```sh
+cd app-rs && cargo build --release     # the first build also compiles MLX (~6 min)
+cargo run --release --bin inbetweener -- --rig soma
+cargo run --release --bin scene-preview -- --scene assets/scenes/soma_gym.scene.json
+cargo run --release --bin smart-primitive-editor -- assets/smart_primitives/soma/sit.smart_primitive.json
+cargo run --release --bin scene-editor -- --scene assets/scenes/soma_gym.scene.json
+```
+
+The scene and Smart Primitive documents are byte-compatible with upstream's
+(`motionbricks.scene` / `motionbricks.smart_primitive.authoring` v1, tested round-trip),
+so scenes and primitives authored in one implementation open in the other. Clips come
+from `checkpoints/motions` (the `motionbricks-mlx download --clips` set) or the upstream
+checkout via `--assets` — the sample clips stay under their NVIDIA Sample Data Evaluation
+License and are never committed (see [app-rs/assets/README.md](../app-rs/assets/README.md)).
+For tests and screenshots the viewer also has an offscreen headless mode
+(`viewer::HeadlessViewer`; `viewer-demo --headless out.ppm --frames 30`).
+Details and per-app notes: [app-rs/README.md](../app-rs/README.md).
+
 ---
 
 ## 4. The Runtime API

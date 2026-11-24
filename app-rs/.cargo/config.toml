@@ -1,0 +1,6 @@
+# Same setup as model-rs/.cargo/config.toml: keep the MLX build usable without `xcode-select -s`.
+[env]
+# mlx-sys installs MLX's compiled Metal kernels (mlx.metallib, ~175 MB) here instead of ~/.mlx/lib.
+MLX_RS_METAL_PATH = { value = "target/mlx-metal", relative = true }
+# MLX's CMake build needs Xcode's `metal` compiler; does not override an existing DEVELOPER_DIR.
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"

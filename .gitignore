@@ -24,6 +24,7 @@ model/benchmarks/results/*.json
 # Rust port (model-rs): build output, generated requests, raw benchmark runs
 model-rs/target/
 tools/onnx/target/
+app-rs/target/
 model-rs/bench/requests/
 model-rs/bench/results/raw*/
 model-rs/bench/results/*.log
