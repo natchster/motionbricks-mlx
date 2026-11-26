@@ -108,7 +108,7 @@ pub(crate) fn arrow_head(start: Vec3, end: Vec3) -> (Vec3, Vec<MeshVertex>) {
         })
         .collect();
     let push = |verts: &mut Vec<MeshVertex>, p: Vec3, n: Vec3| {
-        verts.push(MeshVertex { position: p.to_array(), normal: n.to_array(), color: [0.0; 4] });
+        verts.push(MeshVertex { position: p.to_array(), normal: n.to_array(), color: [0; 4] });
     };
     let mut out = Vec::with_capacity(SEGMENTS * 2 * 3);
     for i in 0..SEGMENTS {
@@ -131,6 +131,7 @@ pub(crate) fn arrow_head(start: Vec3, end: Vec3) -> (Vec3, Vec<MeshVertex>) {
 /// used by the translate gizmo's plane handles. Returns 6 vertices.
 pub(crate) fn plane_quad(origin: Vec3, u: Vec3, v: Vec3, color: [f32; 4]) -> Vec<MeshVertex> {
     let n = u.cross(v).normalize_or(Vec3::Y);
+    let color = super::render::pack_color(color);
     let mut out = Vec::with_capacity(6);
     let corners = [origin, origin + u, origin + u + v, origin + v];
     for p in [corners[0], corners[1], corners[2], corners[0], corners[2], corners[3]] {

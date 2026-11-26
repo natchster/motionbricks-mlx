@@ -94,7 +94,7 @@ mod tests {
         let mut out = Vec::new();
         for &i in &mesh.indices {
             let p = transform.transform_point3(mesh.positions[i as usize]);
-            out.push(MeshVertex { position: p.to_array(), normal: [0.0; 3], color });
+            out.push(MeshVertex { position: p.to_array(), normal: [0.0; 3], color: crate::viewer::render::pack_color(color) });
         }
         out
     }

@@ -20,7 +20,7 @@ use crate::viewer::camera::OrbitCamera;
 pub(crate) const CLEAR_COLOR: wgpu::Color = wgpu::Color { r: 0.1, g: 0.1, b: 0.12, a: 1.0 };
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// One vertex of the triangle stream: position + normal + color (40 bytes).
+/// One vertex of the triangle stream: position + normal + color (28 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MeshVertex {
@@ -28,18 +28,24 @@ pub struct MeshVertex {
     pub position: [f32; 3],
     /// World-space normal.
     pub normal: [f32; 3],
-    /// Linear RGBA color.
-    pub color: [f32; 4],
+    /// Linear RGBA color, one byte per channel (`Unorm8x4` in the vertex layout;
+    /// debug colors do not need more).
+    pub color: [u8; 4],
 }
 
-/// One vertex of the line stream: position + color (28 bytes).
+/// One vertex of the line stream: position + color (16 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct LineVertex {
     /// World-space position.
     pub position: [f32; 3],
-    /// Linear RGBA color.
-    pub color: [f32; 4],
+    /// Linear RGBA color, one byte per channel.
+    pub color: [u8; 4],
+}
+
+/// Pack a linear RGBA color to the vertices' 8-bit channels.
+pub(crate) fn pack_color(color: [f32; 4]) -> [u8; 4] {
+    color.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8)
 }
 
 pub(crate) fn as_bytes<T>(slice: &[T]) -> &[u8] {
@@ -185,7 +191,7 @@ pub(crate) fn create_pipelines(device: &wgpu::Device, format: wgpu::TextureForma
         &[wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<MeshVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Unorm8x4],
         }],
     );
     let line_pipeline = make_pipeline(
@@ -199,7 +205,7 @@ pub(crate) fn create_pipelines(device: &wgpu::Device, format: wgpu::TextureForma
         &[wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4],
         }],
     );
 

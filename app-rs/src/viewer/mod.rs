@@ -266,10 +266,11 @@ impl Frame {
             *normal = normal_mat.mul_vec3(*normal).normalize_or_zero();
         }
         let start = self.mesh_verts.len();
+        let packed = render::pack_color(color);
         let vertex = |i: usize| render::MeshVertex {
             position: self.skinned_positions[i].to_array(),
             normal: self.skinned_normals.get(i).copied().unwrap_or(Vec3::Y).to_array(),
-            color,
+            color: packed,
         };
         self.mesh_verts.reserve(if mesh.indices.is_empty() { self.skinned_positions.len() } else { mesh.indices.len() });
         if mesh.indices.is_empty() {
@@ -285,10 +286,11 @@ impl Frame {
 
     /// Log world-space line segments (drawn 1 px wide).
     pub fn log_lines(&mut self, segments: &[[Vec3; 2]], color: Color) {
+        let packed = render::pack_color(color);
         self.line_verts.reserve(segments.len() * 2);
         for [a, b] in segments {
-            self.line_verts.push(render::LineVertex { position: a.to_array(), color });
-            self.line_verts.push(render::LineVertex { position: b.to_array(), color });
+            self.line_verts.push(render::LineVertex { position: a.to_array(), color: packed });
+            self.line_verts.push(render::LineVertex { position: b.to_array(), color: packed });
         }
     }
 
@@ -299,8 +301,11 @@ impl Frame {
 
     /// Log a filled axis-aligned box (shaded like a mesh).
     pub fn log_solid_box(&mut self, center: Vec3, half_extents: Vec3, color: Color) {
-        let cube = Mesh::cube(center, half_extents);
-        self.log_mesh(&cube, Mat4::IDENTITY, color);
+        // One shared unit cube, scaled per box (upstream logs a fresh cube per
+        // box; the viewer transforms at draw time anyway).
+        static UNIT_CUBE: std::sync::OnceLock<Mesh> = std::sync::OnceLock::new();
+        let cube = UNIT_CUBE.get_or_init(|| Mesh::cube(Vec3::ZERO, Vec3::splat(0.5)));
+        self.log_mesh(cube, Mat4::from_translation(center) * Mat4::from_scale(half_extents * 2.0), color);
     }
 
     /// Log an arrow from `start` to `end`: a line plus a small solid cone head at `end`.
@@ -311,9 +316,10 @@ impl Frame {
         }
         self.log_lines(&[[start, head_base]], color);
         let base = self.mesh_verts.len();
+        let packed = render::pack_color(color);
         self.mesh_verts
             .extend(cone.into_iter().map(|mut v| {
-                v.color = color;
+                v.color = packed;
                 v
             }));
         self.mesh_instances
@@ -424,6 +430,7 @@ fn push_mesh(
 ) {
     let start = soup.len();
     soup.reserve(if indices.is_empty() { positions.len() } else { indices.len() });
+    let packed = render::pack_color(color);
     let normal_mat = transform.inverse().transpose();
     let mut push = |i: u32| {
         let p = positions[i as usize];
@@ -433,7 +440,7 @@ fn push_mesh(
         soup.push(render::MeshVertex {
             position: wp.to_array(),
             normal: wn.to_array(),
-            color,
+            color: packed,
         });
     };
     if indices.is_empty() {
@@ -704,6 +711,50 @@ impl<H: FnMut(&mut Frame, &mut imgui::Ui)> ApplicationHandler for App<H> {
 
 #[cfg(test)]
 mod bench_timing {
+    /// A scene-preview-like heavy frame: 1 character mesh + foot-contact FK,
+    /// 8 skeleton poses, 4 instance meshes (the duplicated-FK pattern the bins
+    /// use today).
+    #[test]
+    #[ignore = "timing only"]
+    fn time_scene_preview_frame() {
+        use crate::rig::soma::SomaRig;
+        use crate::viewer::Frame;
+        use std::time::Instant;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let soma = SomaRig::load(root.join("checkpoints/motions")).expect("soma loads");
+        let skin = soma.viewer_skin();
+        let local = soma.skeleton.reference_local_transforms().to_vec();
+        let mut frame = Frame::new();
+        let start = Instant::now();
+        let iterations = 100;
+        for _ in 0..iterations {
+            frame.begin_frame(1.0 / 60.0);
+            // Character: mesh + (foot contacts recompute FK).
+            let world = soma.fk(&local, soma.model_to_runtime).expect("fk");
+            let bones = soma.bone_matrices(&world);
+            frame.log_skinned_mesh(&soma.mesh.mesh, &skin, &bones, glam::Mat4::IDENTITY, [0.6, 0.6, 0.6, 1.0]);
+            let _again = soma.fk(&local, soma.model_to_runtime).expect("fk contacts");
+            // 8 context/target skeleton poses.
+            for _ in 0..8 {
+                let world = soma.fk(&local, soma.model_to_runtime).expect("fk skeleton");
+                let mut segments = Vec::with_capacity(world.len() - 1);
+                for (j, w) in world.iter().enumerate().skip(1) {
+                    let parent = world[soma.skeleton.parent_indices()[j] as usize];
+                    segments.push([glam::Vec3::from_array(w.p.0), glam::Vec3::from_array(parent.p.0)]);
+                }
+                frame.log_lines(&segments, [1.0; 4]);
+            }
+            // 4 instance mesh poses.
+            for _ in 0..4 {
+                let world = soma.fk(&local, soma.model_to_runtime).expect("fk instance");
+                let bones = soma.bone_matrices(&world);
+                frame.log_skinned_mesh(&soma.mesh.mesh, &skin, &bones, glam::Mat4::IDENTITY, [1.0, 0.5, 0.5, 1.0]);
+            }
+        }
+        let elapsed = start.elapsed();
+        eprintln!("scene-preview-like frame x{iterations}: {:?} ({:?}/frame)", elapsed, elapsed / iterations);
+    }
+
     #[test]
     #[ignore = "timing only"]
     fn time_log_skinned_mesh_soma() {

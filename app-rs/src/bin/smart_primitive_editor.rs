@@ -1286,22 +1286,17 @@ impl SmartPrimitiveEditor {
             ]);
         }
         frame.log_lines(&path, TRAJECTORY_COLOR);
-        let mut frames = Vec::with_capacity(transforms.len() * 3);
-        let mut frame_colors = Vec::with_capacity(3);
         for (axis, color) in [(Vec3::X, [1.0, 0.0, 0.0, 1.0]), (Vec3::Y, [0.0, 1.0, 0.0, 1.0]), (Vec3::Z, [0.0, 0.0, 1.0, 1.0])] {
-            for transform in &world {
-                frames.push((
+            let axis_frames: Vec<[Vec3; 2]> = world
+                .iter()
+                .map(|transform| {
                     [
                         world_point_to_viewer(transform.translation),
                         world_point_to_viewer(transform.translation + transform.rotation_xyzw * axis * TRAJECTORY_FRAME_SCALE),
-                    ],
-                    color,
-                ));
-            }
-            frame_colors.push(color);
-        }
-        for ([a, b], color) in frames {
-            frame.log_lines(&[[a, b]], color);
+                    ]
+                })
+                .collect();
+            frame.log_lines(&axis_frames, color);
         }
     }
 
