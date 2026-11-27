@@ -32,7 +32,8 @@ bytemuck = { version = "1", features = ["derive"] }
 tempfile = { version = "3", default-features = false }
 
 [features]
-# Development binaries (metal-stages, metal-precision): `cargo run --release --features dev-tools --bin ...`.
+# Development binaries (metal-stages, metal-precision, kernel-times, bench-fused, debug-fused):
+# `cargo run --release --features dev-tools --bin ...`.
 dev-tools = []
 
 [profile.release]
@@ -49,6 +50,21 @@ path = "src/bin/gemm_tune.rs"
 [[bin]]
 name = "metal-stages"
 path = "src/bin/metal_stages.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "debug-fused"
+path = "src/bin/debug_fused.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "bench-fused"
+path = "src/bin/bench_fused.rs"
+required-features = ["dev-tools"]
+
+[[bin]]
+name = "kernel-times"
+path = "src/bin/kernel_times.rs"
 required-features = ["dev-tools"]
 
 [[bin]]

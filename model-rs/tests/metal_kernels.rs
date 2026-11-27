@@ -285,6 +285,84 @@ fn gemm_half_precision_matches_reference() {
 
 /// The Metal transformer stack vs the float64 reference: both attention kernels, padded keys,
 /// short (9) and long (25) sequences, every precision.
+/// The fused GEMM + add + LayerNorm path (`run_ln`, low-latency mode) against the
+/// unfused run + add_layernorm on the same buffers, at every precision.
+#[test]
+fn reduce_ln_matches_unfused() {
+    let _gpu = gpu_lock();
+    let mut rng = Rand::new(7);
+    for precision in ["float32", "float16", "bfloat16", "int8"] {
+        let gpu = Gpu::with_precision(Precision::parse(precision).unwrap()).unwrap();
+        let k = Kernels::new(&gpu).unwrap();
+        for (m, n, kk) in [(9usize, 512usize, 512usize), (16, 1024, 2048), (25, 512, 2048), (16, 512, 1024)] {
+            let a = gpu.upload_t(&rng.vec(m * kk, 1.0));
+            let w = gpu.upload_t(&rng.vec(n * kk, 0.05));
+            let bias = gpu.upload_t(&rng.vec(n, 0.5));
+            let x = gpu.upload_t(&rng.vec(m * n, 1.0));
+            let ln_w = gpu.upload_t(&rng.vec(n, 1.0).iter().map(|v| v.abs() + 0.5).collect::<Vec<_>>());
+            let ln_b = gpu.upload_t(&rng.vec(n, 0.5));
+            let y_ref = gpu.upload_t(&vec![0.0f32; m * n]);
+            let mid = gpu.upload_t(&vec![0.0f32; m * n]);
+            let y_fused = gpu.upload_t(&vec![0.0f32; m * n]);
+            let weight = Weight::Dense(w);
+            let mut rec = Recorder::new(&gpu);
+            k.run(&mut rec, &GemmCall::new(&a, &weight, &bias, &mid, GemmParams::new(m, n, kk)));
+            k.add_layernorm(&mut rec, &x, &mid, &ln_w, &ln_b, &y_ref, m, n);
+            k.run_ln(&mut rec, &GemmCall::new(&a, &weight, &bias, &y_fused, GemmParams::new(m, n, kk)), &x, &ln_w, &ln_b);
+            wait(&rec.commit());
+            let (got, want) = (y_fused.to_f32(m * n), y_ref.to_f32(m * n));
+            let e = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            // The fused path keeps the GEMM sum in f32 through the LayerNorm; the unfused
+            // path rounds it to the network type first, so the two differ by one rounding of
+            // the inputs to LN (up to ~0.4% relative at bf16, on pre-LN values up to ~±10).
+            let tol = if precision == "float32" { 1e-4 } else { 6e-2 };
+            assert!(e < tol, "{precision} m={m} n={n} k={kk}: max abs {e}");
+        }
+    }
+}
+
+/// Timing harness (run with --ignored --nocapture): the unfused GEMM + add_layernorm pair
+/// vs the fused run_ln, at the model's N=1 shapes.
+#[test]
+#[ignore = "timing only"]
+fn time_fused_vs_unfused_pair() {
+    let _gpu = gpu_lock();
+    let gpu = Gpu::with_precision(Precision::BF16).unwrap();
+    let k = Kernels::new(&gpu).unwrap();
+    let mut rng = Rand::new(3);
+    for (m, n, kk) in [(16usize, 1024usize, 1024usize), (16, 1024, 2048), (9, 512, 512), (25, 512, 2048)] {
+        let a = gpu.upload_t(&rng.vec(m * kk, 1.0));
+        let w = gpu.upload_t(&rng.vec(n * kk, 0.05));
+        let bias = gpu.upload_t(&rng.vec(n, 0.5));
+        let x = gpu.upload_t(&rng.vec(m * n, 1.0));
+        let ln_w = gpu.upload_t(&rng.vec(n, 1.0));
+        let ln_b = gpu.upload_t(&rng.vec(n, 0.5));
+        let y = gpu.upload_t(&vec![0.0f32; m * n]);
+        let mid = gpu.upload_t(&vec![0.0f32; m * n]);
+        let weight = Weight::Dense(w);
+        let time = |f: &mut dyn FnMut(&mut Recorder)| -> f64 {
+            let mut times = Vec::new();
+            for _ in 0..30 {
+                let mut rec = Recorder::new(&gpu);
+                f(&mut rec);
+                let t0 = std::time::Instant::now();
+                wait(&rec.commit());
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            times[times.len() / 2]
+        };
+        let unfused = time(&mut |rec| {
+            k.run(rec, &GemmCall::new(&a, &weight, &bias, &mid, GemmParams::new(m, n, kk)));
+            k.add_layernorm(rec, &x, &mid, &ln_w, &ln_b, &y, m, n);
+        });
+        let fused = time(&mut |rec| {
+            k.run_ln(rec, &GemmCall::new(&a, &weight, &bias, &y, GemmParams::new(m, n, kk)), &x, &ln_w, &ln_b);
+        });
+        eprintln!("m={m} n={n} k={kk}: unfused {unfused:.3} ms, fused {fused:.3} ms");
+    }
+}
+
 #[test]
 fn transformer_layer_matches_reference() {
     let _gpu = gpu_lock();
@@ -327,6 +405,57 @@ fn transformer_layer_matches_reference() {
                     "float32" | "int8" => 5e-5,
                     "float16" => 2e-2,
                     _ => 1e-1,
+                };
+                assert!(e < tol, "{precision} d={d} heads={heads} L={l} scalar attention {scalar}: max abs {e}");
+            }
+        }
+    }
+}
+
+/// The same layer in low-latency mode (fused GEMM + add + LayerNorm).
+#[test]
+fn transformer_layer_low_latency_matches_reference() {
+    let _gpu = gpu_lock();
+    let (b, ffn) = (2usize, 256usize);
+    for precision in ["float32", "float16", "bfloat16", "int8"] {
+        let gpu = Gpu::with_precision(Precision::parse(precision).unwrap()).unwrap();
+        let mut k = Kernels::new(&gpu).unwrap();
+        k.low_latency = true;
+        // (d, heads, length): head dims 32 and 64 (MMA attention), 16 (scalar attention).
+        for (d, heads, l) in [(128usize, 4usize, 9usize), (128, 2, 25), (64, 4, 7)] {
+            for scalar in [false, true] {
+                k.scalar_attention = scalar;
+                let mut rng = Rand::new((d * 31 + l) as u64);
+                let w = encoder_weights(&mut rng, 1, d, ffn);
+                let tensors: HashMap<String, Array> = to_arrays(&w, d, ffn);
+                let tf = Transformer::load(&gpu, &tensors, "t", 1, heads, precision == "int8").unwrap();
+                let x = rng.vec(b * l * d, 1.0);
+                let pad: Vec<bool> = (0..b * l).map(|i| i / l == 1 && i % l >= l - 3).collect();
+                let xb = gpu.upload_t(&x);
+                let padb = gpu.upload(&pad.iter().map(|&p| p as i32 as f32).collect::<Vec<_>>());
+                let scratch = Scratch::new(&gpu, b * l, d, ffn);
+                let mut rec = Recorder::new(&gpu);
+                tf.encode(&k, &mut rec, &xb, Some(&padb), b, l, &scratch);
+                wait(&rec.commit());
+                let got = xb.to_f32(b * l * d);
+                // Reference on the weights the runtime actually uses (INT8: dequantized).
+                let mut w_ref = w.clone();
+                if precision == "int8" {
+                    for (name, v) in w_ref.iter_mut() {
+                        if name.ends_with(".weight") && !name.contains("norm") {
+                            let rows = v.len() / if name.ends_with("linear2.weight") { ffn } else { d };
+                            let wa = Array::from_slice(v, &[rows as i32, (v.len() / rows) as i32]);
+                            let (q, s, bb) = quantize(&wa, QuantizeOptions { group_size: Some(64), bits: Some(8), ..Default::default() }).unwrap();
+                            *v = to_vec_f32(&dequantize(&q, &s, &bb.unwrap(), DQ).unwrap()).unwrap();
+                        }
+                    }
+                }
+                let want = reference_layer(&x.iter().map(|&v| v as f64).collect::<Vec<_>>(), &w_ref, 0, b, l, d, ffn, heads, &pad);
+                let e = got.iter().zip(&want).map(|(a, c)| (*a as f64 - c).abs()).fold(0f64, f64::max);
+                let tol = match precision {
+                    "float32" | "int8" => 1e-3,
+                    "float16" => 3e-2,
+                    _ => 1.5e-1,
                 };
                 assert!(e < tol, "{precision} d={d} heads={heads} L={l} scalar attention {scalar}: max abs {e}");
             }

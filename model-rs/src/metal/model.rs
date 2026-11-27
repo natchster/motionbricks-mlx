@@ -80,6 +80,8 @@ pub struct Bufs {
     pub gr_in: Buf,
     pub lr_in: Buf,
     pub lp_in: Buf,
+    /// G1: per-pose root position + heading written by g1_preprocess for g1_preprocess_lr.
+    pub g1_roots: Buf,
     pub hg: Buf,
     pub hl: Buf,
     pub hp: Buf,
@@ -131,7 +133,8 @@ pub struct Bufs {
     pub le: Buf,
     re: Buf,
     pe: Buf,
-    px: Buf,
+    /// Pose transformer output (pub for the dev-tools stage comparisons).
+    pub px: Buf,
     pub plog: Buf,
     /// Pose tokens (int32).
     pub tokens: Buf,
@@ -149,6 +152,7 @@ struct Glue {
     prep: Pipeline,
     soma_retarget: Pipeline,
     g1_preprocess: Pipeline,
+    g1_preprocess_lr: Pipeline,
     root_assemble: Pipeline,
     root_second_input: Pipeline,
     root_dense_cond: Pipeline,
@@ -166,6 +170,7 @@ impl Glue {
             prep: gpu.pipeline("prep")?,
             soma_retarget: gpu.pipeline("soma_retarget")?,
             g1_preprocess: gpu.pipeline("g1_preprocess")?,
+            g1_preprocess_lr: gpu.pipeline("g1_preprocess_lr")?,
             root_assemble: gpu.pipeline("root_assemble")?,
             root_second_input: gpu.pipeline("root_second_input")?,
             root_dense_cond: gpu.pipeline("root_dense_cond")?,
@@ -229,6 +234,39 @@ struct RetargetParams {
     copy_pos: i32,
 }
 
+
+/// Which dispatch structure a [`MetalModel`] encodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// The reference structure (every operator its own dispatch).
+    #[default]
+    Reference,
+    /// Fewer dispatches per transformer layer: the post-norm GEMM + add-residual +
+    /// LayerNorm pairs are fused into the split-K reduce (the GEMM writes partials,
+    /// a row-wise reduce adds the residual and LayerNorms). Numerics differ from the
+    /// reference only by floating-point rounding order. Wins at small batches
+    /// (dispatch-latency-bound), neutral at large ones.
+    LowLatency,
+}
+
+impl Mode {
+    /// "reference" or "low-latency".
+    pub fn parse(name: &str) -> Result<Self> {
+        match name {
+            "reference" | "ref" => Ok(Mode::Reference),
+            "low-latency" | "lowlatency" | "low_latency" | "fused" => Ok(Mode::LowLatency),
+            other => bail!("unknown mode {other:?} (reference or low-latency)"),
+        }
+    }
+
+    /// This mode's name (`Mode::parse` accepts it back).
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Reference => "reference",
+            Mode::LowLatency => "low-latency",
+        }
+    }
+}
 
 pub struct MetalModel {
     pub gpu: Gpu,
@@ -294,10 +332,20 @@ impl MetalModel {
         P: TryInto<config::Precision>,
         P::Error: Into<anyhow::Error>,
     {
+        Self::from_checkpoints_with_mode(name, dir, max_batch, precision, Mode::Reference)
+    }
+
+    /// [`Self::from_checkpoints_with`] with a dispatch [`Mode`] ([`Mode::LowLatency`] fuses the
+    /// transformer's GEMM + add + LayerNorm pairs; lowest latency at small batches).
+    pub fn from_checkpoints_with_mode<P>(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: P, mode: Mode) -> Result<Self>
+    where
+        P: TryInto<config::Precision>,
+        P::Error: Into<anyhow::Error>,
+    {
         let precision = precision.try_into().map_err(Into::into)?;
         let spec = get_spec(name)?;
         let loaded = read_checkpoints(dir, &spec)?;
-        Self::from_loaded(spec, loaded, max_batch, precision)
+        Self::from_loaded(spec, loaded, max_batch, precision, mode)
     }
 
     /// From one converted file (`motionbricks_rs::convert` or `motionbricks_mlx.convert`).
@@ -306,19 +354,29 @@ impl MetalModel {
         P: TryInto<config::Precision>,
         P::Error: Into<anyhow::Error>,
     {
-        let precision = precision.try_into().map_err(Into::into)?;
-        let (name, loaded) = crate::weights::read_converted(path)?;
-        Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision)
+        Self::from_converted_with_mode(path, max_batch, precision, Mode::Reference)
     }
 
-    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: config::Precision) -> Result<Self> {
+    /// [`Self::from_converted`] with a dispatch [`Mode`].
+    pub fn from_converted_with_mode<P>(path: impl AsRef<Path>, max_batch: usize, precision: P, mode: Mode) -> Result<Self>
+    where
+        P: TryInto<config::Precision>,
+        P::Error: Into<anyhow::Error>,
+    {
+        let precision = precision.try_into().map_err(Into::into)?;
+        let (name, loaded) = crate::weights::read_converted(path)?;
+        Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision, mode)
+    }
+
+    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: config::Precision, mode: Mode) -> Result<Self> {
         ensure!((1..=MAX_BATCH).contains(&max_batch), "max_batch must be in 1..={MAX_BATCH}, got {max_batch}");
         let prec = Precision::from(precision);
         let int8 = precision.is_quantized();
         let rep = MotionRepresentation::new(spec.num_joints, &loaded.mean, &loaded.std)?;
         let gpu = Gpu::with_precision(prec)?;
         // Split-K partials are sized after the warm-up, from the launches the model makes.
-        let k = Kernels::with_partial_len(&gpu, 0)?;
+        let mut k = Kernels::with_partial_len(&gpu, 0)?;
+        k.low_latency = mode == Mode::LowLatency;
         let l = Loader { gpu: &gpu, t: &loaded.tensors };
         let pd = 1 + spec.local_poses_dim() as usize;
         let ld = rep.local.dim as usize;
@@ -474,6 +532,7 @@ impl MetalModel {
             gr_in: f(b * 8 * 5),
             lr_in: f(b * 8 * 4),
             lp_in: f(b * 8 * (pd - 1)),
+            g1_roots: f(b * 8 * 4),
             hg: f(b * 8),
             hl: f(b * 8),
             hp: f(b * 8),
@@ -586,8 +645,10 @@ impl MetalModel {
         let (b, n) = (&self.b, d.b as usize);
         let lp = match self.spec.kind {
             Kind::UnitreeG1 => {
-                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(bytemuck::bytes_of(d))];
-                rec.dispatch(&self.glue.g1_preprocess, &args, (n.div_ceil(32), 1, 1), (32, 1, 1));
+                let args = [Arg::Buf(&b.ctx, 0), Arg::Buf(&b.tgt, 0), Arg::Buf(&self.rig.f, 0), Arg::Buf(&self.rig.i, 0), Arg::Buf(&b.gr_in, 0), Arg::Buf(&b.lp_in, 0), Arg::Bytes(bytemuck::bytes_of(d)), Arg::Buf(&b.g1_roots, 0)];
+                rec.dispatch(&self.glue.g1_preprocess, &args, ((n * 8).div_ceil(32), 1, 1), (32, 1, 1));
+                let args = [Arg::Buf(&b.g1_roots, 0), Arg::Buf(&b.lr_in, 0), Arg::Bytes(bytemuck::bytes_of(d))];
+                rec.dispatch(&self.glue.g1_preprocess_lr, &args, ((n * 8).div_ceil(32), 1, 1), (32, 1, 1));
                 &b.lp_in
             }
             Kind::Soma => {

@@ -145,17 +145,19 @@ struct G1Off { int basis, axes, q2t, rest, neutral, f2q, model_axes; int parents
 constant constexpr G1Off GO = {0, 9, 9 + 87, 9 + 87 + 261, 9 + 87 + 261 + 90, 9 + 87 + 261 + 90 + 102,
                                9 + 87 + 261 + 90 + 102 + 306, 0, 30, 64, 98};
 
-// One thread per batch item: 8 poses (4 context + 4 target), XYZW root quaternion inputs.
+// One thread per (batch item, pose): 8 poses (4 context + 4 target), XYZW root quaternion
+// inputs. Each thread writes its pose's gr/lp rows and its root position + heading for
+// g1_preprocess_lr (the local-root rows need the next pose's heading).
 [[kernel]] void g1_preprocess(
     device const float* ctx [[buffer(0)]], device const float* tgt [[buffer(1)]],
     device const float* rf [[buffer(2)]], device const int* ri [[buffer(3)]],
-    device float* gr [[buffer(4)]], device float* lr [[buffer(5)]], device float* lp [[buffer(6)]],
-    constant Dims& d [[buffer(7)]], uint b [[thread_position_in_grid]]) {
-  if (int(b) >= d.B) return;
+    device float* gr [[buffer(4)]], device float* lp [[buffer(5)]],
+    constant Dims& d [[buffer(6)]], device float* roots [[buffer(7)]], uint tid [[thread_position_in_grid]]) {
+  const int b = int(tid) / 8;
+  if (b >= d.B) return;
+  const int f = int(tid) % 8;
   const M3 basis = load3(rf + GO.basis);
-  float3 root[8];
-  float heading[8];
-  for (int f = 0; f < 8; f++) {
+  {
     device const float* q = (f < 4 ? ctx + (b * 4 + f) * 36 : tgt + (b * 4 + f - 4) * 36);
     // XYZW -> WXYZ
     M3 rot[30];
@@ -191,10 +193,13 @@ constant constexpr G1Off GO = {0, 9, 9 + 87, 9 + 87 + 261, 9 + 87 + 261 + 90, 9 
         mr[jt] = eye3();
       }
     }
-    root[f] = mp[0];
-    heading[f] = atan2(mr[0].m[0][2], mr[0].m[2][2]);
+    device float* root_heading = roots + (long)(b * 8 + f) * 4;
+    root_heading[0] = mp[0].x;
+    root_heading[1] = mp[0].y;
+    root_heading[2] = mp[0].z;
+    root_heading[3] = atan2(mr[0].m[0][2], mr[0].m[2][2]);
     device float* g = gr + (b * 8 + f) * 5;
-    g[0] = mp[0].x; g[1] = mp[0].y; g[2] = mp[0].z; g[3] = cos(heading[f]); g[4] = sin(heading[f]);
+    g[0] = mp[0].x; g[1] = mp[0].y; g[2] = mp[0].z; g[3] = cos(root_heading[3]); g[4] = sin(root_heading[3]);
     device float* l = lp + (long)(b * 8 + f) * (d.PD - 1);
     for (int jt = 1; jt < 34; jt++) {
       float3 nr = mp[jt] - mp[0] * float3(1.0f, 0.0f, 1.0f);
@@ -206,18 +211,27 @@ constant constexpr G1Off GO = {0, 9, 9 + 87, 9 + 87 + 261, 9 + 87 + 261 + 90, 9 
       s[3] = mr[jt].m[0][1]; s[4] = mr[jt].m[1][1]; s[5] = mr[jt].m[2][1];
     }
   }
-  for (int start = 0; start < 8; start += 4) {
-    for (int i = 0; i < 3; i++) {
-      int f = start + i;
-      device float* o = lr + (b * 8 + f) * 4;
-      o[0] = wrap_pi(heading[f + 1] - heading[f]) * 30.0f;
-      o[1] = (root[f + 1].x - root[f].x) * 30.0f;
-      o[2] = (root[f + 1].z - root[f].z) * 30.0f;
-      o[3] = root[f].y;
-    }
-    device float* o = lr + (b * 8 + start + 3) * 4;
-    o[0] = 0.0f; o[1] = 0.0f; o[2] = 0.0f; o[3] = root[start + 3].y;
+}
+
+// The local-root rows (one thread per (batch item, pose)): deltas to the next pose, from the
+// roots and headings g1_preprocess left in `roots`.
+[[kernel]] void g1_preprocess_lr(
+    device const float* roots [[buffer(0)]], device float* lr [[buffer(1)]],
+    constant Dims& d [[buffer(2)]], uint tid [[thread_position_in_grid]]) {
+  const int b = int(tid) / 8;
+  if (b >= d.B) return;
+  const int f = int(tid) % 8;
+  const float4 r0 = *(device const float4*)(roots + (long)(b * 8 + f) * 4);
+  device float* o = lr + (b * 8 + f) * 4;
+  if (f % 4 == 3) {
+    o[0] = 0.0f; o[1] = 0.0f; o[2] = 0.0f; o[3] = r0.y;
+    return;
   }
+  const float4 r1 = *(device const float4*)(roots + (long)(b * 8 + f + 1) * 4);
+  o[0] = wrap_pi(r1.w - r0.w) * 30.0f;
+  o[1] = (r1.x - r0.x) * 30.0f;
+  o[2] = (r1.z - r0.z) * 30.0f;
+  o[3] = r0.y;
 }
 
 // --- root network glue ---------------------------------------------------------------------------

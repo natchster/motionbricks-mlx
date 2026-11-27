@@ -77,6 +77,17 @@ struct LnParams {
     eps: f32,
 }
 
+/// `gemm_reduce_ln` parameters (must match kernels.metal's ReduceLnParams).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ReduceLnParams {
+    m: i32,
+    n: i32,
+    splits: i32,
+    ldy: i32,
+    eps: f32,
+}
+
 
 pub const ACT_NONE: i32 = 0;
 pub const ACT_RELU: i32 = 1;
@@ -279,6 +290,8 @@ struct Flags {
     up: bool,
     q8: bool,
     vec: bool,
+    /// Write split-K partials even when the plan does not split K (fused reduce paths).
+    partial: bool,
 }
 
 /// Kernels used by the runtime; GEMM pipelines are specialized lazily per (tile, flags)
@@ -292,6 +305,11 @@ pub struct Kernels {
     /// Use the scalar attention kernel (one lane per key) even where the MMA kernel applies.
     pub scalar_attention: bool,
     pub add_ln: Pipeline,
+    /// Row-wise split-K reduce with a fused add-residual + LayerNorm (low-latency mode).
+    pub reduce_ln: Pipeline,
+    /// Fuse the post-norm transformer's GEMM + add + LayerNorm pairs into one reduce
+    /// dispatch (one fewer dispatch per pair; see [`Self::run_ln`]).
+    pub low_latency: bool,
     pub dummy: Buf,
     pub dummy_t: Buf,
     /// Split-K partial sums. Its length caps splits * M * N (larger plans use fewer splits).
@@ -329,6 +347,8 @@ impl Kernels {
                 .collect::<Result<_>>()?,
             scalar_attention: false,
             add_ln: gpu.pipeline("add_layernorm")?,
+            reduce_ln: gpu.pipeline("gemm_reduce_ln")?,
+            low_latency: false,
             dummy: gpu.buffer(4),
             dummy_t: gpu.buffer_t(4),
             partial: gpu.buffer(len),
@@ -359,7 +379,7 @@ impl Kernels {
             return p.clone();
         }
         let name = format!("gemm_mma_{}_{}_{}_{}_{}", t.bm, t.bn, t.bk, t.wm, t.wn);
-        let consts = [(0, f.plain), (1, f.conv), (2, f.concat), (3, f.amask), (4, f.arelu), (5, f.up), (6, f.q8), (7, f.vec)];
+        let consts = [(0, f.plain), (1, f.conv), (2, f.concat), (3, f.amask), (4, f.arelu), (5, f.up), (6, f.q8), (7, f.vec), (8, f.partial)];
         match self.gpu.specialized(&name, &consts) {
             Ok(p) => {
                 self.gemm.borrow_mut().insert((t, f), p.clone());
@@ -474,8 +494,65 @@ impl Kernels {
             up: p.conv_up == 2,
             q8,
             vec,
+            partial: false,
         };
         (p, t, flags)
+    }
+
+    /// Fused `y = LN(x + (A Wᵀ + b))`: the GEMM writes split-K partials (even when the plan
+    /// does not split K), then a row-wise reduce dispatch applies bias, adds the residual `x`
+    /// and LayerNorms each row — one dispatch fewer than [`Self::run`] + [`Self::add_layernorm`],
+    /// and the intermediate never leaves registers. The GEMM must be a plain linear (no conv,
+    /// concat, mask, activation or blend epilogue). Used in low-latency mode.
+    pub fn run_ln(&self, rec: &mut Recorder, g: &GemmCall, x: &Buf, ln_w: &Buf, ln_b: &Buf) {
+        let q8 = matches!(g.w, Weight::Q8(_));
+        // Row width cap of the fused kernel's threadgroup row buffer (kernels.metal).
+        assert!(g.p.n <= 3072 && g.p.n % 4 == 0, "run_ln needs a row width <= 3072 and a multiple of 4: {:?}", g.p);
+        let (p, t, mut flags) = self.resolve(&g.p, q8);
+        assert!(!flags.conv && !flags.concat && !flags.amask && !flags.arelu && g.p.act == ACT_NONE && g.res.is_none() && g.ymask.is_none() && g.missing.is_none(), "run_ln needs a plain linear: {:?}", g.p);
+        flags.partial = true;
+        let (m, n) = (p.m as usize, p.n as usize);
+        let pso = self.pipeline(t, flags);
+        let (d, dt) = (&self.dummy, &self.dummy_t);
+        let (wd, wq, qs, qb) = match g.w {
+            Weight::Dense(b) => (b, d, d, d),
+            Weight::Q8(q) => (dt, &q.q, &q.scales, &q.biases),
+        };
+        let args = [
+            Arg::Buf(g.a.0, g.a.1),
+            Arg::Buf(wd, 0),
+            Arg::Buf(g.bias, 0),
+            Arg::Buf(g.y.0, g.y.1),
+            Arg::Bytes(bytemuck::bytes_of(&p)),
+            Arg::Buf(g.amask.unwrap_or(d), 0),
+            Arg::Buf(dt, 0),
+            Arg::Buf(g.a2.unwrap_or(dt), 0),
+            Arg::Buf(g.a3.unwrap_or(dt), 0),
+            Arg::Buf(d, 0),
+            Arg::Buf(d, 0),
+            Arg::Buf(wq, 0),
+            Arg::Buf(qs, 0),
+            Arg::Buf(qb, 0),
+            Arg::Buf(&self.partial, 0),
+        ];
+        rec.dispatch(&pso, &args, (n.div_ceil(t.bn), m.div_ceil(t.bm), p.splits as usize), (t.wm * t.wn * 32, 1, 1));
+        let rl = ReduceLnParams { m: p.m, n: p.n, splits: p.splits, ldy: p.ldy, eps: 1e-5 };
+        let args = [
+            Arg::Buf(&self.partial, 0),
+            Arg::Buf(g.bias, 0),
+            Arg::Buf(x, 0),
+            Arg::Buf(ln_w, 0),
+            Arg::Buf(ln_b, 0),
+            Arg::Buf(g.y.0, g.y.1),
+            Arg::Bytes(bytemuck::bytes_of(&rl)),
+        ];
+        rec.dispatch(&self.reduce_ln, &args, (m, 1, 1), (1024, 1, 1));
+    }
+
+    /// Plain linear + residual + LayerNorm (low-latency mode): `y = LN(x + (A Wᵀ + b))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_ln(&self, rec: &mut Recorder, a: &Buf, w: &Weight, bias: &Buf, x: &Buf, ln_w: &Buf, ln_b: &Buf, y: &Buf, m: usize, n: usize, k: usize) {
+        self.run_ln(rec, &GemmCall::new(a, w, bias, y, GemmParams::new(m, n, k)), x, ln_w, ln_b);
     }
 
     /// `Y = epilogue(A Wᵀ + b)` with the planned kernel (plus a reduce dispatch when split over K).
@@ -681,11 +758,18 @@ impl Transformer {
         for l in &self.layers {
             k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE);
             k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads);
-            k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
-            k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
-            k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
-            k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
-            k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
+            if k.low_latency {
+                // Fused: GEMM partials -> row reduce with add-residual + LayerNorm.
+                k.linear_ln(rec, &s.attn, &l.out_w, &l.out_b, x, &l.n1_w, &l.n1_b, &s.x2, rows, d, d);
+                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
+                k.linear_ln(rec, &s.ff, &l.l2_w, &l.l2_b, &s.x2, &l.n2_w, &l.n2_b, x, rows, d, f);
+            } else {
+                k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
+                k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
+                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
+                k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
+                k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
+            }
         }
     }
 }

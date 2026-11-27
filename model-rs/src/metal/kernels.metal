@@ -54,7 +54,9 @@ constant bool fc_arelu [[function_constant(4)]];   // relu(A)
 constant bool fc_up [[function_constant(5)]];      // conv over 2x nearest-upsampled frames
 constant bool fc_q8 [[function_constant(6)]];      // W is INT8 (affine, group 64)
 constant bool fc_vec [[function_constant(7)]];     // all K extents / strides multiples of 4
+constant bool fc_partial [[function_constant(8)]]; // write split-K partials even at splits == 1 (fused reduce paths)
 #define FC(x) (is_function_constant_defined(x) && x)
+constant bool PARTIAL = FC(fc_partial);
 constant bool PLAIN = FC(fc_plain);
 constant bool CONV = FC(fc_conv);
 constant bool CONCAT = FC(fc_concat);
@@ -316,7 +318,7 @@ template <int BM, int BN, int BK, int WM, int WN>
       }
     }
   }
-  const bool split = p.splits > 1;
+  const bool split = p.splits > 1 || PARTIAL;
   _Pragma("clang loop unroll(full)") for (int i = 0; i < TM; i++) {
     _Pragma("clang loop unroll(full)") for (int j = 0; j < TN; j++) {
       auto e = acc[i][j].thread_elements();
@@ -546,6 +548,55 @@ inline float tg_sum(float v, threadgroup float* red, uint sg, uint lane, uint ns
   t = simd_sum(t);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   return t;
+}
+
+struct ReduceLnParams {
+  int M, N;              // rows, row width of Y
+  int splits;            // K splits summed from P ([splits][M][N])
+  int ldy;               // row stride of Y
+  float eps;             // LayerNorm epsilon
+};
+
+// Sum split-K partials, add the bias and the residual X, then LayerNorm the row:
+// y = LN(x + gemm) — one transformer-layer dispatch instead of GEMM-write + add_layernorm.
+// One threadgroup per row; N <= REDUCE_LN_MAX (rows are <= 32 at this model's sizes).
+constant int REDUCE_LN_MAX = 3072;
+[[kernel]] void gemm_reduce_ln(
+    device const float* P [[buffer(0)]], device const T* bias [[buffer(1)]],
+    device const T* x [[buffer(2)]], device const T* w [[buffer(3)]], device const T* bvec [[buffer(4)]],
+    device T* y [[buffer(5)]], constant ReduceLnParams& p [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint nsg [[simdgroups_per_threadgroup]]) {
+  if (int(row) >= p.M) return;
+  threadgroup float red[32];
+  threadgroup float a[REDUCE_LN_MAX];
+  const int mn = int(row) * p.N;
+  // Vectorized: N is a multiple of 4 (the transformer's widths are), so each lane
+  // handles float4 chunks.
+  const int n4 = p.N / 4;
+  device const float4* P4 = (device const float4*)(P + mn);
+  device const T4* bias4 = (device const T4*)bias;
+  device const T4* x4 = (device const T4*)(x + mn);
+  float sum = 0.0f;
+  for (int i = int(tid); i < n4; i += int(nt)) {
+    float4 v = float4(bias4[i]);
+    for (int z = 0; z < p.splits; z++) v += ((device const float4*)(P + z * p.M * p.N + mn))[i];
+    v += float4(x4[i]);
+    for (int c = 0; c < 4; c++) a[i * 4 + c] = v[c];
+    sum += v.x + v.y + v.z + v.w;
+  }
+  const float mean = tg_sum(sum, red, sg, lane, nsg) / p.N;
+  float var = 0.0f;
+  for (int i = int(tid); i < p.N; i += int(nt)) { float d = a[i] - mean; var += d * d; }
+  const float inv = rsqrt(tg_sum(var, red, sg, lane, nsg) / p.N + p.eps);
+  device T4* y4 = (device T4*)(y + int(row) * p.ldy);
+  device const T4* w4 = (device const T4*)w;
+  device const T4* b4 = (device const T4*)bvec;
+  for (int i = int(tid); i < n4; i += int(nt)) {
+    float4 av(a[i * 4], a[i * 4 + 1], a[i * 4 + 2], a[i * 4 + 3]);
+    y4[i] = T4((av - mean) * inv * float4(w4[i]) + float4(b4[i]));
+  }
 }
 
 [[kernel]] void add_layernorm(

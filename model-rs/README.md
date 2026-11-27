@@ -12,6 +12,23 @@ golden parity tests against NVIDIA's PyTorch model as the Python port.
 The [user guide](../docs/user_guide.md#3-the-rust-implementations-model-rs) explains when to use which. The Metal runtime is tied to this model
 implementation and to Apple-silicon GPUs, in exchange for the lowest latency.
 
+### Dispatch modes (reference and low-latency)
+
+`MetalModel` runs one of two dispatch structures (`metal::model::Mode`, `Reference` by default):
+
+- **Reference:** every operator is its own dispatch; this is the structure all parity numbers and
+  the speedup table above were measured with.
+- **Low-latency** (`from_checkpoints_with_mode` / `from_converted_with_mode`): the post-norm
+  transformer's `GEMM → +residual → LayerNorm` pairs are fused into the split-K reduce — the GEMM
+  writes partials and a vectorized row-wise reduce adds the residual and LayerNorms, saving 48
+  dispatches at N=1 (398 → 350) and the intermediate tensor's round trip. Numerics differ from the
+  reference only by floating-point rounding order (the fused path rounds the GEMM output *less*
+  often); `tests/metal_model.rs::low_latency_matches_reference` checks both models, all precisions.
+  Measured at N=1 (GPU time, interleaved with the reference on an M4 Pro): **about 3–7% faster**
+  at BF16, 0–3% at FP32; neutral from N=4 up, where the dispatches no longer dominate. It uses the
+  same tuned GEMM plans (the GEMM halves are unchanged), so the M4-Pro table and the fallback rule
+  for other Macs both apply as before.
+
 Both also run upstream's **Runtime API** (`motionbricks_rs::runtime`). It provides engines,
 endpoint correction, tokens, animation buffers, the motion recorder, motion players, target
 placement, IK pins, and BVH/CSV clips. See [Runtime API](#runtime-api).
