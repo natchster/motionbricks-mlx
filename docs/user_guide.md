@@ -175,7 +175,7 @@ by skipping. The per-stage table is in [model/README.md](../model/README.md#veri
 | | `motionbricks_rs::MotionBricks` (mlx-rs port) | **`motionbricks_rs::metal::model::MetalModel`** (Metal runtime) |
 |---|---|---|
 | what it is | the Python graph op for op on mlx-rs: same MLX kernels | a fixed dispatch plan written for these two networks, on its own Metal kernels |
-| speed | same as Python (0.99–1.01× the time, compiled) | **about 2× faster at N=1**; 1.8–1.9× at N=2, 1.4× at N=4, 1.2–1.3× at N=8, 1.07–1.18× at N=16, 1.04–1.09× at N=32 (INT8 at N=2–4: 1.35–1.6×) |
+| speed | same as Python (0.99–1.01× the time, compiled) | **2.1–2.3× faster at N=1**; 1.9–2.1× at N=2, 1.4–1.5× at N=4, 1.2–1.3× at N=8, 1.09–1.18× at N=16, 1.02–1.08× at N=32 (INT8 at N=2: 1.7×) |
 | precisions | FP32, FP16, BF16 | FP32, FP16, BF16, INT8 (the same modes as the Python port) |
 | configurations | everything the Python port supports | the release configuration only |
 
@@ -421,7 +421,7 @@ All numbers come from a **Mac mini (2024, model `Mac16,11`) with an Apple M4 Pro
 - 14-core CPU (10 performance + 4 efficiency cores), 20-core GPU, 64 GB of unified memory;
 - macOS 27.0 (build 26A428), Python 3.12.11 with MLX 0.32.4, Rust 1.100 with mlx-rs 0.34 (MLX
   0.32.2), PyTorch 2.15.0 and ONNX Runtime 1.32.0;
-- a quiet machine (load average 0.6–4), measured on 2026-11-21.
+- a quiet machine (load median 2.3, range 1.4–5.8), measured on 2026-11-27.
 
 ### Across backends
 
@@ -429,12 +429,12 @@ Median time per batched generation, with requests/s in parentheses:
 
 | Backend | SOMA N=1 | SOMA N=32 | G1 N=1 | G1 N=32 |
 |---|---|---|---|---|
-| **Rust Metal runtime, BF16** (`model-rs`) | **4.05 ms** (247) | **35.21 ms (909)** | **4.04 ms** (248) | **35.42 ms (903)** |
-| Rust Metal runtime, INT8 weights | **4.03 ms** (248) | 42.78 ms (748) | 4.06 ms (246) | 42.15 ms (759) |
-| Rust Metal runtime, FP32 | 5.18 ms (193) | 42.91 ms (746) | 5.18 ms (193) | 43.72 ms (732) |
-| Python MLX, BF16 | 8.25 ms (121) | 37.86 ms (845) | 8.30 ms (121) | 37.76 ms (848) |
-| Python MLX, INT8 weights | 8.01 ms (125) | 46.37 ms (690) | 7.96 ms (126) | 45.64 ms (701) |
-| Python MLX, FP32 | 10.72 ms (93) | 45.18 ms (708) | 10.55 ms (95) | 45.38 ms (705) |
+| **Rust Metal runtime, BF16** (`model-rs`) | **3.76 ms** (266) | **37.35 ms (857)** | **3.64 ms** (276) | **36.08 ms (887)** |
+| Rust Metal runtime, INT8 weights | **3.81 ms** (262) | 43.48 ms (736) | 3.71 ms (269) | 42.57 ms (752) |
+| Rust Metal runtime, FP32 | 5.00 ms (200) | 42.88 ms (746) | 4.88 ms (205) | 43.67 ms (733) |
+| Python MLX, BF16 | 8.29 ms (121) | 38.80 ms (825) | 8.25 ms (120) | 38.17 ms (838) |
+| Python MLX, INT8 weights | 7.96 ms (126) | 46.75 ms (684) | 7.85 ms (127) | 45.60 ms (702) |
+| Python MLX, FP32 | 10.61 ms (95) | 46.02 ms (695) | 10.50 ms (95) | 46.03 ms (695) |
 | upstream PyTorch, `.cuda()`→MPS via cudashim | 32.08 ms (31) | 91.19 ms (351) | 37.04 ms (27) | 98.97 ms (323) |
 | upstream ONNX on ONNX Runtime CPU (TensorRT shim) | 13.54 ms (74) | 210.6 ms (152) | 14.06 ms (71) | 213.6 ms (150) |
 | upstream PyTorch, CPU | 33.41 ms (30) | 867 ms (37) | 33.29 ms (30) | 914 ms (35) |
@@ -448,17 +448,17 @@ Where the numbers come from:
   same machine and software; those backends haven't changed since.
 
 What the table shows:
-- **Lowest latency:** the Rust Metal runtime takes **4.0 ms for a single request** in BF16,
-  FP16 or INT8, and 5.2 ms in FP32. That is about **2× faster** than Python MLX at the same
+- **Lowest latency:** the Rust Metal runtime takes **3.6–3.8 ms for a single request** in BF16,
+  FP16 or INT8, and 4.9–5.0 ms in FP32. That is **2.1–2.3× faster** than Python MLX at the same
   precision.
-- **Highest throughput:** the Rust Metal runtime in **BF16** delivers 903–909 req/s at N=32,
-  against Python BF16's 845–848.
-- **Every batch size and precision:** the Metal runtime is faster than Python MLX in all 144 paired
-  comparisons (2 models × 4 precisions × 6 batch sizes × 3 rounds). The smallest margin is 1.02×,
-  for FP32 at N=32.
-- **Versus other Mac options:** at its fastest precision, Python MLX is 2.4–4.7× faster than
-  NVIDIA's PyTorch model on the GPU (MPS), and the Rust Metal runtime 2.6–9.2× faster. At batch 32
-  they deliver 5.6–5.7× and 6.0× the throughput of ONNX Runtime on the CPU.
+- **Highest throughput:** the Rust Metal runtime in **BF16** delivers 857–887 req/s at N=32,
+  against Python BF16's 825–838.
+- **Every batch size and precision:** the Metal runtime is faster than Python MLX in all paired
+  comparisons at N ≤ 16 (2 models × 4 precisions × 5 batch sizes × 3 rounds), by 2.12–2.31× at
+  N=1; at N=32 both are GPU-throughput-bound and the margin is within noise (0.98–1.08×).
+- **Versus other Mac options:** at its fastest precision, Python MLX is 2.4–4.5× faster than
+  NVIDIA's PyTorch model on the GPU (MPS), and the Rust Metal runtime 2.4–10.2× faster. At batch 32
+  they deliver 5.6× and 5.6–5.9× the throughput of ONNX Runtime on the CPU.
 
 ### Python MLX vs the Rust Metal runtime
 
@@ -467,18 +467,18 @@ per precision. Each cell gives Python MLX → **Rust Metal runtime** in ms, and 
 
 | N | FP32 | BF16 | FP16 | INT8 weights |
 |---|---|---|---|---|
-| 1 | 10.72 → **5.18** (2.06×) | 8.25 → **4.05** (2.04×) | 8.24 → **4.04** (2.04×) | 8.01 → **4.03** (1.99×) |
-| 2 | 11.06 → **5.98** (1.85×) | 8.89 → **4.66** (1.91×) | 8.87 → **4.70** (1.88×) | 8.48 → **5.26** (1.61×) |
-| 4 | 12.02 → **8.28** (1.45×) | 10.00 → **6.92** (1.45×) | 9.99 → **6.99** (1.43×) | 10.75 → **7.93** (1.36×) |
-| 8 | 15.99 → **13.08** (1.20×) | 13.94 → **10.90** (1.28×) | 13.93 → **10.97** (1.27×) | 15.37 → **12.82** (1.20×) |
-| 16 | 24.90 → **22.99** (1.08×) | 21.77 → **18.38** (1.18×) | 21.78 → **19.08** (1.14×) | 25.26 → **23.01** (1.10×) |
-| 32 | 45.18 → **42.91** (1.04×) | 37.86 → **35.21** (1.08×) | 37.86 → **36.49** (1.04×) | 46.37 → **42.78** (1.09×) |
+| 1 | 10.61 → **5.00** (2.12×) | 8.29 → **3.76** (2.25×) | 8.14 → **3.78** (2.15×) | 7.96 → **3.81** (2.26×) |
+| 2 | 11.02 → **5.70** (1.93×) | 8.98 → **4.42** (2.05×) | 8.81 → **4.50** (1.97×) | 8.47 → **5.03** (1.72×) |
+| 4 | 11.92 → **8.08** (1.48×) | 10.12 → **6.76** (1.48×) | 9.93 → **6.78** (1.47×) | 10.66 → **7.74** (1.38×) |
+| 8 | 15.95 → **12.95** (1.23×) | 14.09 → **11.17** (1.28×) | 13.86 → **10.95** (1.26×) | 15.27 → **12.70** (1.21×) |
+| 16 | 25.30 → **22.56** (1.12×) | 22.19 → **19.06** (1.18×) | 21.77 → **18.96** (1.15×) | 25.60 → **23.19** (1.11×) |
+| 32 | 46.02 → **42.88** (1.07×) | 38.80 → **37.35** (1.04×) | 37.86 → **36.61** (1.03×) | 46.75 → **43.48** (1.08×) |
 
-- **Unitree G1:** within 0.04× of these ratios. Both models, the per-round ranges and the mlx-rs
-  port's times are in
+- **Unitree G1:** within 0.2× of these ratios (3.64 ms at N=1 BF16, 2.26×). Both models, the
+  per-round ranges and the mlx-rs port's times are in
   [`model-rs/bench/results/report_metal.md`](../model-rs/bench/results/report_metal.md).
-- **Streams of single requests:** the Metal runtime sustains 193–194 req/s in FP32 and 247–251 req/s
-  in BF16/FP16 without pipelining. Pipelined Python reaches 149–153 and 198–199.
+- **Streams of single requests:** the Metal runtime sustains 200–205 req/s in FP32 and 265–280
+  req/s in BF16/FP16 without pipelining. Pipelined Python reaches 151–155 and 185–200.
 
 What changed since the first Rust release, which was FP32 only and 0.97× Python's speed at N=32:
 - **FP16, BF16 and INT8 kernels**, with the same modes as the Python port.
@@ -490,6 +490,11 @@ What changed since the first Rust release, which was FP32 only and 0.97× Python
   0.16–0.25 ms per call (4–6% at N=1).
 - **No MLX kernels at run time:** the steel GEMMs the first release borrowed from `mlx.metallib`
   are replaced by its own kernel, which matches them.
+- **Fused normalize:** the transformer's Linear → +residual → LayerNorm pairs run in one split-K
+  reduce dispatch each (the GEMM writes partials; a vectorized row-wise reduce applies bias,
+  residual and LayerNorm) — 48 fewer dispatches at N=1 (398 → 350 on SOMA).
+- **Per-pose G1 forward kinematics:** the G1 rig kernel runs one thread per pose and batch item
+  instead of one thread per sequence (the G1 input stage drops from ~0.2 ms to 0.07 ms at N=1).
 
 ### Running the benchmarks
 

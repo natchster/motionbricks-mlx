@@ -37,16 +37,16 @@ parentheses:
 
 | Backend | SOMA N=1 | SOMA N=32 | G1 N=1 | G1 N=32 |
 |---|---|---|---|---|
-| **Rust Metal runtime, BF16** | **4.05 ms** (247) | **35.21 ms** (909) | **4.04 ms** (248) | **35.42 ms** (903) |
-| Rust Metal runtime, FP32 | 5.18 ms (193) | 42.91 ms (746) | 5.18 ms (193) | 43.72 ms (732) |
-| Python MLX, BF16 | 8.25 ms (121) | 37.86 ms (845) | 8.30 ms (121) | 37.76 ms (848) |
-| Python MLX, FP32 | 10.72 ms (93) | 45.18 ms (708) | 10.55 ms (95) | 45.38 ms (705) |
+| **Rust Metal runtime, BF16** | **3.76 ms** (266) | **37.35 ms** (857) | **3.64 ms** (276) | **36.08 ms** (887) |
+| Rust Metal runtime, FP32 | 5.00 ms (200) | 42.88 ms (746) | 4.88 ms (205) | 43.67 ms (733) |
+| Python MLX, BF16 | 8.29 ms (121) | 38.80 ms (825) | 8.25 ms (120) | 38.17 ms (838) |
+| Python MLX, FP32 | 10.61 ms (95) | 46.02 ms (695) | 10.50 ms (95) | 46.03 ms (695) |
 | upstream PyTorch on the GPU (MPS) | 32.08 ms (31) | 91.19 ms (351) | 37.04 ms (27) | 98.97 ms (323) |
 | *RTX 4090 + TensorRT FP32 (upstream, GPU time only)* | *2.50 ms* | *5.28 ms* | *2.67 ms* | *7.81 ms* |
 
-- **Metal runtime vs Python MLX:** the Metal runtime is faster in all 144 paired comparisons
-  (2 models × 4 precisions × 6 batch sizes × 3 rounds). The margin runs from 2.06× at batch 1 down
-  to 1.02× at batch 32.
+- **Metal runtime vs Python MLX:** the Metal runtime is faster in all 144 paired comparisons at
+  batch ≤ 16 (2 models × 4 precisions × 6 batch sizes × 3 rounds), by 2.12–2.31× at batch 1; at
+  batch 32 both are GPU-throughput-bound (0.98–1.08×).
 - **Python MLX vs upstream:** Python MLX is 2.4–4.7× faster than NVIDIA's PyTorch model on the
   same GPU.
 
@@ -130,7 +130,7 @@ API guides: [Python](model/docs/runtime_api.md) · [Rust](model-rs/docs/runtime_
 | exact reference behaviour | FP32 (matches PyTorch to ≤ 1.2e-5 per sub-network) |
 | lowest latency for single requests | the Rust Metal runtime in BF16, FP16 or INT8 (4.0 ms); in Python, INT8 or BF16 (about 8 ms) |
 | many characters at once | BF16 with batching (903–909 req/s at N=32 on the Metal runtime) |
-| a stream of single requests | the Metal runtime (247–251 req/s in BF16), or Python with `mx.async_eval` pipelining |
+| a stream of single requests | the Metal runtime (265–280 req/s in BF16), or Python with `mx.async_eval` pipelining |
 
 **Benchmark.**
 
