@@ -412,57 +412,6 @@ fn transformer_layer_matches_reference() {
     }
 }
 
-/// The same layer in low-latency mode (fused GEMM + add + LayerNorm).
-#[test]
-fn transformer_layer_low_latency_matches_reference() {
-    let _gpu = gpu_lock();
-    let (b, ffn) = (2usize, 256usize);
-    for precision in ["float32", "float16", "bfloat16", "int8"] {
-        let gpu = Gpu::with_precision(Precision::parse(precision).unwrap()).unwrap();
-        let mut k = Kernels::new(&gpu).unwrap();
-        k.low_latency = true;
-        // (d, heads, length): head dims 32 and 64 (MMA attention), 16 (scalar attention).
-        for (d, heads, l) in [(128usize, 4usize, 9usize), (128, 2, 25), (64, 4, 7)] {
-            for scalar in [false, true] {
-                k.scalar_attention = scalar;
-                let mut rng = Rand::new((d * 31 + l) as u64);
-                let w = encoder_weights(&mut rng, 1, d, ffn);
-                let tensors: HashMap<String, Array> = to_arrays(&w, d, ffn);
-                let tf = Transformer::load(&gpu, &tensors, "t", 1, heads, precision == "int8").unwrap();
-                let x = rng.vec(b * l * d, 1.0);
-                let pad: Vec<bool> = (0..b * l).map(|i| i / l == 1 && i % l >= l - 3).collect();
-                let xb = gpu.upload_t(&x);
-                let padb = gpu.upload(&pad.iter().map(|&p| p as i32 as f32).collect::<Vec<_>>());
-                let scratch = Scratch::new(&gpu, b * l, d, ffn);
-                let mut rec = Recorder::new(&gpu);
-                tf.encode(&k, &mut rec, &xb, Some(&padb), b, l, &scratch);
-                wait(&rec.commit());
-                let got = xb.to_f32(b * l * d);
-                // Reference on the weights the runtime actually uses (INT8: dequantized).
-                let mut w_ref = w.clone();
-                if precision == "int8" {
-                    for (name, v) in w_ref.iter_mut() {
-                        if name.ends_with(".weight") && !name.contains("norm") {
-                            let rows = v.len() / if name.ends_with("linear2.weight") { ffn } else { d };
-                            let wa = Array::from_slice(v, &[rows as i32, (v.len() / rows) as i32]);
-                            let (q, s, bb) = quantize(&wa, QuantizeOptions { group_size: Some(64), bits: Some(8), ..Default::default() }).unwrap();
-                            *v = to_vec_f32(&dequantize(&q, &s, &bb.unwrap(), DQ).unwrap()).unwrap();
-                        }
-                    }
-                }
-                let want = reference_layer(&x.iter().map(|&v| v as f64).collect::<Vec<_>>(), &w_ref, 0, b, l, d, ffn, heads, &pad);
-                let e = got.iter().zip(&want).map(|(a, c)| (*a as f64 - c).abs()).fold(0f64, f64::max);
-                let tol = match precision {
-                    "float32" | "int8" => 1e-3,
-                    "float16" => 3e-2,
-                    _ => 1.5e-1,
-                };
-                assert!(e < tol, "{precision} d={d} heads={heads} L={l} scalar attention {scalar}: max abs {e}");
-            }
-        }
-    }
-}
-
 /// A plan-table line for `key` with `plan` (the format `gemm-tune` writes).
 fn plan_line(prec: &str, m: i32, plan: &str) -> String {
     format!("{prec} {m} 512 512 0 0 0 0 0 0  {plan}")

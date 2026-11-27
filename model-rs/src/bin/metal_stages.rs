@@ -5,9 +5,7 @@
 //! GPU time per stage of the Metal runtime (each stage re-run on valid buffers from a full pass).
 //! Development tool (`--features dev-tools`):
 //!
-//!     metal-stages [float32|float16|bfloat16|int8] [batches...] [low-latency]
-
-// With `low-latency`, the model uses Mode::LowLatency (fused GEMM + add + LayerNorm).
+//!     metal-stages [float32|float16|bfloat16|int8] [batches...]
 //!
 //! Checkpoints: `$MOTIONBRICKS_CHECKPOINTS` or `checkpoints/MotionBricks`.
 
@@ -18,7 +16,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use common::{median, positionals};
 use motionbricks_rs::config::{Precision, checkpoint_dir};
-use motionbricks_rs::metal::model::{MetalModel, Mode};
+use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::{Recorder, wait};
 use motionbricks_rs::npy::load_npz;
 
@@ -26,18 +24,10 @@ fn main() -> Result<()> {
     let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut args = positionals()?.into_iter();
     let prec = args.next().unwrap_or("float32".into()).parse::<Precision>()?.name();
-    let mut mode = Mode::Reference;
-    let mut batches = Vec::new();
-    for v in args {
-        match v.as_str() {
-            "low-latency" | "fused" => mode = Mode::LowLatency,
-            _ => batches.push(common::parse(&v, "batch size")?),
-        }
-    }
+    let batches = args.map(|v| common::parse(&v, "batch size")).collect::<Result<Vec<usize>>>()?;
     let batches = if batches.is_empty() { vec![1, 32] } else { batches };
     for name in ["soma", "unitree_g1"] {
-        let m = MetalModel::from_checkpoints_with_mode(name, checkpoint_dir(name), 64, prec, mode)?;
-        let mode_name = mode.name();
+        let m = MetalModel::from_checkpoints_with(name, checkpoint_dir(name), 64, prec)?;
         for &batch in &batches {
             let req = load_npz(here.join("bench/requests").join(format!("{name}_N{batch}.npz")))?;
             m.run(&req)?;
@@ -73,8 +63,8 @@ fn main() -> Result<()> {
                 Ok(median(&mut v))
             };
             let (single, chunked) = (e2e(false)?, e2e(true)?);
-            println!("{name:<10} {prec:<8} {mode_name:<11} N={batch:<2} end to end ms: one command buffer {single:.2} | chunked commits {chunked:.2}");
-            println!("{name:<10} {prec:<8} {mode_name:<11} N={batch:<2} GPU ms: input {input:.2} | root {root:.2} | root->pose {r2p:.2} | pose {pose:.2} | vq {vq:.2} | finish {fin:.2} | whole {all:.2} | {dispatches} dispatches");
+            println!("{name:<10} {prec:<8} N={batch:<2} end to end ms: one command buffer {single:.2} | chunked commits {chunked:.2}");
+            println!("{name:<10} {prec:<8} N={batch:<2} GPU ms: input {input:.2} | root {root:.2} | root->pose {r2p:.2} | pose {pose:.2} | vq {vq:.2} | finish {fin:.2} | whole {all:.2} | {dispatches} dispatches");
         }
     }
     Ok(())

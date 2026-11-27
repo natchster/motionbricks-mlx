@@ -305,11 +305,9 @@ pub struct Kernels {
     /// Use the scalar attention kernel (one lane per key) even where the MMA kernel applies.
     pub scalar_attention: bool,
     pub add_ln: Pipeline,
-    /// Row-wise split-K reduce with a fused add-residual + LayerNorm (low-latency mode).
+    /// Row-wise split-K reduce with a fused add-residual + LayerNorm (the post-norm
+    /// transformer's GEMM pairs run through it; see [`Self::run_ln`]).
     pub reduce_ln: Pipeline,
-    /// Fuse the post-norm transformer's GEMM + add + LayerNorm pairs into one reduce
-    /// dispatch (one fewer dispatch per pair; see [`Self::run_ln`]).
-    pub low_latency: bool,
     pub dummy: Buf,
     pub dummy_t: Buf,
     /// Split-K partial sums. Its length caps splits * M * N (larger plans use fewer splits).
@@ -348,7 +346,6 @@ impl Kernels {
             scalar_attention: false,
             add_ln: gpu.pipeline("add_layernorm")?,
             reduce_ln: gpu.pipeline("gemm_reduce_ln")?,
-            low_latency: false,
             dummy: gpu.buffer(4),
             dummy_t: gpu.buffer_t(4),
             partial: gpu.buffer(len),
@@ -699,7 +696,6 @@ pub struct Scratch {
     pub x2: Buf,
     pub qkv: Buf,
     pub attn: Buf,
-    pub proj: Buf,
     pub ff: Buf,
 }
 
@@ -709,14 +705,13 @@ impl Scratch {
             x2: gpu.buffer_t(rows * d),
             qkv: gpu.buffer_t(rows * 3 * d),
             attn: gpu.buffer_t(rows * d),
-            proj: gpu.buffer_t(rows * d),
             ff: gpu.buffer_t(rows * ffn),
         }
     }
 
     /// Whether these buffers hold `rows` tokens of a transformer of width `d` and FFN width `ffn`.
     pub fn fits(&self, rows: usize, d: usize, ffn: usize) -> bool {
-        self.x2.len() >= rows * d && self.qkv.len() >= rows * 3 * d && self.attn.len() >= rows * d && self.proj.len() >= rows * d && self.ff.len() >= rows * ffn
+        self.x2.len() >= rows * d && self.qkv.len() >= rows * 3 * d && self.attn.len() >= rows * d && self.ff.len() >= rows * ffn
     }
 }
 
@@ -758,18 +753,11 @@ impl Transformer {
         for l in &self.layers {
             k.linear(rec, x, &l.in_w, &l.in_b, &s.qkv, rows, 3 * d, d, ACT_NONE);
             k.attention(rec, &s.qkv, pad, &s.attn, batch, len, d, self.heads);
-            if k.low_latency {
-                // Fused: GEMM partials -> row reduce with add-residual + LayerNorm.
-                k.linear_ln(rec, &s.attn, &l.out_w, &l.out_b, x, &l.n1_w, &l.n1_b, &s.x2, rows, d, d);
-                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
-                k.linear_ln(rec, &s.ff, &l.l2_w, &l.l2_b, &s.x2, &l.n2_w, &l.n2_b, x, rows, d, f);
-            } else {
-                k.linear(rec, &s.attn, &l.out_w, &l.out_b, &s.proj, rows, d, d, ACT_NONE);
-                k.add_layernorm(rec, x, &s.proj, &l.n1_w, &l.n1_b, &s.x2, rows, d);
-                k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
-                k.linear(rec, &s.ff, &l.l2_w, &l.l2_b, &s.proj, rows, d, f, ACT_NONE);
-                k.add_layernorm(rec, &s.x2, &s.proj, &l.n2_w, &l.n2_b, x, rows, d);
-            }
+            // Fused: GEMM partials -> row reduce with add-residual + LayerNorm (one dispatch
+            // fewer per pair than GEMM + add_layernorm, and no intermediate tensor round trip).
+            k.linear_ln(rec, &s.attn, &l.out_w, &l.out_b, x, &l.n1_w, &l.n1_b, &s.x2, rows, d, d);
+            k.linear(rec, &s.x2, &l.l1_w, &l.l1_b, &s.ff, rows, f, d, ACT_RELU);
+            k.linear_ln(rec, &s.ff, &l.l2_w, &l.l2_b, &s.x2, &l.n2_w, &l.n2_b, x, rows, d, f);
         }
     }
 }

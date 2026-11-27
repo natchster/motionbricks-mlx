@@ -190,13 +190,10 @@ The Metal runtime is fast *because* it isn't general:
   stream the weights at close to the memory bandwidth at batch 1.
 - **Fused work:** convolutions, masks, concatenations, blends and INT8 dequantization are folded
   into the matrix multiplies. Attention runs on simdgroup matrices straight from the packed QKV,
-  and the rig runs as one thread per pose (per pose and batch item for the G1).
-- **Low-latency mode** (`Mode::LowLatency`, via `from_checkpoints_with_mode`): on top of the
-  reference structure, the transformer's GEMM + residual + LayerNorm pairs are fused into the
-  split-K reduce — 48 fewer dispatches at N=1 and ~3–7% lower single-request GPU time (M4 Pro,
-  BF16; neutral at N≥4). Same tuned GEMM plans on every Mac; numerics differ from the reference
-  only in floating-point rounding order (checked by
-  `tests/metal_model.rs::low_latency_matches_reference`).
+  and the rig runs as one thread per pose and batch item. Each transformer layer's
+  Linear → +residual → LayerNorm pairs are fused into the split-K reduce
+  (`gemm_reduce_ln`: partials in, LayerNorm out, one dispatch per pair), which removes 48
+  dispatches and the intermediate round trips at N=1 (~3–7% lower single-request GPU time).
 - **Precomputed constants:** the pose network's token embedding is computed once at load time,
   because the release configuration makes it constant.
 

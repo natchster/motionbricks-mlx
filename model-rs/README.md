@@ -7,27 +7,10 @@ golden parity tests against NVIDIA's PyTorch model as the Python port.
 | Runtime | What it is | Speed vs the Python MLX port at the same precision (Mac mini M4 Pro) |
 |---|---|---|
 | `motionbricks_rs::MotionBricks` | an op-for-op port on [mlx-rs](https://github.com/oxiglade/mlx-rs) 0.34 (MLX 0.32.2): the same graph, the same kernels, and the shared rig kernels (`../model/motionbricks_mlx/assets/rig_kernels.metal`); FP32, FP16, BF16 | the same (0.99–1.01× the time, compiled) |
-| **`motionbricks_rs::metal::model::MetalModel`** | **a model-specific Metal runtime** built from what MLX does generically: a static dispatch plan, its own fused kernels, and GEMM plans tuned per launch; FP32, FP16, BF16, INT8 | **1.96–2.06× at N=1**, 1.61–1.91× at N=2, 1.35–1.45× at N=4, 1.18–1.28× at N=8, 1.07–1.18× at N=16, 1.04–1.09× at N=32 |
+| **`motionbricks_rs::metal::model::MetalModel`** | **a model-specific Metal runtime** built from what MLX does generically: a static dispatch plan, its own fused kernels (GEMM + residual + LayerNorm in one reduce), and GEMM plans tuned per launch; FP32, FP16, BF16, INT8 | **2.12–2.31× at N=1**, 1.93–2.05× at N=2, 1.38–1.49× at N=4, 1.21–1.28× at N=8, 1.09–1.18× at N=16, 1.02–1.08× at N=32 |
 
 The [user guide](../docs/user_guide.md#3-the-rust-implementations-model-rs) explains when to use which. The Metal runtime is tied to this model
 implementation and to Apple-silicon GPUs, in exchange for the lowest latency.
-
-### Dispatch modes (reference and low-latency)
-
-`MetalModel` runs one of two dispatch structures (`metal::model::Mode`, `Reference` by default):
-
-- **Reference:** every operator is its own dispatch; this is the structure all parity numbers and
-  the speedup table above were measured with.
-- **Low-latency** (`from_checkpoints_with_mode` / `from_converted_with_mode`): the post-norm
-  transformer's `GEMM → +residual → LayerNorm` pairs are fused into the split-K reduce — the GEMM
-  writes partials and a vectorized row-wise reduce adds the residual and LayerNorms, saving 48
-  dispatches at N=1 (398 → 350) and the intermediate tensor's round trip. Numerics differ from the
-  reference only by floating-point rounding order (the fused path rounds the GEMM output *less*
-  often); `tests/metal_model.rs::low_latency_matches_reference` checks both models, all precisions.
-  Measured at N=1 (GPU time, interleaved with the reference on an M4 Pro): **about 3–7% faster**
-  at BF16, 0–3% at FP32; neutral from N=4 up, where the dispatches no longer dominate. It uses the
-  same tuned GEMM plans (the GEMM halves are unchanged), so the M4-Pro table and the fallback rule
-  for other Macs both apply as before.
 
 Both also run upstream's **Runtime API** (`motionbricks_rs::runtime`). It provides engines,
 endpoint correction, tokens, animation buffers, the motion recorder, motion players, target
@@ -176,7 +159,7 @@ batch sizes too.
 
 ## 3. The Metal runtime (`src/metal/`)
 
-- **A static plan:** one generation is a fixed list of 238–398 dispatches (most at N=1, where
+- **A static plan:** one generation is a fixed list of 236–350 dispatches (most at N=1, where
   split-K adds reduce passes). They are recorded into serial command buffers and committed in
   chunks (after 8, 40 and 120 dispatches), so the GPU starts on the first stage while the CPU
   encodes the rest. That saves 0.16–0.25 ms per call over one command buffer. Encoding takes
@@ -222,8 +205,20 @@ batch sizes too.
   8 queries. It reads Q/K/V straight from the packed QKV projection, and computes the masked
   softmax in threadgroup memory. At N=32 it takes 0.48 ms for the pose transformer's 16 layers,
   against 1.21 ms for the earlier one-lane-per-key kernel.
+- **Fused normalize** (`gemm_reduce_ln`, `kernels.metal`): the post-norm transformer's
+  `Linear → +residual → LayerNorm` pairs (48 of them at N=1) run as two dispatches instead of
+  three: the GEMM always writes split-K partials (the `fc_partial` function constant forces the
+  partial path even for plans that don't split K), then one row-wise reduce per pair sums the
+  partials, adds the bias and residual, and LayerNorms the row — 1024 threads per row, float4
+  loads, threadgroup reductions. That saves the dispatch and the intermediate tensor's round trip
+  per pair, worth ~3–7% of single-request GPU time (and it rounds the GEMM output *less* often
+  than the unfused order). Two alternatives measured and rejected: forcing split-K off loses more
+  in the GEMM than the reduce saves, and a 256-thread row kernel can't stream the partials fast
+  enough (the reduce dominated the fusion).
 - **Model kernels** (`model.metal`), one thread per item:
-  - G1 forward kinematics and feature extraction (one thread per sequence, all 30 joints);
+  - G1 forward kinematics and feature extraction (one thread per pose per sequence — 8 per
+    sequence — so a single request runs 8 threads instead of 1; the local-root rows, which need
+    the next pose's heading, follow in the tiny `g1_preprocess_lr` dispatch);
   - joint-angle decoding with `matrix_quat`;
   - the SOMA T-pose retarget;
   - normalization, the duration head and argmax, dense conditions, `global_root_to_local` with
@@ -304,7 +299,7 @@ pick the same durations.
 
 Machine: Mac mini (2024, `Mac16,11`), Apple M4 Pro (14-core CPU, 20-core GPU), 64 GB, macOS 27.0.
 `bench/run_all.sh 3 "float32 bfloat16 float16 int8"` ran 3 interleaved rounds per precision on
-2026-11-21, on a quiet machine (load median 1.3). The order of Python and Rust alternates every
+2026-11-27, on a quiet machine (load median 2.3). The order of Python and Rust alternates every
 round. Sustained load raises the GPU time at N=32 by up to 10% within minutes, so only paired
 ratios are meaningful there. Times are the median per batched call, end to end: inputs from the
 host, outputs back on the host. Each cell gives Python MLX (compiled) → **Metal runtime** in ms,
@@ -315,29 +310,30 @@ and the paired speedup. Per-round ranges, GPU times and the mlx-rs port are in
 
 | N | FP32 | BF16 | FP16 | INT8 weights |
 |---|---|---|---|---|
-| 1 | 10.72 → **5.18** (2.06×) | 8.25 → **4.05** (2.04×) | 8.24 → **4.04** (2.04×) | 8.01 → **4.03** (1.99×) |
-| 2 | 11.06 → **5.98** (1.85×) | 8.89 → **4.66** (1.91×) | 8.87 → **4.70** (1.88×) | 8.48 → **5.26** (1.61×) |
-| 4 | 12.02 → **8.28** (1.45×) | 10.00 → **6.92** (1.45×) | 9.99 → **6.99** (1.43×) | 10.75 → **7.93** (1.36×) |
-| 8 | 15.99 → **13.08** (1.20×) | 13.94 → **10.90** (1.28×) | 13.93 → **10.97** (1.27×) | 15.37 → **12.82** (1.20×) |
-| 16 | 24.90 → **22.99** (1.08×) | 21.77 → **18.38** (1.18×) | 21.78 → **19.08** (1.14×) | 25.26 → **23.01** (1.10×) |
-| 32 | 45.18 → **42.91** (1.04×) | 37.86 → **35.21** (1.08×) | 37.86 → **36.49** (1.04×) | 46.37 → **42.78** (1.09×) |
+| 1 | 10.61 → **5.00** (2.12×) | 8.29 → **3.76** (2.25×) | 8.14 → **3.78** (2.15×) | 7.96 → **3.81** (2.26×) |
+| 2 | 11.02 → **5.70** (1.93×) | 8.98 → **4.42** (2.05×) | 8.81 → **4.50** (1.97×) | 8.47 → **5.03** (1.72×) |
+| 4 | 11.92 → **8.08** (1.48×) | 10.12 → **6.76** (1.48×) | 9.93 → **6.78** (1.47×) | 10.66 → **7.74** (1.38×) |
+| 8 | 15.95 → **12.95** (1.23×) | 14.09 → **11.17** (1.28×) | 13.86 → **10.95** (1.26×) | 15.27 → **12.70** (1.21×) |
+| 16 | 25.30 → **22.56** (1.12×) | 22.19 → **19.06** (1.18×) | 21.77 → **18.96** (1.15×) | 25.60 → **23.19** (1.11×) |
+| 32 | 46.02 → **42.88** (1.07×) | 38.80 → **37.35** (1.04×) | 37.86 → **36.61** (1.03×) | 46.75 → **43.48** (1.08×) |
 
 #### Unitree G1
 
 | N | FP32 | BF16 | FP16 | INT8 weights |
 |---|---|---|---|---|
-| 1 | 10.55 → **5.18** (2.04×) | 8.30 → **4.04** (2.06×) | 8.28 → **4.04** (2.05×) | 7.96 → **4.06** (1.96×) |
-| 2 | 10.90 → **5.97** (1.82×) | 8.83 → **4.72** (1.87×) | 8.81 → **4.74** (1.86×) | 8.49 → **5.28** (1.61×) |
-| 4 | 11.86 → **8.18** (1.45×) | 9.96 → **6.93** (1.44×) | 9.97 → **7.01** (1.42×) | 10.75 → **7.95** (1.35×) |
-| 8 | 15.82 → **13.36** (1.18×) | 13.77 → **10.91** (1.26×) | 13.77 → **11.00** (1.25×) | 15.33 → **12.81** (1.20×) |
-| 16 | 24.86 → **23.42** (1.07×) | 21.67 → **18.43** (1.18×) | 21.68 → **18.88** (1.15×) | 24.84 → **22.51** (1.11×) |
-| 32 | 45.38 → **43.72** (1.04×) | 37.76 → **35.42** (1.07×) | 37.79 → **36.27** (1.04×) | 45.64 → **42.15** (1.09×) |
+| 1 | 10.50 → **4.88** (2.15×) | 8.25 → **3.64** (2.26×) | 8.22 → **3.57** (2.31×) | 7.85 → **3.71** (2.12×) |
+| 2 | 10.88 → **5.59** (1.95×) | 8.78 → **4.36** (2.01×) | 8.73 → **4.39** (2.00×) | 8.32 → **4.88** (1.70×) |
+| 4 | 11.84 → **7.96** (1.49×) | 9.93 → **6.68** (1.49×) | 9.88 → **6.71** (1.47×) | 10.60 → **7.63** (1.39×) |
+| 8 | 15.82 → **13.08** (1.21×) | 13.74 → **10.76** (1.28×) | 13.72 → **10.85** (1.26×) | 15.23 → **12.55** (1.22×) |
+| 16 | 25.38 → **23.31** (1.09×) | 21.90 → **19.00** (1.15×) | 21.64 → **19.64** (1.11×) | 24.79 → **22.49** (1.10×) |
+| 32 | 46.03 → **43.67** (1.05×) | 38.17 → **36.08** (1.05×) | 38.44 → **37.83** (1.02×) | 45.60 → **42.57** (1.08×) |
 
-- **Every round:** all 144 paired comparisons favour the Metal runtime; the smallest is 1.02× (G1
-  FP32, N=32).
-- **Streams of single requests:** the Metal runtime sustains 193–194 req/s in FP32 and 247–251 in
-  BF16/FP16 sequentially. Python and mlx-rs reach 94–96 (FP32) or 121–122 (BF16/FP16)
-  sequentially, and 149–153 or 196–199 with `async_eval` pipelining.
+- **Every round:** all 144 paired comparisons favour the Metal runtime at N ≤ 16 (2.12× or more
+  at N=1). At N=32 both runtimes are GPU-throughput-bound and the pair is within noise
+  (0.98–1.08×).
+- **Streams of single requests:** the Metal runtime sustains 200–205 req/s in FP32 and 265–280 in
+  BF16/FP16 sequentially. Python and mlx-rs reach 95 (FP32) or 120–123 (BF16/FP16)
+  sequentially, and 151–155 or 185–200 with `async_eval` pipelining.
 - **mlx-rs vs Python** ([`bench/results/report_mlx-rs.md`](bench/results/report_mlx-rs.md)):
   compiled, mlx-rs takes 0.99–1.01× Python's time; eager 0.97–1.01×, because Rust builds the eager
   graph in 0.3–0.4 ms against Python's 0.5–0.7 ms. The language does not matter once the graph is

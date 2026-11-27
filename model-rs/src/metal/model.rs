@@ -235,39 +235,6 @@ struct RetargetParams {
 }
 
 
-/// Which dispatch structure a [`MetalModel`] encodes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Mode {
-    /// The reference structure (every operator its own dispatch).
-    #[default]
-    Reference,
-    /// Fewer dispatches per transformer layer: the post-norm GEMM + add-residual +
-    /// LayerNorm pairs are fused into the split-K reduce (the GEMM writes partials,
-    /// a row-wise reduce adds the residual and LayerNorms). Numerics differ from the
-    /// reference only by floating-point rounding order. Wins at small batches
-    /// (dispatch-latency-bound), neutral at large ones.
-    LowLatency,
-}
-
-impl Mode {
-    /// "reference" or "low-latency".
-    pub fn parse(name: &str) -> Result<Self> {
-        match name {
-            "reference" | "ref" => Ok(Mode::Reference),
-            "low-latency" | "lowlatency" | "low_latency" | "fused" => Ok(Mode::LowLatency),
-            other => bail!("unknown mode {other:?} (reference or low-latency)"),
-        }
-    }
-
-    /// This mode's name (`Mode::parse` accepts it back).
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Reference => "reference",
-            Mode::LowLatency => "low-latency",
-        }
-    }
-}
-
 pub struct MetalModel {
     pub gpu: Gpu,
     pub k: Kernels,
@@ -332,20 +299,10 @@ impl MetalModel {
         P: TryInto<config::Precision>,
         P::Error: Into<anyhow::Error>,
     {
-        Self::from_checkpoints_with_mode(name, dir, max_batch, precision, Mode::Reference)
-    }
-
-    /// [`Self::from_checkpoints_with`] with a dispatch [`Mode`] ([`Mode::LowLatency`] fuses the
-    /// transformer's GEMM + add + LayerNorm pairs; lowest latency at small batches).
-    pub fn from_checkpoints_with_mode<P>(name: &str, dir: impl AsRef<Path>, max_batch: usize, precision: P, mode: Mode) -> Result<Self>
-    where
-        P: TryInto<config::Precision>,
-        P::Error: Into<anyhow::Error>,
-    {
         let precision = precision.try_into().map_err(Into::into)?;
         let spec = get_spec(name)?;
         let loaded = read_checkpoints(dir, &spec)?;
-        Self::from_loaded(spec, loaded, max_batch, precision, mode)
+        Self::from_loaded(spec, loaded, max_batch, precision)
     }
 
     /// From one converted file (`motionbricks_rs::convert` or `motionbricks_mlx.convert`).
@@ -354,29 +311,19 @@ impl MetalModel {
         P: TryInto<config::Precision>,
         P::Error: Into<anyhow::Error>,
     {
-        Self::from_converted_with_mode(path, max_batch, precision, Mode::Reference)
-    }
-
-    /// [`Self::from_converted`] with a dispatch [`Mode`].
-    pub fn from_converted_with_mode<P>(path: impl AsRef<Path>, max_batch: usize, precision: P, mode: Mode) -> Result<Self>
-    where
-        P: TryInto<config::Precision>,
-        P::Error: Into<anyhow::Error>,
-    {
         let precision = precision.try_into().map_err(Into::into)?;
         let (name, loaded) = crate::weights::read_converted(path)?;
-        Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision, mode)
+        Self::from_loaded(get_spec(&name)?, loaded, max_batch, precision)
     }
 
-    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: config::Precision, mode: Mode) -> Result<Self> {
+    fn from_loaded(spec: ModelSpec, loaded: crate::weights::Loaded, max_batch: usize, precision: config::Precision) -> Result<Self> {
         ensure!((1..=MAX_BATCH).contains(&max_batch), "max_batch must be in 1..={MAX_BATCH}, got {max_batch}");
         let prec = Precision::from(precision);
         let int8 = precision.is_quantized();
         let rep = MotionRepresentation::new(spec.num_joints, &loaded.mean, &loaded.std)?;
         let gpu = Gpu::with_precision(prec)?;
         // Split-K partials are sized after the warm-up, from the launches the model makes.
-        let mut k = Kernels::with_partial_len(&gpu, 0)?;
-        k.low_latency = mode == Mode::LowLatency;
+        let k = Kernels::with_partial_len(&gpu, 0)?;
         let l = Loader { gpu: &gpu, t: &loaded.tensors };
         let pd = 1 + spec.local_poses_dim() as usize;
         let ld = rep.local.dim as usize;

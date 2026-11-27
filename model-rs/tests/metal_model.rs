@@ -19,7 +19,7 @@ mod common;
 use std::collections::HashMap;
 
 use common::*;
-use motionbricks_rs::metal::model::{MetalModel, Mode};
+use motionbricks_rs::metal::model::MetalModel;
 use motionbricks_rs::metal::{Recorder, wait};
 use motionbricks_rs::npy::{Npy, NpyData};
 use motionbricks_rs::{convert, examples};
@@ -229,51 +229,8 @@ fn batch_larger_than_max_batch_is_refused(name: &str) {
     }
 }
 
-/// Low-latency mode (the transformer's GEMM + add + LayerNorm pairs fused into the
-/// split-K reduce): same outputs as the reference mode within rounding-order noise.
-fn low_latency_matches_reference(name: &str) {
-    let _gpu = gpu_lock();
-    let Some(dir) = checkpoints(name) else { return };
-    for precision in ["float32", "bfloat16", "int8"] {
-        let reference = MetalModel::from_checkpoints_with(name, &dir, 4, precision).expect("reference model loads");
-        let fused = MetalModel::from_checkpoints_with_mode(name, &dir, 4, precision, Mode::LowLatency).expect("low-latency model loads");
-        for (batch, seed) in [(1, 3), (4, 11)] {
-            let request = request(name, batch, seed);
-            let r = run(&reference, &request);
-            let f = run(&fused, &request);
-            assert_eq!(r.1, f.1, "{name}/{precision} N={batch}: durations");
-            if precision == "float32" {
-                // The only difference is the fused reduce's f32 accumulation order.
-                let e = max_abs(&f.0, &r.0, |_| true);
-                assert!(e < 1e-3, "{name}/{precision} N={batch}: motion max abs {e}");
-            } else {
-                // Half-precision rounding of the fused intermediate puts the diff in the same
-                // noise class as the accepted bf16-vs-fp32 one (median < 0.05, per tracks_fp32).
-                let mut d: Vec<f32> = f.0.iter().zip(&r.0).map(|(a, b)| (a - b).abs()).collect();
-                d.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let median = d[d.len() / 2];
-                assert!(median < 0.05, "{name}/{precision} N={batch}: motion median |diff| {median}");
-            }
-            if let (Some(a), Some(b)) = (&f.2, &r.2) {
-                if precision == "float32" {
-                    let e = max_abs(a, b, |_| true);
-                    assert!(e < 1e-3, "{name}/{precision} N={batch}: contacts max abs {e}");
-                } else {
-                    // Contact probabilities flip near their threshold under rounding; median,
-                    // as for the motion (and the accepted bf16-vs-fp32 noise class).
-                    let mut d: Vec<f32> = a.iter().zip(b).map(|(x, y)| (x - y).abs()).collect();
-                    d.sort_by(|x, y| x.partial_cmp(y).unwrap());
-                    let median = d[d.len() / 2];
-                    assert!(median < 0.05, "{name}/{precision} N={batch}: contacts median |diff| {median}");
-                }
-            }
-        }
-    }
-}
-
 for_both_models!(
     interface_matches_onnx_contract,
-    low_latency_matches_reference,
     chunked_commits_equal_one_command_buffer,
     batch_rows_are_independent,
     allowed_token_counts_are_respected,
