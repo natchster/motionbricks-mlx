@@ -458,7 +458,7 @@ What the table shows:
   N=1; at N=32 both are GPU-throughput-bound and the margin is within noise (0.98–1.08×).
 - **Versus other Mac options:** at its fastest precision, Python MLX is 2.4–4.5× faster than
   NVIDIA's PyTorch model on the GPU (MPS), and the Rust Metal runtime 2.4–10.2× faster. At batch 32
-  they deliver 5.6× and 5.6–5.9× the throughput of ONNX Runtime on the CPU.
+  they deliver 5.4–5.6× and 5.6–5.9× the throughput of ONNX Runtime on the CPU.
 
 ### Python MLX vs the Rust Metal runtime
 
